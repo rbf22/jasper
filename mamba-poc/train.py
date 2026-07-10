@@ -18,6 +18,7 @@ import random
 import argparse
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext as _nullcontext
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -31,6 +32,13 @@ def get_device():
     elif torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def should_use_amp(cfg: dict, device: torch.device) -> bool:
+    """Auto-enable AMP on CUDA unless explicitly disabled."""
+    if device.type != "cuda":
+        return False
+    return cfg.get("use_amp", True)
 
 
 def load_config(config_path: str) -> dict:
@@ -77,9 +85,10 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
 
 
 @torch.no_grad()
-def evaluate(model, eval_set, vocab, device, max_new=10):
+def evaluate(model, eval_set, vocab, device, max_new=10, use_amp=False):
     """Evaluate accuracy on the eval set by generating answers and verifying."""
     model.eval()
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
     correct = {1: 0, 2: 0, 3: 0}
     total = {1: 0, 2: 0, 3: 0}
     correct_by_depth = {}
@@ -99,7 +108,8 @@ def evaluate(model, eval_set, vocab, device, max_new=10):
         # Generate answer tokens
         generated = input_ids[:, :prompt_len]
         for _ in range(max_new):
-            out = model(generated)
+            with amp_ctx:
+                out = model(generated)
             next_logits = out["logits"][:, -1, :]
             next_token = next_logits.argmax(dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
@@ -143,6 +153,11 @@ def train(cfg: dict, config_path: str):
     model = MambaWorkspaceModel(model_config).to(device)
     n_params = model.get_num_params()
     print(f"{n_params / 1e6:.1f}M")
+
+    # AMP (auto-enabled on CUDA)
+    use_amp = should_use_amp(cfg, device)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    print(f"AMP (fp16): {use_amp}")
 
     # Training hyperparameters
     lr = cfg.get("lr", 6e-4)
@@ -228,27 +243,37 @@ def train(cfg: dict, config_path: str):
         input_ids = input_ids.to(device)
         labels = labels.to(device)
 
-        # Forward
-        out = model(input_ids)
-        logits = out["logits"]
+        # Forward (with AMP autocast on CUDA)
+        amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
+        with amp_ctx:
+            out = model(input_ids)
+            logits = out["logits"]
 
-        # Compute loss only on answer positions
-        # Shift: predict next token
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, :-1].contiguous()
+            # Compute loss only on answer positions
+            # Shift: predict next token
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, :-1].contiguous()
 
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
 
         # Backward
         optimizer.zero_grad()
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
         scheduler.step()
 
         step += 1
@@ -272,7 +297,7 @@ def train(cfg: dict, config_path: str):
         # Evaluation
         if step % eval_interval == 0:
             print(f"\n--- Evaluation at step {step} ---")
-            eval_results = evaluate(model, eval_set, vocab, device, max_new=5)
+            eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp)
             for k, v in sorted(eval_results.items()):
                 print(f"  {k}: {v:.3f}")
             if use_wandb:
@@ -289,7 +314,7 @@ def train(cfg: dict, config_path: str):
     # Final checkpoint and eval
     save_checkpoint(model, optimizer, scheduler, step, loss.item(), str(ckpt_path), cfg)
     print(f"\nFinal checkpoint saved at step {step}")
-    eval_results = evaluate(model, eval_set, vocab, device, max_new=5)
+    eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp)
     print("Final evaluation:")
     for k, v in sorted(eval_results.items()):
         print(f"  {k}: {v:.3f}")
