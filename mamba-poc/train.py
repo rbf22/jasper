@@ -162,12 +162,22 @@ def train(cfg: dict, config_path: str):
     # Training hyperparameters
     lr = cfg.get("lr", 6e-4)
     max_steps = cfg.get("max_steps", 10000)
-    batch_size = cfg.get("batch_size", 32)
     seq_len = cfg.get("seq_len", 128)
     tokens_per_batch = float(cfg.get("tokens_per_batch", 250000))
-    # Adjust batch size to hit target tokens per batch
+    micro_batch_size = cfg.get("micro_batch_size", 0)  # 0 = no grad accumulation
+
+    # Compute effective batch size and gradient accumulation steps
     if tokens_per_batch > 0:
-        batch_size = max(1, int(tokens_per_batch / seq_len))
+        effective_batch_size = max(1, int(tokens_per_batch / seq_len))
+    else:
+        effective_batch_size = cfg.get("batch_size", 32)
+
+    if micro_batch_size > 0 and micro_batch_size < effective_batch_size:
+        grad_accum_steps = max(1, effective_batch_size // micro_batch_size)
+        batch_size = micro_batch_size
+    else:
+        grad_accum_steps = 1
+        batch_size = effective_batch_size
     warmup_steps = cfg.get("warmup_steps", 200)
     weight_decay = cfg.get("weight_decay", 0.1)
     grad_clip = cfg.get("grad_clip", 1.0)
@@ -234,60 +244,72 @@ def train(cfg: dict, config_path: str):
     last_log_time = time.time()
 
     print(f"Starting training from step {step} to {max_steps}")
-    print(f"Batch size: {batch_size}, Seq len: {seq_len}, Tokens/batch: {batch_size * seq_len}")
+    print(f"Micro-batch: {batch_size}, Grad accum: {grad_accum_steps}, "
+          f"Effective batch: {batch_size * grad_accum_steps}, "
+          f"Seq len: {seq_len}, Tokens/step: {batch_size * grad_accum_steps * seq_len}")
 
     while step < max_steps:
-        input_ids, labels, task_ids = sample_batch(
-            batch_size, seq_len, vocab, depth_range=depth_range, rng=rng
-        )
-        input_ids = input_ids.to(device)
-        labels = labels.to(device)
-
-        # Forward (with AMP autocast on CUDA)
-        amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
-        with amp_ctx:
-            out = model(input_ids)
-            logits = out["logits"]
-
-            # Compute loss only on answer positions
-            # Shift: predict next token
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, :-1].contiguous()
-
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-        # Backward
         optimizer.zero_grad()
+        total_loss = 0.0
+
+        for accum_idx in range(grad_accum_steps):
+            input_ids, labels, task_ids = sample_batch(
+                batch_size, seq_len, vocab, depth_range=depth_range, rng=rng
+            )
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+
+            # Forward (with AMP autocast on CUDA)
+            amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
+            with amp_ctx:
+                out = model(input_ids)
+                logits = out["logits"]
+
+                # Compute loss only on answer positions
+                # Shift: predict next token
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, :-1].contiguous()
+
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+                loss = loss / grad_accum_steps
+
+            # Backward (accumulate)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            total_loss += loss.item()
+
+        # Optimizer step (after all accumulation steps)
         if scaler is not None:
-            scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         scheduler.step()
 
         step += 1
+        avg_loss = total_loss / grad_accum_steps
 
         # Logging
         if step % log_interval == 0:
             elapsed = time.time() - last_log_time
-            tokens_sec = (batch_size * seq_len * log_interval) / elapsed
+            tokens_sec = (batch_size * grad_accum_steps * seq_len * log_interval) / elapsed
             current_lr = scheduler.get_last_lr()[0]
-            msg = f"Step {step}/{max_steps} | Loss: {loss.item():.4f} | LR: {current_lr:.2e} | {tokens_sec:.0f} tok/s"
+            msg = f"Step {step}/{max_steps} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | {tokens_sec:.0f} tok/s"
             print(msg)
             if use_wandb:
                 wandb.log({
-                    "loss": loss.item(),
+                    "loss": avg_loss,
                     "lr": current_lr,
                     "tokens/sec": tokens_sec,
                     "step": step,
@@ -307,12 +329,12 @@ def train(cfg: dict, config_path: str):
 
         # Checkpoint
         if time.time() - last_ckpt_time > checkpoint_interval:
-            save_checkpoint(model, optimizer, scheduler, step, loss.item(), str(ckpt_path), cfg)
+            save_checkpoint(model, optimizer, scheduler, step, avg_loss, str(ckpt_path), cfg)
             print(f"Checkpoint saved at step {step}")
             last_ckpt_time = time.time()
 
     # Final checkpoint and eval
-    save_checkpoint(model, optimizer, scheduler, step, loss.item(), str(ckpt_path), cfg)
+    save_checkpoint(model, optimizer, scheduler, step, avg_loss, str(ckpt_path), cfg)
     print(f"\nFinal checkpoint saved at step {step}")
     eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp)
     print("Final evaluation:")
