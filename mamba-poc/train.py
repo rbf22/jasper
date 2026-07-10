@@ -296,7 +296,7 @@ def train(cfg: dict, config_path: str):
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            total_loss += loss.item()
+            total_loss += loss.item() * grad_accum_steps  # un-scale to get raw loss per micro-batch
 
         # Optimizer step (after all accumulation steps)
         if scaler is not None:
