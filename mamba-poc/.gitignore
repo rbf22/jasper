@@ -1,0 +1,7 @@
+# venv artifacts
+bin/
+lib/
+include/
+share/
+pyvenv.cfg
+__pycache__/
