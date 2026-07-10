@@ -3,7 +3,7 @@ Kaggle runner — launches Cell B and Cell D in parallel on dual T4 GPUs.
 
 Usage:
     python kaggle_runner.py                    # train both cells
-    python kaggle_runner.py --monitor          # just monitor running jobs
+    python kaggle_runner.py --status           # check status and recent logs
     python kaggle_runner.py --wait             # wait for running jobs to finish
     python kaggle_runner.py --clean            # delete checkpoints and start fresh
     python kaggle_runner.py --save-outputs     # copy checkpoints + probes to /kaggle/working
@@ -109,7 +109,7 @@ def launch_training(clean=False):
     return proc_b.returncode, proc_d.returncode
 
 
-def monitor():
+def status():
     """Show status and recent logs from running training jobs."""
     result = subprocess.run(["ps", "aux"], capture_output=True, text=True)
     train_procs = [l for l in result.stdout.split("\n") if "train.py" in l and "grep" not in l]
@@ -143,7 +143,7 @@ def wait():
             break
         time.sleep(300)
         print(f"[{time.strftime('%H:%M:%S')}] Still running: {len(train_procs)} processes")
-    monitor()
+    status()
 
 
 def save_outputs():
@@ -195,15 +195,15 @@ def smoke_test():
 
 def main():
     parser = argparse.ArgumentParser(description="Kaggle parallel training runner")
-    parser.add_argument("--monitor", action="store_true", help="Show status and recent logs")
+    parser.add_argument("--status", action="store_true", help="Check status and recent logs")
     parser.add_argument("--wait", action="store_true", help="Wait for training to finish")
     parser.add_argument("--clean", action="store_true", help="Delete checkpoints before training")
     parser.add_argument("--save-outputs", action="store_true", help="Copy outputs to /kaggle/working")
     parser.add_argument("--smoke-test", action="store_true", help="Run smoke tests")
     args = parser.parse_args()
 
-    if args.monitor:
-        monitor()
+    if args.status:
+        status()
     elif args.wait:
         wait()
     elif args.save_outputs:
