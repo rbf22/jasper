@@ -165,7 +165,7 @@ def train(cfg: dict, config_path: str):
 
     # AMP (auto-enabled on CUDA)
     use_amp = should_use_amp(cfg, device)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    scaler = torch.amp.GradScaler("cuda", init_scale=1024, enabled=use_amp) if use_amp else None
     print(f"AMP (fp16): {use_amp}")
 
     # Training hyperparameters
@@ -297,6 +297,16 @@ def train(cfg: dict, config_path: str):
             else:
                 loss.backward()
             total_loss += loss.item() * grad_accum_steps  # un-scale to get raw loss per micro-batch
+
+        # Check for NaN before optimizer step
+        if math.isnan(total_loss) or math.isinf(total_loss):
+            print(f"Step {step+1}: NaN/Inf loss detected, skipping optimizer step")
+            optimizer.zero_grad()
+            if scaler is not None:
+                scaler.update()
+            scheduler.step()
+            step += 1
+            continue
 
         # Optimizer step (after all accumulation steps)
         if scaler is not None:
