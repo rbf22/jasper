@@ -218,9 +218,14 @@ def train(cfg: dict, config_path: str):
     # Resume
     start_step = 0
     if cfg.get("resume", True) and ckpt_path.exists():
-        print(f"Resuming from {ckpt_path}")
-        start_step, _ = load_checkpoint(ckpt_path, model, optimizer, scheduler)
-        print(f"Resumed at step {start_step}")
+        try:
+            print(f"Resuming from {ckpt_path}")
+            start_step, _ = load_checkpoint(ckpt_path, model, optimizer, scheduler)
+            print(f"Resumed at step {start_step}")
+        except (RuntimeError, KeyError) as e:
+            print(f"Checkpoint incompatible (likely different model config): {e}")
+            print("Starting fresh from step 0.")
+            start_step = 0
 
     # Data
     vocab = Vocab()
