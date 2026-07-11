@@ -5,3 +5,17 @@ include/
 share/
 pyvenv.cfg
 __pycache__/
+
+# Checkpoints
+checkpoints/*.pt
+
+# Training logs
+*.log
+
+# Probe outputs
+probe_*.json
+probe_*.csv
+probe_*.png
+
+# Outputs
+outputs/
