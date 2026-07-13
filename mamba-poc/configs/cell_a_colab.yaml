@@ -1,12 +1,11 @@
-# Cell B on Colab T4 — hybrid baseline with AMP
-cell: B
+# Cell A on Colab T4 — pure Mamba2 SSM floor with AMP
+cell: A
 d_model: 384
 n_layers: 14
 expand: 4
 d_state: 64
 n_heads: 4
-use_attention: true
-attention_positions: [5, 10]
+use_attention: false
 use_workspace: false
 recurrent_core: false
 
@@ -35,7 +34,7 @@ micro_batch_size: 128
 # Wandb
 wandb: false
 wandb_project: mamba-workspace-poc
-run_name: cellB-colab-seed1
+run_name: cellA-colab-seed1
 
 # Checkpointing
 ckpt_dir: checkpoints
