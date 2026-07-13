@@ -87,9 +87,9 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
     prev_path = path.replace("_latest.pt", "_prev.pt")
     shutil.copy2(path, prev_path)
 
-    # Backup to Google Drive if mounted and configured
+    # Backup to Google Drive if mounted and configured (skip for smoke tests)
     gdrive_ckpt_dir = config.get("gdrive_ckpt_dir")
-    if gdrive_ckpt_dir and os.path.isdir(GDRIVE_DIR):
+    if gdrive_ckpt_dir and gdrive_ckpt_dir != "__skip__" and os.path.isdir(GDRIVE_DIR):
         for fname in [os.path.basename(path), os.path.basename(prev_path)]:
             gdrive_path = os.path.join(gdrive_ckpt_dir, fname)
             try:
@@ -484,6 +484,8 @@ def main():
         cfg["no_wandb"] = True
         cfg["resume"] = False
         cfg["depth_range"] = [4, 4]  # Task 1 depth-4 only
+        # Don't back up smoke test checkpoints to Google Drive
+        cfg["gdrive_ckpt_dir"] = None
         # Keep cell from config — don't override to D
         cfg["core_start"] = 3
         cfg["core_end"] = 5

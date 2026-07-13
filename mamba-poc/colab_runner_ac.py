@@ -44,14 +44,25 @@ GDRIVE_DIR = "/content/drive/MyDrive"
 
 
 def clean_checkpoints():
-    """Delete all checkpoints for a fresh start."""
+    """Delete checkpoints for cells A and C — local AND Google Drive."""
+    cell_names = ["cellA", "cellC"]
+
     ckpt_dir = os.path.join(REPO_DIR, "checkpoints")
     if os.path.isdir(ckpt_dir):
         for f in os.listdir(ckpt_dir):
-            if f.endswith(".pt"):
+            if f.endswith(".pt") and any(f.startswith(c) for c in cell_names):
                 path = os.path.join(ckpt_dir, f)
                 os.remove(path)
                 print(f"Deleted: {path}")
+
+    # Also clean Google Drive backups (stale smoke test checkpoints cause resume issues)
+    gdrive_ckpt = os.path.join(GDRIVE_DIR, "jasper-checkpoints")
+    if os.path.isdir(gdrive_ckpt):
+        for f in os.listdir(gdrive_ckpt):
+            if f.endswith(".pt") and any(f.startswith(c) for c in cell_names):
+                path = os.path.join(gdrive_ckpt, f)
+                os.remove(path)
+                print(f"Deleted from Google Drive: {path}")
 
 
 def launch_training_sequential(clean=False, cell_filter=None):
