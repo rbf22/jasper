@@ -190,6 +190,7 @@ def train(cfg: dict, config_path: str):
     warmup_steps = cfg.get("warmup_steps", 200)
     weight_decay = cfg.get("weight_decay", 0.1)
     grad_clip = cfg.get("grad_clip", 1.0)
+    z_loss_coef = cfg.get("z_loss_coef", 1e-4)
     eval_interval = cfg.get("eval_interval", 500)
     log_interval = cfg.get("log_interval", 50)
     checkpoint_interval = cfg.get("checkpoint_interval", 900)  # 15 min in seconds
@@ -289,6 +290,11 @@ def train(cfg: dict, config_path: str):
                     shift_labels.view(-1),
                     ignore_index=-100,
                 )
+                # z-loss: penalize log-partition drift to keep logit scale stable (PaLM-style)
+                z = torch.logsumexp(shift_logits.float(), dim=-1)  # (B, T-1)
+                z_mask = shift_labels != -100
+                z_loss = z_loss_coef * (z[z_mask] ** 2).mean()
+                loss = loss + z_loss
                 loss = loss / grad_accum_steps
 
             # Backward (accumulate)

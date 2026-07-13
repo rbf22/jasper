@@ -57,14 +57,37 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
+    """ZCRMSNorm: x * (1 + gamma) / RMS(x), gamma init 0 (identity-scale at init)."""
+
     def __init__(self, d, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(d))
+        self.weight = nn.Parameter(torch.zeros(d))
         self.eps = eps
 
     def forward(self, x):
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * norm).type_as(x) * self.weight
+        return (x.float() * norm).type_as(x) * (1 + self.weight)
+
+
+# ---------------------------------------------------------------------------
+# Gated Residual Block
+# ---------------------------------------------------------------------------
+
+class GatedBlock(nn.Module):
+    """Gated pre-norm residual wrapper: x + sigmoid(gate) * layer(norm(x)).
+
+    gate init 0 -> sigmoid(0) = 0.5, a damped residual at initialization.
+    Lets the recurrent core learn to fade or sharpen each layer per iteration.
+    """
+
+    def __init__(self, layer: nn.Module, d_model: int):
+        super().__init__()
+        self.layer = layer
+        self.norm = RMSNorm(d_model)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + torch.sigmoid(self.gate) * self.layer(self.norm(x))
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +303,8 @@ class WorkspaceModule(nn.Module):
 
         self.norm = RMSNorm(self.d_model)
         self.slot_norm = RMSNorm(self.d_model)
+        self.read_gate = nn.Parameter(torch.zeros(1))
+        self.write_gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor, slot_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -304,7 +329,7 @@ class WorkspaceModule(nn.Module):
         read_attn = F.softmax(read_attn, dim=-1)
         read_out = torch.matmul(read_attn, rv)  # (B, n_heads, m, d_head)
         read_out = read_out.transpose(1, 2).contiguous().view(B, self.n_slots, D)
-        slots = self.slot_norm(slots + self.read_out(read_out))  # residual + normalize to prevent growth over K iterations
+        slots = self.slot_norm(slots + torch.sigmoid(self.read_gate) * self.read_out(read_out))  # gated residual + normalize to prevent growth over K iterations
 
         # --- Write: hidden states attend over slots ---
         wq = self.write_q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -315,7 +340,7 @@ class WorkspaceModule(nn.Module):
         write_attn = F.softmax(write_attn, dim=-1)
         write_out = torch.matmul(write_attn, wv)  # (B, n_heads, T, d_head)
         write_out = write_out.transpose(1, 2).contiguous().view(B, T, D)
-        x = x + self.write_out(write_out)  # residual update to hidden states
+        x = x + torch.sigmoid(self.write_gate) * self.write_out(write_out)  # gated residual update to hidden states
 
         x = self.norm(x)
         return x, slots
@@ -339,9 +364,10 @@ class MambaWorkspaceModel(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(config.n_layers):
             if config.use_attention and i in config.attention_positions:
-                self.layers.append(AttentionLayer(config))
+                inner = AttentionLayer(config)
             else:
-                self.layers.append(Mamba2Layer(config))
+                inner = Mamba2Layer(config)
+            self.layers.append(GatedBlock(inner, config.d_model))
 
         # Workspace module
         if config.use_workspace:
