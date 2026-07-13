@@ -174,7 +174,7 @@ def train(cfg: dict, config_path: str):
 
     # AMP (auto-enabled on CUDA)
     use_amp = should_use_amp(cfg, device)
-    scaler = torch.amp.GradScaler("cuda", init_scale=1024, enabled=use_amp) if use_amp else None
+    scaler = torch.amp.GradScaler("cuda", init_scale=128, enabled=use_amp) if use_amp else None
     print(f"AMP (fp16): {use_amp}")
 
     # Training hyperparameters
@@ -288,6 +288,8 @@ def train(cfg: dict, config_path: str):
     step = start_step
     last_ckpt_time = time.time()
     last_log_time = time.time()
+    nan_streak = 0
+    nan_streak_limit = 5
 
     print(f"Starting training from step {step} to {max_steps}")
     print(f"Micro-batch: {batch_size}, Grad accum: {grad_accum_steps}, "
@@ -337,7 +339,8 @@ def train(cfg: dict, config_path: str):
 
         # Check for NaN before optimizer step
         if math.isnan(total_loss) or math.isinf(total_loss):
-            print(f"Step {step+1}: NaN/Inf loss detected, skipping optimizer step")
+            nan_streak += 1
+            print(f"Step {step+1}: NaN/Inf loss detected (streak {nan_streak}/{nan_streak_limit}), skipping optimizer step")
             if scaler is not None:
                 scaler.unscale_(optimizer)
             optimizer.zero_grad()
@@ -345,7 +348,24 @@ def train(cfg: dict, config_path: str):
                 scaler.update()
             scheduler.step()
             step += 1
+
+            # If NaN persists, weights are corrupted — restore from last checkpoint
+            if nan_streak >= nan_streak_limit and ckpt_path.exists():
+                print(f"NaN streak limit reached — restoring from checkpoint at {ckpt_path}")
+                try:
+                    step, _ = load_checkpoint(str(ckpt_path), model, optimizer, scheduler)
+                    print(f"Restored to step {step}. Resetting GradScaler.")
+                    if scaler is not None:
+                        scaler = torch.amp.GradScaler("cuda", init_scale=128, enabled=use_amp)
+                    nan_streak = 0
+                    model.train()
+                except Exception as e:
+                    print(f"Checkpoint restore failed: {type(e).__name__}: {e}")
+                    print("Cannot recover — exiting.")
+                    return model, {}
             continue
+
+        nan_streak = 0
 
         # Optimizer step (after all accumulation steps)
         if scaler is not None:
