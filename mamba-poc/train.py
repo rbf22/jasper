@@ -15,12 +15,16 @@ import math
 import yaml
 import json
 import random
+import shutil
 import argparse
 import torch
 import torch.nn.functional as F
 from contextlib import nullcontext as _nullcontext
 from pathlib import Path
 from typing import Optional, Dict
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+GDRIVE_DIR = "/content/drive/MyDrive"
 
 from data import Vocab, sample_batch, generate_eval_set, TASK_VERIFIERS
 from model import MambaWorkspaceModel, get_cell_config, ModelConfig
@@ -64,6 +68,9 @@ def build_model_config(cfg: dict) -> ModelConfig:
 
 
 def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
+    """Save checkpoint atomically (write to temp, then rename)."""
+    path = str(path)
+    tmp_path = path + ".tmp"
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -71,7 +78,18 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
         "step": step,
         "loss": loss,
         "config": config,
-    }, path)
+    }, tmp_path)
+    os.replace(tmp_path, path)
+
+    # Backup to Google Drive if mounted and configured
+    gdrive_ckpt_dir = config.get("gdrive_ckpt_dir")
+    if gdrive_ckpt_dir and os.path.isdir(GDRIVE_DIR):
+        gdrive_path = os.path.join(gdrive_ckpt_dir, os.path.basename(path))
+        try:
+            shutil.copy2(path, gdrive_path)
+            print(f"Checkpoint backed up to Google Drive: {gdrive_path}")
+        except Exception as e:
+            print(f"Warning: Failed to backup checkpoint to Google Drive: {e}")
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
@@ -211,22 +229,44 @@ def train(cfg: dict, config_path: str):
             config=cfg,
         )
 
-    # Checkpointing
+    # Checkpointing — resolve to absolute path relative to script dir
     ckpt_dir = Path(cfg.get("ckpt_dir", "checkpoints"))
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = SCRIPT_DIR / ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"cell{cell}_latest.pt"
 
     # Resume
     start_step = 0
-    if cfg.get("resume", True) and ckpt_path.exists():
-        try:
-            print(f"Resuming from {ckpt_path}")
-            start_step, _ = load_checkpoint(ckpt_path, model, optimizer, scheduler)
-            print(f"Resumed at step {start_step}")
-        except (RuntimeError, KeyError) as e:
-            print(f"Checkpoint incompatible (likely different model config): {e}")
-            print("Starting fresh from step 0.")
-            start_step = 0
+    resume_ckpt = None
+    if cfg.get("resume", True):
+        # Check local checkpoint first
+        if ckpt_path.exists():
+            resume_ckpt = ckpt_path
+            print(f"Found local checkpoint: {ckpt_path} ({ckpt_path.stat().st_size / 1e6:.1f} MB)")
+        else:
+            # Check Google Drive backup
+            gdrive_ckpt_dir = cfg.get("gdrive_ckpt_dir")
+            if gdrive_ckpt_dir and os.path.isdir(GDRIVE_DIR):
+                gdrive_path = os.path.join(gdrive_ckpt_dir, f"cell{cell}_latest.pt")
+                if os.path.exists(gdrive_path):
+                    print(f"Local checkpoint missing, restoring from Google Drive: {gdrive_path}")
+                    shutil.copy2(gdrive_path, str(ckpt_path))
+                    resume_ckpt = ckpt_path
+                else:
+                    print(f"No checkpoint found locally or in Google Drive ({gdrive_path})")
+            else:
+                print(f"No checkpoint found at {ckpt_path}")
+
+        if resume_ckpt is not None:
+            try:
+                print(f"Resuming from {resume_ckpt}")
+                start_step, _ = load_checkpoint(str(resume_ckpt), model, optimizer, scheduler)
+                print(f"Resumed at step {start_step}")
+            except Exception as e:
+                print(f"Checkpoint load failed: {type(e).__name__}: {e}")
+                print("Starting fresh from step 0.")
+                start_step = 0
 
     # Data
     vocab = Vocab()
@@ -298,6 +338,8 @@ def train(cfg: dict, config_path: str):
         # Check for NaN before optimizer step
         if math.isnan(total_loss) or math.isinf(total_loss):
             print(f"Step {step+1}: NaN/Inf loss detected, skipping optimizer step")
+            if scaler is not None:
+                scaler.unscale_(optimizer)
             optimizer.zero_grad()
             if scaler is not None:
                 scaler.update()

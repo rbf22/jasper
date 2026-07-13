@@ -40,3 +40,4 @@ run_name: cellB-colab-seed1
 # Checkpointing
 ckpt_dir: checkpoints
 resume: true
+gdrive_ckpt_dir: /content/drive/MyDrive/jasper-checkpoints
