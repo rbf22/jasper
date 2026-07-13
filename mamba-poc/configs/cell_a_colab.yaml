@@ -14,7 +14,7 @@ lr: 6.0e-4
 max_steps: 10000
 tokens_per_batch: 250000
 seq_len: 128
-warmup_steps: 500
+warmup_steps: 1500
 weight_decay: 0.1
 grad_clip: 1.0
 z_loss_coef: 1.0e-4

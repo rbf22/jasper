@@ -318,13 +318,15 @@ def train(cfg: dict, config_path: str):
             labels = labels.to(device)
 
             # Forward (with AMP autocast on CUDA)
+            # Model runs in fp16, but logits + loss computed in fp32 to avoid overflow
             amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
             with amp_ctx:
                 out = model(input_ids)
                 logits = out["logits"]
 
-                # Compute loss only on answer positions
-                # Shift: predict next token
+            # Compute loss in fp32 — logits and cross-entropy are the main overflow risk
+            with torch.amp.autocast("cuda", enabled=False):
+                logits = logits.float()
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_labels = labels[:, :-1].contiguous()
 
@@ -334,7 +336,7 @@ def train(cfg: dict, config_path: str):
                     ignore_index=-100,
                 )
                 # z-loss: penalize log-partition drift to keep logit scale stable (PaLM-style)
-                z = torch.logsumexp(shift_logits.float(), dim=-1)  # (B, T-1)
+                z = torch.logsumexp(shift_logits, dim=-1)  # (B, T-1)
                 z_mask = shift_labels != -100
                 z_loss = z_loss_coef * (z[z_mask] ** 2).mean()
                 loss = loss + z_loss
