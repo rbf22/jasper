@@ -437,7 +437,7 @@ def main():
         cfg["no_wandb"] = True
         cfg["resume"] = False
         cfg["depth_range"] = [4, 4]  # Task 1 depth-4 only
-        cfg["cell"] = "D"
+        # Keep cell from config — don't override to D
         cfg["core_start"] = 3
         cfg["core_end"] = 5
         cfg["attention_positions"] = [2, 5]
