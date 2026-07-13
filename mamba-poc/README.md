@@ -15,7 +15,9 @@ See the [root README](../README.md) for the project overview and [desktop-mamba-
 | `train.py` | Training loop with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection and smoke testing. |
 | `probe.py` | Analysis scripts for R2 (K sweep — test-time compute scaling), R3 (linear probes on workspace slots — decodability), and R4 (selective workspace ablation — J-space signature). |
 | `configs/cell_{a,b,c,d}.yaml` | YAML configs for each of the four model cells. Override any `ModelConfig` field from here. |
-| `kaggle_notebook.ipynb` | Kaggle T4 notebook for running cells B and D (the go/no-go pair) on free GPU time. |
+| `colab_notebook.ipynb` | Google Colab T4 notebook for running cells B and D (the go/no-go pair) on free GPU time. |
+| `colab_runner.py` | Sequential training runner for Colab (single T4 GPU). Trains Cell B then Cell D, saves outputs to Google Drive. |
+| `vast_runner.py` | Parallel training runner for Vast.ai (dual GPU). Trains Cell B and D simultaneously on separate GPUs. |
 | `requirements.txt` | Python dependencies. |
 | `checkpoints/` | Saved during training (gitignored). One checkpoint per cell: `cell{X}_latest.pt`. |
 
@@ -181,9 +183,9 @@ python probe.py --checkpoint checkpoints/cellD_latest.pt --config configs/cell_d
 
 **R4** computes the mean workspace slot state across training examples, then replaces live slots with this mean at inference. Reports accuracy drop per task. Success (J-space signature): Tasks 1–2 drop ≥30 points, Task 3 drops ≤5 points.
 
-### 7. Kaggle (free GPU)
+### 7. Google Colab (free GPU)
 
-Open `kaggle_notebook.ipynb` in Kaggle with GPU T4 enabled. It runs cells B and D (the go/no-go pair) at the full ~2B-token budget. Each takes ~12 hours on a T4. See [infra-setup-guide.md](../infra-setup-guide.md) for details.
+Open `colab_notebook.ipynb` in Colab with T4 GPU enabled. It runs cells B and D (the go/no-go pair) sequentially at the full ~2B-token budget. Each takes ~12 hours on a T4. See [infra-setup-guide.md](../infra-setup-guide.md) for details.
 
 ---
 

@@ -1,14 +1,19 @@
-# Cell B on Kaggle T4 — hybrid baseline with AMP
-cell: B
+# Cell D on Colab T4 — full architecture with AMP
+cell: D
 d_model: 384
-n_layers: 14
+n_layers: 13
 expand: 4
 d_state: 64
 n_heads: 4
 use_attention: true
 attention_positions: [5, 10]
-use_workspace: false
-recurrent_core: false
+use_workspace: true
+n_workspace_slots: 16
+recurrent_core: true
+core_start: 6
+core_end: 10
+k_train_max: 6
+k_inference: 6
 
 # Training
 lr: 6.0e-4
@@ -18,6 +23,7 @@ seq_len: 128
 warmup_steps: 500
 weight_decay: 0.1
 grad_clip: 1.0
+z_loss_coef: 1.0e-4
 depth_range: [2, 8]
 eval_interval: 500
 log_interval: 50
@@ -27,14 +33,14 @@ seed: 42
 # AMP — T4 has no bf16, use fp16
 use_amp: true
 
-# Gradient accumulation — T4 has 15GB VRAM, can't fit full batch (1953)
+# Gradient accumulation — Colab T4 has 15GB VRAM, Cell D uses more memory (workspace + recurrent core)
 # Micro-batch of 32 with 60 accumulation steps = 1920 effective batch
 micro_batch_size: 32
 
 # Wandb
 wandb: false
 wandb_project: mamba-workspace-poc
-run_name: cellB-kaggle-seed1
+run_name: cellD-colab-seed1
 
 # Checkpointing
 ckpt_dir: checkpoints

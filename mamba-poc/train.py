@@ -84,15 +84,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     return ckpt["step"], ckpt["loss"]
 
 
-def _copy_to_kaggle_output(ckpt_path):
-    """Copy checkpoint to /kaggle/working/ so it survives session death. No-op if not on Kaggle."""
-    import shutil
-    kaggle_output = "/kaggle/working"
-    if os.path.isdir(kaggle_output):
-        dst = os.path.join(kaggle_output, os.path.basename(ckpt_path))
-        shutil.copy2(ckpt_path, dst)
-
-
 @torch.no_grad()
 def evaluate(model, eval_set, vocab, device, max_new=10, use_amp=False):
     """Evaluate accuracy on the eval set by generating answers and verifying."""
@@ -361,13 +352,11 @@ def train(cfg: dict, config_path: str):
         if time.time() - last_ckpt_time > checkpoint_interval:
             save_checkpoint(model, optimizer, scheduler, step, avg_loss, str(ckpt_path), cfg)
             print(f"Checkpoint saved at step {step}")
-            _copy_to_kaggle_output(ckpt_path)
             last_ckpt_time = time.time()
 
     # Final checkpoint and eval
     save_checkpoint(model, optimizer, scheduler, step, avg_loss, str(ckpt_path), cfg)
     print(f"\nFinal checkpoint saved at step {step}")
-    _copy_to_kaggle_output(ckpt_path)
     eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp)
     print("Final evaluation:")
     for k, v in sorted(eval_results.items()):
