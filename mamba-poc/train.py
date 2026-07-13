@@ -68,7 +68,9 @@ def build_model_config(cfg: dict) -> ModelConfig:
 
 
 def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
-    """Save checkpoint atomically (write to temp, then rename)."""
+    """Save checkpoint atomically (write to temp, then rename).
+    Keeps the previous checkpoint as _prev.pt for rollback on NaN.
+    """
     path = str(path)
     tmp_path = path + ".tmp"
     torch.save({
@@ -81,15 +83,20 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
     }, tmp_path)
     os.replace(tmp_path, path)
 
+    # Rotate: keep a copy of this checkpoint as _prev before next overwrite
+    prev_path = path.replace("_latest.pt", "_prev.pt")
+    shutil.copy2(path, prev_path)
+
     # Backup to Google Drive if mounted and configured
     gdrive_ckpt_dir = config.get("gdrive_ckpt_dir")
     if gdrive_ckpt_dir and os.path.isdir(GDRIVE_DIR):
-        gdrive_path = os.path.join(gdrive_ckpt_dir, os.path.basename(path))
-        try:
-            shutil.copy2(path, gdrive_path)
-            print(f"Checkpoint backed up to Google Drive: {gdrive_path}")
-        except Exception as e:
-            print(f"Warning: Failed to backup checkpoint to Google Drive: {e}")
+        for fname in [os.path.basename(path), os.path.basename(prev_path)]:
+            gdrive_path = os.path.join(gdrive_ckpt_dir, fname)
+            try:
+                shutil.copy2(os.path.join(os.path.dirname(path), fname), gdrive_path)
+            except Exception as e:
+                print(f"Warning: Failed to backup {fname} to Google Drive: {e}")
+        print(f"Checkpoint saved at step {step} (latest + prev backed up to Google Drive)")
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
@@ -174,7 +181,7 @@ def train(cfg: dict, config_path: str):
 
     # AMP (auto-enabled on CUDA)
     use_amp = should_use_amp(cfg, device)
-    scaler = torch.amp.GradScaler("cuda", init_scale=128, enabled=use_amp) if use_amp else None
+    scaler = torch.amp.GradScaler("cuda", init_scale=64, enabled=use_amp) if use_amp else None
     print(f"AMP (fp16): {use_amp}")
 
     # Training hyperparameters
@@ -235,6 +242,7 @@ def train(cfg: dict, config_path: str):
         ckpt_dir = SCRIPT_DIR / ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"cell{cell}_latest.pt"
+    ckpt_prev_path = ckpt_dir / f"cell{cell}_prev.pt"
 
     # Resume
     start_step = 0
@@ -290,6 +298,8 @@ def train(cfg: dict, config_path: str):
     last_log_time = time.time()
     nan_streak = 0
     nan_streak_limit = 5
+    restore_attempts = 0
+    restore_limit = 3
 
     print(f"Starting training from step {step} to {max_steps}")
     print(f"Micro-batch: {batch_size}, Grad accum: {grad_accum_steps}, "
@@ -349,19 +359,35 @@ def train(cfg: dict, config_path: str):
             scheduler.step()
             step += 1
 
-            # If NaN persists, weights are corrupted — restore from last checkpoint
-            if nan_streak >= nan_streak_limit and ckpt_path.exists():
-                print(f"NaN streak limit reached — restoring from checkpoint at {ckpt_path}")
+            # If NaN persists, weights are corrupted — restore from checkpoint
+            if nan_streak >= nan_streak_limit:
+                restore_attempts += 1
+                # After 2 failed restores from latest, try the prev checkpoint
+                if restore_attempts >= 2 and ckpt_prev_path.exists():
+                    restore_path = str(ckpt_prev_path)
+                    print(f"Latest checkpoint keeps NaN-ing — trying previous checkpoint: {ckpt_prev_path}")
+                elif ckpt_path.exists():
+                    restore_path = str(ckpt_path)
+                    print(f"NaN streak limit reached — restoring from checkpoint at {ckpt_path}")
+                else:
+                    print("No checkpoint to restore from — exiting.")
+                    return model, {}
+
                 try:
-                    step, _ = load_checkpoint(str(ckpt_path), model, optimizer, scheduler)
-                    print(f"Restored to step {step}. Resetting GradScaler.")
+                    step, _ = load_checkpoint(restore_path, model, optimizer, scheduler)
+                    print(f"Restored to step {step}. Resetting GradScaler (attempt {restore_attempts}/{restore_limit}).")
                     if scaler is not None:
-                        scaler = torch.amp.GradScaler("cuda", init_scale=128, enabled=use_amp)
+                        scaler = torch.amp.GradScaler("cuda", init_scale=32, enabled=use_amp)
                     nan_streak = 0
                     model.train()
                 except Exception as e:
                     print(f"Checkpoint restore failed: {type(e).__name__}: {e}")
                     print("Cannot recover — exiting.")
+                    return model, {}
+
+                if restore_attempts >= restore_limit:
+                    print(f"Restore limit ({restore_limit}) reached — checkpoint may be irrecoverably unstable.")
+                    print("Consider lowering LR or deleting checkpoints for a fresh start.")
                     return model, {}
             continue
 
@@ -413,7 +439,6 @@ def train(cfg: dict, config_path: str):
         # Checkpoint
         if time.time() - last_ckpt_time > checkpoint_interval:
             save_checkpoint(model, optimizer, scheduler, step, avg_loss, str(ckpt_path), cfg)
-            print(f"Checkpoint saved at step {step}")
             last_ckpt_time = time.time()
 
     # Final checkpoint and eval
