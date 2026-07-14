@@ -11,7 +11,7 @@ use_workspace: false
 recurrent_core: false
 
 # Training
-lr: 6.0e-4
+lr: 4.0e-4
 max_steps: 10000
 tokens_per_batch: 250000
 seq_len: 128

@@ -73,6 +73,12 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
     """
     path = str(path)
     tmp_path = path + ".tmp"
+
+    # Rotate: save old latest as _prev BEFORE overwriting (so _prev is actually the previous checkpoint)
+    prev_path = path.replace("_latest.pt", "_prev.pt")
+    if os.path.exists(path):
+        shutil.copy2(path, prev_path)
+
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -82,10 +88,6 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
         "config": config,
     }, tmp_path)
     os.replace(tmp_path, path)
-
-    # Rotate: keep a copy of this checkpoint as _prev before next overwrite
-    prev_path = path.replace("_latest.pt", "_prev.pt")
-    shutil.copy2(path, prev_path)
 
     # Backup to Google Drive if mounted and configured (skip for smoke tests)
     gdrive_ckpt_dir = config.get("gdrive_ckpt_dir")
@@ -181,7 +183,7 @@ def train(cfg: dict, config_path: str):
 
     # AMP (auto-enabled on CUDA)
     use_amp = should_use_amp(cfg, device)
-    scaler = torch.amp.GradScaler("cuda", init_scale=64, enabled=use_amp) if use_amp else None
+    scaler = torch.amp.GradScaler("cuda", init_scale=16, enabled=use_amp) if use_amp else None
     print(f"AMP (fp16): {use_amp}")
 
     # Training hyperparameters
@@ -379,9 +381,10 @@ def train(cfg: dict, config_path: str):
                     step, _ = load_checkpoint(restore_path, model, optimizer, scheduler)
                     print(f"Restored to step {step}. Resetting GradScaler (attempt {restore_attempts}/{restore_limit}).")
                     if scaler is not None:
-                        scaler = torch.amp.GradScaler("cuda", init_scale=32, enabled=use_amp)
+                        scaler = torch.amp.GradScaler("cuda", init_scale=8, enabled=use_amp)
                     nan_streak = 0
                     model.train()
+                    last_ckpt_time = time.time()
                 except Exception as e:
                     print(f"Checkpoint restore failed: {type(e).__name__}: {e}")
                     print("Cannot recover — exiting.")

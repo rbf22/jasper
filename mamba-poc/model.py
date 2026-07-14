@@ -188,8 +188,10 @@ class Mamba2Layer(nn.Module):
         scores = CB.unsqueeze(1) * L.permute(0, 3, 1, 2)  # (B, n_heads, T, T)
 
         # Y[b, h, t, i] = sum_s scores[b, h, t, s] * V[b, s, h, i]
+        # Upcast only this matmul to fp32 — accumulation over T=128 can overflow fp16
         V_h = V.permute(0, 2, 1, 3)  # (B, n_heads, T, d_head)
-        Y = torch.matmul(scores, V_h)  # (B, n_heads, T, d_head)
+        with torch.amp.autocast("cuda", enabled=False):
+            Y = torch.matmul(scores.float(), V_h.float()).type_as(x)
 
         # Skip connection (D residual)
         Y = Y + self.D.view(1, self.n_heads, 1, 1) * V_h

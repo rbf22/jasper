@@ -16,7 +16,7 @@ k_train_max: 6
 k_inference: 6
 
 # Training
-lr: 6.0e-4
+lr: 4.0e-4
 max_steps: 10000
 tokens_per_batch: 250000
 seq_len: 128
