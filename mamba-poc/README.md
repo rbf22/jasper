@@ -12,7 +12,7 @@ See the [root README](../README.md) for the project overview and [desktop-mamba-
 |------|-------------|
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
 | `model.py` | The full model (`MambaWorkspaceModel`) with four cell configurations behind config flags. Contains the pure-PyTorch Mamba2 SSD layer, multi-head attention with RoPE, perceiver-style workspace module, and the recurrent core loop. |
-| `train.py` | Training loop with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection and smoke testing. |
+| `train.py` | Training loop with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection. |
 | `probe.py` | Analysis scripts for R2 (K sweep — test-time compute scaling), R3 (linear probes on workspace slots — decodability), and R4 (selective workspace ablation — J-space signature). |
 | `configs/cell_{a,b,c,d}.yaml` | YAML configs for each of the four model cells. Override any `ModelConfig` field from here. |
 | `colab_notebook.ipynb` | Google Colab T4 notebook for running cells B and D (the go/no-go pair) on free GPU time. |
@@ -125,14 +125,7 @@ python model.py
 ```
 Prints parameter counts for all four cells. Useful to verify they're roughly matched (~30M each).
 
-### 4. Smoke test
-
-```bash
-python train.py --config configs/cell_d.yaml --smoke-test
-```
-Runs a 5M-parameter Cell D on Task 1 depth-4 only for ~200 steps (~10 min). Confirms loss drops below the trivial baseline and the model generates verifiable answers. **Do this before any real training run.**
-
-### 5. Train a cell
+### 4. Train a cell
 
 ```bash
 python train.py --config configs/cell_d.yaml

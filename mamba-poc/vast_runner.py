@@ -8,14 +8,12 @@ Usage:
     python vast_runner.py --wait             # wait for running jobs to finish
     python vast_runner.py --clean            # delete checkpoints and start fresh
     python vast_runner.py --save-outputs     # copy checkpoints + probes to output dir
-    python vast_runner.py --smoke-test       # run smoke test on both cells
     python vast_runner.py --sequential       # run B then D on single GPU
 
 Setup on Vast.ai:
     git clone https://github.com/rbf22/jasper.git
     cd jasper/mamba-poc
     pip install einops pyyaml wandb numpy
-    python vast_runner.py --smoke-test       # verify everything works
     python vast_runner.py --clean            # start training
 """
 
@@ -212,28 +210,12 @@ def save_outputs():
     print(f"\nAll outputs saved to {OUTPUT_DIR}/")
 
 
-def smoke_test():
-    """Run smoke test on both cells sequentially."""
-    for name, config in [("Cell B", CONFIG_B), ("Cell D", CONFIG_D)]:
-        print(f"\n=== Smoke test: {name} ===")
-        result = subprocess.run(
-            ["python", "train.py", "--config", config, "--smoke-test"],
-            cwd=REPO_DIR,
-        )
-        if result.returncode != 0:
-            print(f"{name} smoke test FAILED")
-            return result.returncode
-    print("\nBoth smoke tests passed!")
-    return 0
-
-
 def main():
     parser = argparse.ArgumentParser(description="Vast.ai parallel training runner")
     parser.add_argument("--status", action="store_true", help="Check status and recent logs")
     parser.add_argument("--wait", action="store_true", help="Wait for training to finish")
     parser.add_argument("--clean", action="store_true", help="Delete checkpoints before training")
     parser.add_argument("--save-outputs", action="store_true", help="Copy outputs to output dir")
-    parser.add_argument("--smoke-test", action="store_true", help="Run smoke tests")
     parser.add_argument("--sequential", action="store_true", help="Run B then D on single GPU")
     args = parser.parse_args()
 
@@ -243,8 +225,6 @@ def main():
         wait()
     elif args.save_outputs:
         save_outputs()
-    elif args.smoke_test:
-        sys.exit(smoke_test())
     else:
         n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if args.sequential or n_gpus < 2:

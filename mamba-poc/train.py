@@ -89,7 +89,7 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
     }, tmp_path)
     os.replace(tmp_path, path)
 
-    # Backup to Google Drive if mounted and configured (skip for smoke tests)
+    # Backup to Google Drive if mounted and configured
     gdrive_ckpt_dir = config.get("gdrive_ckpt_dir")
     if gdrive_ckpt_dir and gdrive_ckpt_dir != "__skip__" and os.path.isdir(GDRIVE_DIR):
         for fname in [os.path.basename(path), os.path.basename(prev_path)]:
@@ -466,7 +466,6 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--cell", type=str, default=None, help="Override cell (A/B/C/D)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb")
-    parser.add_argument("--smoke-test", action="store_true", help="Quick smoke test")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -474,28 +473,6 @@ def main():
         cfg["cell"] = args.cell
     if args.no_wandb:
         cfg["no_wandb"] = True
-    if args.smoke_test:
-        cfg["max_steps"] = 200
-        cfg["batch_size"] = 16
-        cfg["seq_len"] = 64
-        cfg["tokens_per_batch"] = 0  # use batch_size directly
-        cfg["d_model"] = 128
-        cfg["n_layers"] = 6
-        cfg["warmup_steps"] = 20
-        cfg["eval_interval"] = 100
-        cfg["log_interval"] = 20
-        cfg["no_wandb"] = True
-        cfg["resume"] = False
-        cfg["depth_range"] = [4, 4]  # Task 1 depth-4 only
-        # Don't back up smoke test checkpoints to Google Drive
-        cfg["gdrive_ckpt_dir"] = None
-        # Keep cell from config — don't override to D
-        cfg["core_start"] = 3
-        cfg["core_end"] = 5
-        cfg["attention_positions"] = [2, 5]
-        cfg["k_train_max"] = 3
-        cfg["k_inference"] = 3
-        print("=== SMOKE TEST MODE ===")
 
     train(cfg, args.config)
 

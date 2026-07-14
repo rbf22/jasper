@@ -10,7 +10,6 @@ Usage:
     python colab_runner_ac.py --wait             # wait for running jobs to finish
     python colab_runner_ac.py --clean            # delete checkpoints and start fresh
     python colab_runner_ac.py --save-outputs     # copy checkpoints + probes to Google Drive
-    python colab_runner_ac.py --smoke-test       # run smoke test on both cells
     python colab_runner_ac.py --cell A           # train only Cell A
     python colab_runner_ac.py --cell C           # train only Cell C
 
@@ -18,7 +17,6 @@ Setup on Colab:
     git clone https://github.com/rbf22/jasper.git
     cd jasper/mamba-poc
     pip install einops pyyaml wandb numpy
-    python colab_runner_ac.py --smoke-test       # verify everything works
     python colab_runner_ac.py --clean            # start training
 """
 
@@ -55,7 +53,7 @@ def clean_checkpoints():
                 os.remove(path)
                 print(f"Deleted: {path}")
 
-    # Also clean Google Drive backups (stale smoke test checkpoints cause resume issues)
+    # Also clean Google Drive backups
     gdrive_ckpt = os.path.join(GDRIVE_DIR, "jasper-checkpoints")
     if os.path.isdir(gdrive_ckpt):
         for f in os.listdir(gdrive_ckpt):
@@ -187,28 +185,12 @@ def save_outputs():
         print("Run: from google.colab import drive; drive.mount('/content/drive')")
 
 
-def smoke_test():
-    """Run smoke test on both cells sequentially."""
-    for name, config in [("Cell A", CONFIG_A), ("Cell C", CONFIG_C)]:
-        print(f"\n=== Smoke test: {name} ===")
-        result = subprocess.run(
-            ["python", "train.py", "--config", config, "--smoke-test"],
-            cwd=REPO_DIR,
-        )
-        if result.returncode != 0:
-            print(f"{name} smoke test FAILED")
-            return result.returncode
-    print("\nBoth smoke tests passed!")
-    return 0
-
-
 def main():
     parser = argparse.ArgumentParser(description="Colab sequential training runner (Cells A + C)")
     parser.add_argument("--status", action="store_true", help="Check status and recent logs")
     parser.add_argument("--wait", action="store_true", help="Wait for training to finish")
     parser.add_argument("--clean", action="store_true", help="Delete checkpoints before training")
     parser.add_argument("--save-outputs", action="store_true", help="Copy outputs to Google Drive")
-    parser.add_argument("--smoke-test", action="store_true", help="Run smoke tests")
     parser.add_argument("--cell", type=str, default=None, help="Train only one cell (A or C)")
     args = parser.parse_args()
 
@@ -218,8 +200,6 @@ def main():
         wait()
     elif args.save_outputs:
         save_outputs()
-    elif args.smoke_test:
-        sys.exit(smoke_test())
     else:
         n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         print(f"GPUs detected: {n_gpus} (Colab uses single GPU — running sequentially)")
