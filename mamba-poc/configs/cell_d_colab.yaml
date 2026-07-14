@@ -34,9 +34,10 @@ seed: 42
 use_amp: true
 
 # Gradient accumulation — Colab T4 has 15GB VRAM, Cell D uses more memory (workspace + recurrent core)
-# Micro-batch of 128 with 15 accumulation steps = 1920 effective batch
-# If OOM occurs, reduce to 96 (20 accum steps) or 64 (30 accum steps)
-micro_batch_size: 128
+# Micro-batch of 256 with 7 accumulation steps = 1792 effective batch
+# (gradient checkpointing frees ~12GB, allowing larger micro-batch)
+# If OOM occurs, reduce to 128 (15 accum steps) or 96 (20 accum steps)
+micro_batch_size: 256
 
 # Wandb
 wandb: false

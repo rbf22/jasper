@@ -29,8 +29,9 @@ seed: 42
 use_amp: true
 
 # Gradient accumulation — Colab T4 has 15GB VRAM
-# Micro-batch of 128 with 15 accumulation steps = 1920 effective batch
-micro_batch_size: 128
+# Micro-batch of 256 with 7 accumulation steps = 1792 effective batch
+# (gradient checkpointing frees ~12GB, allowing larger micro-batch)
+micro_batch_size: 256
 
 # Wandb
 wandb: false
