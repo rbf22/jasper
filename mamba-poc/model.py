@@ -14,6 +14,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
@@ -86,8 +87,17 @@ class GatedBlock(nn.Module):
         self.norm = RMSNorm(d_model)
         self.gate = nn.Parameter(torch.zeros(1))
 
+    def _inner_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layer(self.norm(x))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + torch.sigmoid(self.gate) * self.layer(self.norm(x))
+        if self.training:
+            inner = checkpoint(
+                self._inner_forward, x, use_reentrant=False
+            )
+        else:
+            inner = self._inner_forward(x)
+        return x + torch.sigmoid(self.gate) * inner
 
 
 # ---------------------------------------------------------------------------
