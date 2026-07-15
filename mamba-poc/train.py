@@ -70,7 +70,12 @@ def build_model_config(cfg: dict) -> ModelConfig:
 def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
     """Save checkpoint atomically (write to temp, then rename).
     Keeps the previous checkpoint as _prev.pt for rollback on NaN.
+    Refuses to save if loss is NaN/Inf — never overwrite a good checkpoint with a poisoned one.
     """
+    if math.isnan(loss) or math.isinf(loss):
+        print(f"Skipping checkpoint at step {step} — loss is {loss} (would poison checkpoint)")
+        return False
+
     path = str(path)
     tmp_path = path + ".tmp"
 
@@ -99,6 +104,7 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
             except Exception as e:
                 print(f"Warning: Failed to backup {fname} to Google Drive: {e}")
         print(f"Checkpoint saved at step {step} (latest + prev backed up to Google Drive)")
+    return True
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
@@ -340,7 +346,7 @@ def train(cfg: dict, config_path: str):
                 # z-loss: penalize log-partition drift to keep logit scale stable (PaLM-style)
                 z = torch.logsumexp(shift_logits, dim=-1)  # (B, T-1)
                 z_mask = shift_labels != -100
-                z_loss = z_loss_coef * (z[z_mask] ** 2).mean()
+                z_loss = z_loss_coef * (z[z_mask].clamp(max=50) ** 2).mean()
                 loss = loss + z_loss
                 loss = loss / grad_accum_steps
 
