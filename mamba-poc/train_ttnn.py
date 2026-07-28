@@ -1,0 +1,739 @@
+"""
+Tenstorrent native training script using tt-nn.
+
+Trains the Mamba2 model directly on TT hardware using tt-nn ops,
+bypassing PyTorch/XLA entirely. Forward pass runs on device, backward
+pass uses a hybrid approach (tt-nn ops + host autograd for SSD), and
+the optimizer is AdamW implemented on host.
+
+Usage:
+    .tt-venv/bin/python train_ttnn.py --config configs/cell_a_tt.yaml
+    .tt-venv/bin/python train_ttnn.py --config configs/cell_a_tt.yaml --profile
+    .tt-venv/bin/python train_ttnn.py --config configs/cell_a_tt.yaml --steps 50 --micro_batch 8
+"""
+
+import os
+import sys
+
+# ── TT_VISIBLE_DEVICES must be set BEFORE any ttnn/torch import ──────────────
+# When --device is passed, pin this process to a single physical TT chip so
+# multiple processes can run in parallel without driver-level contention.
+# TT_VISIBLE_DEVICES remaps the physical device to logical 0, so we always
+# open_device(device_id=0) inside the process.  This mirrors the pattern used
+# by the tt-boltz quad-card demo (demo_quad/worker.py).
+_device_id_from_argv = 0
+for _i, _a in enumerate(sys.argv):
+    if _a == "--device" and _i + 1 < len(sys.argv):
+        _device_id_from_argv = int(sys.argv[_i + 1])
+        break
+    if _a.startswith("--device="):
+        _device_id_from_argv = int(_a.split("=", 1)[1])
+        break
+os.environ.setdefault("TT_VISIBLE_DEVICES", str(_device_id_from_argv))
+
+# P300 chips need a custom fabric mesh graph descriptor; without it,
+# ttnn.open_device aborts with TT_FATAL on tt_cluster.cpp.  This mirrors
+# the pattern from the tt-boltz quad-card demo (demo_quad/pool.py).
+_P300_SUBSYSTEM_IDS = {"0x0044", "0x0045", "0x0046"}
+def _is_p300():
+    try:
+        from pathlib import Path
+        for entry in Path("/sys/class/tenstorrent").glob("tenstorrent!*"):
+            sub = (entry / "device" / "subsystem_device").read_text().strip().lower()
+            if sub in _P300_SUBSYSTEM_IDS:
+                return True
+    except Exception:
+        pass
+    return False
+def _find_mesh_graph_descriptor():
+    try:
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.find_spec("ttnn")
+        if spec is None or not spec.submodule_search_locations:
+            return None
+        # ttnn's own copy
+        path = (
+            Path(next(iter(spec.submodule_search_locations)))
+            / "tt_metal" / "fabric" / "mesh_graph_descriptors"
+            / "p150_mesh_graph_descriptor.textproto"
+        )
+        if path.is_file():
+            return str(path)
+        # pjrt_plugin_tt copy
+        import sys
+        for p in sys.path:
+            candidate = Path(p) / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / "p150_mesh_graph_descriptor.textproto"
+            if candidate.is_file():
+                return str(candidate)
+    except Exception:
+        pass
+    return None
+if _is_p300():
+    _mgd = _find_mesh_graph_descriptor()
+    if _mgd:
+        os.environ.setdefault("TT_MESH_GRAPH_DESC_PATH", _mgd)
+
+# Suppress Metal C++ warnings (e.g. ROW MAJOR tile extraction in ttnn.embedding)
+os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
+
+import argparse
+import math
+import time
+import torch
+import ttnn
+import yaml
+import random
+
+# Suppress loguru warnings from ttnn
+from loguru import logger
+logger.remove()
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from model_ttnn import TTMambaWorkspaceModel, ModelConfig
+
+# Cache for identity matrix on device (avoids recreating every step)
+_identity_cache = {}  # (V, device_id) -> ttnn.Tensor
+from data import Vocab, sample_batch, generate_eval_set
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_config(path: str) -> dict:
+    """Load a YAML config file."""
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
+
+def build_model_config(cfg: dict) -> ModelConfig:
+    """Build a ModelConfig from a YAML config dict."""
+    return ModelConfig(
+        d_model=cfg.get("d_model", 384),
+        n_layers=cfg.get("n_layers", 14),
+        vocab_size=cfg.get("vocab_size", 128),
+        d_state=cfg.get("d_state", 64),
+        d_conv=cfg.get("d_conv", 4),
+        expand=cfg.get("expand", 4),
+        n_heads=cfg.get("n_heads", 4),
+        use_attention=cfg.get("use_attention", False),
+        attention_positions=cfg.get("attention_positions", [5, 10]),
+        use_workspace=cfg.get("use_workspace", False),
+        n_workspace_slots=cfg.get("n_workspace_slots", 16),
+        recurrent_core=cfg.get("recurrent_core", False),
+        core_start=cfg.get("core_start", 6),
+        core_end=cfg.get("core_end", 10),
+        k_train_max=cfg.get("k_train_max", 6),
+        k_inference=cfg.get("k_inference", 6),
+        use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optimizer (device-side AdamW)
+# ---------------------------------------------------------------------------
+
+class TTAdamW:
+    """AdamW optimizer for tt-nn tensors — fully on device.
+
+    Uses ttnn.moreh_adamw for bf16 params (the majority).
+    Uses manual fp32 elementwise ops for fp32 params (A_log, D) since
+    moreh_adamw only supports bf16/bf8_b.
+
+    All optimizer state (exp_avg, exp_avg_sq) is kept on device.
+    No host-device transfers during the optimizer step.
+    """
+
+    def __init__(self, params: dict, lr=6e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1):
+        self.base_lr = lr
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.step_count = 0
+
+        self.param_names = list(params.keys())
+        self.device = None  # set from first param
+        self.param_dtype = {}   # name -> ttnn dtype
+        self.exp_avg = {}       # name -> device tensor (same dtype as param)
+        self.exp_avg_sq = {}    # name -> device tensor (same dtype as param)
+
+        for name, tt_tensor in params.items():
+            if self.device is None:
+                self.device = tt_tensor.device()
+            dtype = tt_tensor.dtype
+            self.param_dtype[name] = dtype
+            shape = tuple(tt_tensor.shape)
+            self.exp_avg[name] = ttnn.zeros(shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+            self.exp_avg_sq[name] = ttnn.zeros(shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+
+    def set_lr(self, lr: float):
+        self.lr = lr
+
+    def step(self, grads: dict, model: TTMambaWorkspaceModel):
+        """Apply one optimizer step — fully on device.
+
+        grads: dict of name -> tt-nn gradient tensor
+        model: the model (to update its parameters)
+        """
+        self.step_count += 1
+        device = self.device
+
+        for name in self.param_names:
+            if name not in grads:
+                continue
+
+            grad = grads[name]
+            dtype = self.param_dtype[name]
+            m = self.exp_avg[name]
+            v = self.exp_avg_sq[name]
+
+            if dtype == ttnn.float32:
+                # Manual fp32 AdamW (moreh_adamw doesn't support fp32)
+                # Typecast grad to fp32 if needed
+                if grad.dtype != ttnn.float32:
+                    grad = ttnn.typecast(grad, ttnn.float32)
+                param = model.get_params()[name]  # current param on device
+                lr, b1, b2, eps, wd = self.lr, self.beta1, self.beta2, self.eps, self.weight_decay
+                # m = b1*m + (1-b1)*g
+                m = ttnn.add(ttnn.mul(m, b1), ttnn.mul(grad, 1.0 - b1))
+                # v = b2*v + (1-b2)*g^2
+                g_sq = ttnn.mul(grad, grad)
+                v = ttnn.add(ttnn.mul(v, b2), ttnn.mul(g_sq, 1.0 - b2))
+                # bias correction
+                bc1 = 1.0 - b1 ** self.step_count
+                bc2 = 1.0 - b2 ** self.step_count
+                m_hat = ttnn.mul(m, 1.0 / bc1)
+                v_hat = ttnn.mul(v, 1.0 / bc2)
+                # param -= lr * m_hat / (sqrt(v_hat) + eps)
+                update = ttnn.div(m_hat, ttnn.add(ttnn.sqrt(v_hat), eps))
+                param = ttnn.sub(param, ttnn.mul(update, lr))
+                # weight decay
+                param = ttnn.mul(param, 1.0 - lr * wd)
+                # Store updated state
+                self.exp_avg[name] = m
+                self.exp_avg_sq[name] = v
+            else:
+                # bf16: use ttnn.moreh_adamw
+                # Typecast grad to bf16 if needed (e.g. fp32 grad for A_log)
+                if grad.dtype != ttnn.bfloat16:
+                    grad = ttnn.typecast(grad, ttnn.bfloat16)
+                param = model.get_params()[name]
+                result = ttnn.moreh_adamw(
+                    param, grad, m, v,
+                    lr=self.lr, beta1=self.beta1, beta2=self.beta2,
+                    eps=self.eps, weight_decay=self.weight_decay,
+                    step=self.step_count,
+                )
+                # result = [param_out, exp_avg_out, exp_avg_sq_out, max_exp_avg_sq_out]
+                param = result[0]
+                self.exp_avg[name] = result[1]
+                self.exp_avg_sq[name] = result[2]
+
+            # Update model parameter in-place
+            self._set_model_param(model, name, param)
+
+    def _set_model_param(self, model: TTMambaWorkspaceModel, name: str, param: "ttnn.Tensor"):
+        """Update a model parameter from a device tensor (no transfer)."""
+        if name == "token_emb_weight":
+            model.token_emb_weight = param
+            model.lm_head_weight = param  # weight tying
+        elif name == "norm_weight":
+            model.norm.weight = param
+        elif name.startswith("layer_"):
+            parts = name.split("_", 2)  # ["layer", "0", "in_proj_weight"]
+            layer_idx = int(parts[1])
+            param_name = parts[2]
+            model.layers[layer_idx].set_params({param_name: param})
+        elif name.startswith("ws_"):
+            ws_param_name = name[3:]  # strip "ws_" prefix
+            model.workspace.set_params({ws_param_name: param})
+        else:
+            print(f"WARNING: Unknown param name {name}")
+
+    def get_state(self) -> dict:
+        """Return optimizer state for checkpointing (transfers to host)."""
+        return {
+            "step_count": self.step_count,
+            "lr": self.lr,
+            "exp_avg": {k: ttnn.to_torch(v).clone() for k, v in self.exp_avg.items()},
+            "exp_avg_sq": {k: ttnn.to_torch(v).clone() for k, v in self.exp_avg_sq.items()},
+        }
+
+    def load_state(self, state: dict, model: TTMambaWorkspaceModel):
+        """Load optimizer state from checkpoint (transfers to device)."""
+        self.step_count = state.get("step_count", 0)
+        self.lr = state.get("lr", self.base_lr)
+        for name in self.param_names:
+            if name in state.get("exp_avg", {}):
+                host_m = state["exp_avg"][name]
+                self.exp_avg[name] = ttnn.from_torch(
+                    host_m, dtype=self.param_dtype[name], layout=ttnn.TILE_LAYOUT, device=self.device)
+            if name in state.get("exp_avg_sq", {}):
+                host_v = state["exp_avg_sq"][name]
+                self.exp_avg_sq[name] = ttnn.from_torch(
+                    host_v, dtype=self.param_dtype[name], layout=ttnn.TILE_LAYOUT, device=self.device)
+
+
+# ---------------------------------------------------------------------------
+# Loss function (cross-entropy on device)
+# ---------------------------------------------------------------------------
+
+def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
+    """Compute cross-entropy loss and gradient w.r.t. logits — fully on device.
+
+    logits_tt: (B, T, vocab_size) tt-nn tensor on device
+    labels: (B, T) PyTorch tensor
+    Returns: (loss_value, grad_logits_tt)
+    """
+    device = logits_tt.device()
+    B, T, V = labels.shape[0], labels.shape[1], logits_tt.shape[-1]
+
+    # Shift: predict token t+1 from token t — use logits[:, :-1], labels[:, :-1]
+    shift_logits = logits_tt[:, :-1, :]  # (B, T-1, V)
+    shift_labels = labels[:, :-1]  # (B, T-1) — keep original dtype for mask
+
+    # Create valid mask (1.0 for valid, 0.0 for ignore_index) — small tensor, host transfer is cheap
+    valid_mask_2d = (shift_labels != ignore_index).float()  # (B, T-1)
+    n_valid = int(valid_mask_2d.sum().item())
+    n_valid = max(n_valid, 1)  # avoid division by zero
+
+    # Safe labels: clamp negative to 0 for one-hot embedding lookup
+    safe_labels = shift_labels.clamp(min=0).to(torch.int32)  # (B, T-1)
+    flat_labels = safe_labels.reshape(-1)  # (B*(T-1),)
+
+    # Compute softmax on device
+    probs = ttnn.softmax(shift_logits, dim=-1)  # (B, T-1, V)
+
+    # Create one-hot encoding on device using embedding with identity matrix (cached)
+    cache_key = (V, device.id())
+    if cache_key not in _identity_cache:
+        identity = torch.eye(V, dtype=torch.bfloat16)
+        _identity_cache[cache_key] = ttnn.from_torch(identity, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    identity_tt = _identity_cache[cache_key]
+    label_indices = ttnn.from_torch(flat_labels.unsqueeze(-1), dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+    one_hot = ttnn.embedding(label_indices, identity_tt, layout=ttnn.TILE_LAYOUT)  # (B*(T-1), 1, V)
+    one_hot = ttnn.reshape(one_hot, [B, T - 1, V])
+
+    # Apply valid mask to one_hot: zero out invalid positions
+    mask_tt = ttnn.from_torch(
+        valid_mask_2d.unsqueeze(-1).to(torch.bfloat16),  # (B, T-1, 1)
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    one_hot_masked = ttnn.mul(one_hot, mask_tt)  # (B, T-1, V) — zero at invalid positions
+
+    # grad_logits = (probs - one_hot_masked) / n_valid
+    # At invalid positions, one_hot_masked=0, so grad = probs / n_valid
+    # But we want grad=0 at invalid positions, so mask the gradient too
+    inv_n_valid = 1.0 / n_valid
+    inv_n_valid_tt = ttnn.from_torch(
+        torch.tensor([inv_n_valid], dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+
+    grad_shift = ttnn.mul(ttnn.sub(probs, one_hot_masked), inv_n_valid_tt)  # (B, T-1, V)
+    grad_shift = ttnn.mul(grad_shift, mask_tt)  # zero out invalid positions
+
+    # Pad to (B, T, V) — last position has zero gradient
+    zeros_pad = ttnn.zeros((B, 1, V), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    grad_logits_tt = ttnn.concat([grad_shift, zeros_pad], dim=1)  # (B, T, V)
+
+    # Compute loss value on device: loss = -sum(one_hot_masked * log(probs)) / n_valid
+    probs_clamped = ttnn.clamp(probs, min=1e-8, max=1.0)
+    log_probs = ttnn.log(probs_clamped)  # (B, T-1, V)
+    neg_log_probs_at_target = ttnn.mul(one_hot_masked, log_probs)  # (B, T-1, V)
+    loss_sum = ttnn.sum(neg_log_probs_at_target)  # scalar
+    loss_value = -ttnn.to_torch(loss_sum).item() / n_valid
+
+    return loss_value, grad_logits_tt
+
+
+# ---------------------------------------------------------------------------
+# Gradient clipping and accumulation
+# ---------------------------------------------------------------------------
+
+def clip_grad_norm(grads: dict, max_norm: float) -> float:
+    """Clip gradient norm in-place on device. Returns the original norm.
+
+    Computes sum of squares on device, accumulates in a single device scalar
+    (only one host sync at the end), then scales gradients on device if needed.
+    """
+    if not grads:
+        return 0.0
+
+    device = next(iter(grads.values())).device()
+
+    # Accumulate total norm squared on device — avoid per-tensor host sync
+    total_norm_sq_tt = ttnn.from_torch(
+        torch.tensor([0.0], dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+
+    for tt_grad in grads.values():
+        sq = ttnn.mul(tt_grad, tt_grad)  # element-wise square (on device)
+        norm_sq = ttnn.sum(sq)  # scalar on device
+        total_norm_sq_tt = ttnn.add(total_norm_sq_tt, norm_sq)  # accumulate on device
+
+    # Single host sync to get the total norm
+    total_norm_sq = ttnn.to_torch(total_norm_sq_tt).item()
+    total_norm = math.sqrt(total_norm_sq)
+
+    if total_norm > max_norm and total_norm > 0:
+        scale = max_norm / (total_norm + 1e-6)
+        scale_tt = ttnn.from_torch(
+            torch.tensor([scale], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        for name in grads:
+            grads[name] = ttnn.mul(grads[name], scale_tt)
+
+    return total_norm
+
+
+def accumulate_grads(acc_grads: dict, new_grads: dict, accum_factor: int):
+    """Accumulate new gradients into the running sum (host-side).
+
+    acc_grads: dict of name -> host fp32 tensor (running sum)
+    new_grads: dict of name -> tt-nn gradient tensor
+    accum_factor: divide new grads by this before adding
+    """
+    for name, tt_grad in new_grads.items():
+        grad_host = ttnn.to_torch(tt_grad).float() / accum_factor
+        if name not in acc_grads:
+            acc_grads[name] = grad_host.clone()
+        else:
+            acc_grads[name] += grad_host
+
+
+def host_grads_to_tt(acc_grads: dict, device) -> dict:
+    """Convert accumulated host gradients back to tt-nn tensors."""
+    tt_grads = {}
+    for name, grad_host in acc_grads.items():
+        dtype = ttnn.float32 if "A_log" in name or name.endswith("_D") else ttnn.bfloat16
+        tt_grads[name] = ttnn.from_torch(
+            grad_host.to(torch.float32 if dtype == ttnn.float32 else torch.bfloat16),
+            dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
+        )
+    return tt_grads
+
+
+# ---------------------------------------------------------------------------
+# LR warmup
+# ---------------------------------------------------------------------------
+
+def get_lr(step: int, base_lr: float, warmup_steps: int) -> float:
+    """Linear warmup from 0 to base_lr over warmup_steps, then constant."""
+    if warmup_steps <= 0:
+        return base_lr
+    if step >= warmup_steps:
+        return base_lr
+    return base_lr * step / warmup_steps
+
+
+# ---------------------------------------------------------------------------
+# Profiling / bottleneck analysis
+# ---------------------------------------------------------------------------
+
+class Profiler:
+    """Simple timing profiler for identifying bottlenecks."""
+
+    def __init__(self):
+        self.times = {}
+        self.counts = {}
+
+    def time_section(self, name: str):
+        """Context manager for timing a section."""
+        class Timer:
+            def __init__(self, profiler, section):
+                self.profiler = profiler
+                self.section = section
+
+            def __enter__(self):
+                self.t0 = time.time()
+                return self
+
+            def __exit__(self, *args):
+                dt = time.time() - self.t0
+                self.profiler.times[self.section] = self.profiler.times.get(self.section, 0) + dt
+                self.profiler.counts[self.section] = self.profiler.counts.get(self.section, 0) + 1
+
+        return Timer(self, name)
+
+    def report(self) -> str:
+        """Return a formatted report of timing breakdown."""
+        lines = []
+        total = sum(self.times.values())
+        for name in sorted(self.times.keys(), key=lambda x: -self.times[x]):
+            t = self.times[name]
+            n = self.counts[name]
+            pct = 100 * t / total if total > 0 else 0
+            avg = t / n if n > 0 else 0
+            lines.append(f"  {name:>25s}: {t:>8.3f}s ({pct:>5.1f}%)  avg={avg:.4f}s  n={n}")
+        lines.append(f"  {'TOTAL':>25s}: {total:>8.3f}s")
+        return "\n".join(lines)
+
+    def reset(self):
+        self.times.clear()
+        self.counts.clear()
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+def train(config_path: str, steps_override=None, micro_batch_override=None,
+          accum_steps_override=None, profile=False,
+          checkpoint_dir_override=None, resume=None, device_id=0):
+    """Train the model on TT hardware using a YAML config."""
+    cfg = load_config(config_path)
+    cell = cfg.get("cell", "A")
+
+    # Training hyperparams
+    max_steps = steps_override if steps_override else cfg.get("max_steps", 10000)
+    tokens_per_batch = cfg.get("tokens_per_batch", 250000)
+    seq_len = cfg.get("seq_len", 128)
+    base_lr = cfg.get("lr", 6e-4)
+    warmup_steps = cfg.get("warmup_steps", 200)
+    weight_decay = cfg.get("weight_decay", 0.1)
+    grad_clip = cfg.get("grad_clip", 1.0)
+    depth_range = tuple(cfg.get("depth_range", [2, 8]))
+    seed = cfg.get("seed", 42)
+    eval_interval = cfg.get("eval_interval", 500)
+    log_interval = cfg.get("log_interval", 50)
+    checkpoint_interval = cfg.get("checkpoint_interval", 900)
+    ckpt_dir = checkpoint_dir_override or cfg.get("ckpt_dir", "checkpoints")
+
+    # Micro-batch size: from config override or auto-computed
+    if micro_batch_override:
+        micro_batch = micro_batch_override
+    else:
+        micro_batch = cfg.get("micro_batch_size", 0)
+        if micro_batch == 0:
+            micro_batch = 8  # default conservative
+
+    # Compute gradient accumulation steps
+    tokens_per_micro = micro_batch * seq_len
+    if accum_steps_override:
+        accum_steps = accum_steps_override
+    else:
+        accum_steps = max(1, tokens_per_batch // tokens_per_micro)
+    effective_batch = micro_batch * accum_steps
+    effective_tokens = effective_batch * seq_len
+
+    print(f"=== TT-nn Training: Cell {cell} ===", flush=True)
+    print(f"Config: {config_path}", flush=True)
+
+    # Open device — always open logical device 0.
+    # TT_VISIBLE_DEVICES (set at script start) remaps the physical chip
+    # specified by --device to logical 0, so each process only sees its
+    # own chip and there is no driver-level contention between processes.
+    device = ttnn.open_device(device_id=0)
+    print(f"Device: {device} (physical device {device_id} via TT_VISIBLE_DEVICES)", flush=True)
+
+    # Build model config
+    model_config = build_model_config(cfg)
+
+    # Check for unsupported features
+    # (all cells now supported)
+
+    # Create model
+    model = TTMambaWorkspaceModel(model_config, device)
+    n_params = model.get_num_params()
+    print(f"Model: {model_config.n_layers} layers, d_model={model_config.d_model}, "
+          f"expand={model_config.expand}, n_heads={model_config.n_heads}", flush=True)
+    print(f"Params: {n_params:,} ({n_params/1e6:.2f}M)", flush=True)
+    print(f"bf16 param memory: {n_params * 2 / 1e6:.1f} MB", flush=True)
+
+    # Create optimizer
+    optimizer = TTAdamW(model.get_params(), lr=base_lr, weight_decay=weight_decay)
+
+    # Resume from checkpoint
+    start_step = 0
+    if resume and os.path.exists(resume):
+        opt_state = model.load_checkpoint(resume, device=device)
+        if opt_state:
+            optimizer.load_state(opt_state, model)
+            start_step = optimizer.step_count
+        print(f"Resumed from step {start_step}", flush=True)
+
+    # Data
+    vocab = Vocab()
+    rng = random.Random(seed)
+
+    # Checkpoint directory
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Print training config
+    print(f"\nTraining config:", flush=True)
+    print(f"  micro_batch={micro_batch}, accum_steps={accum_steps}, "
+          f"effective_batch={effective_batch}", flush=True)
+    print(f"  seq_len={seq_len}, tokens_per_batch={tokens_per_batch}", flush=True)
+    print(f"  effective_tokens/step={effective_tokens}", flush=True)
+    print(f"  lr={base_lr}, warmup={warmup_steps}, weight_decay={weight_decay}, "
+          f"grad_clip={grad_clip}", flush=True)
+    print(f"  max_steps={max_steps}", flush=True)
+    if profile:
+        print(f"  Profiling: ENABLED", flush=True)
+
+    print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10}", flush=True)
+
+    profiler = Profiler()
+    total_time = 0
+    total_tokens = 0
+
+    for step in range(start_step, max_steps):
+        t_step_start = time.time()
+
+        # Update LR (warmup)
+        current_lr = get_lr(step, base_lr, warmup_steps)
+        optimizer.set_lr(current_lr)
+
+        # Gradient accumulation
+        accum_grads = {}  # host-side accumulated gradients
+        step_loss = 0.0
+
+        for accum_idx in range(accum_steps):
+            # Sample micro-batch
+            if profile:
+                with profiler.time_section("data_sample"):
+                    input_ids, labels, task_ids = sample_batch(
+                        micro_batch, seq_len, vocab, depth_range=depth_range, rng=rng
+                    )
+            else:
+                input_ids, labels, task_ids = sample_batch(
+                    micro_batch, seq_len, vocab, depth_range=depth_range, rng=rng
+                )
+
+            # Forward — sample K for recurrent core (Cell D)
+            k_value = None
+            if model_config.recurrent_core:
+                k_value = random.randint(1, model_config.k_train_max)
+
+            if profile:
+                with profiler.time_section("forward"):
+                    logits = model.forward(input_ids, k_value=k_value)
+            else:
+                logits = model.forward(input_ids, k_value=k_value)
+
+            # Loss + gradient
+            if profile:
+                with profiler.time_section("loss"):
+                    loss_val, grad_logits = cross_entropy_loss(logits, labels)
+            else:
+                loss_val, grad_logits = cross_entropy_loss(logits, labels)
+
+            step_loss += loss_val
+
+            # Backward
+            if profile:
+                with profiler.time_section("backward"):
+                    grads = model.backward(grad_logits)
+            else:
+                grads = model.backward(grad_logits)
+
+            # Accumulate gradients (host-side)
+            if profile:
+                with profiler.time_section("grad_accum"):
+                    accumulate_grads(accum_grads, grads, accum_steps)
+            else:
+                accumulate_grads(accum_grads, grads, accum_steps)
+
+        # Average loss over accumulation steps
+        step_loss /= accum_steps
+
+        # Convert accumulated gradients to tt-nn tensors
+        if profile:
+            with profiler.time_section("grad_to_tt"):
+                tt_grads = host_grads_to_tt(accum_grads, device)
+        else:
+            tt_grads = host_grads_to_tt(accum_grads, device)
+
+        # Gradient clipping
+        grad_norm = 0.0
+        if grad_clip > 0:
+            if profile:
+                with profiler.time_section("grad_clip"):
+                    grad_norm = clip_grad_norm(tt_grads, grad_clip)
+            else:
+                grad_norm = clip_grad_norm(tt_grads, grad_clip)
+
+        # Optimizer step
+        if profile:
+            with profiler.time_section("optimizer"):
+                optimizer.step(tt_grads, model)
+        else:
+            optimizer.step(tt_grads, model)
+
+        t_step_end = time.time()
+        step_time = t_step_end - t_step_start
+        total_time += step_time
+        total_tokens += effective_tokens
+        tokens_per_sec = effective_tokens / step_time
+
+        if step < 50 or step % log_interval == 0 or step == max_steps - 1:
+            print(f"{step:>6} {step_loss:>10.4f} {current_lr:>10.6f} "
+                  f"{step_time:>7.2f}s {tokens_per_sec:>10.0f} {grad_norm:>10.4f}", flush=True)
+
+        # Checkpoint
+        if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:
+            ckpt_path = os.path.join(ckpt_dir, f"cell_{cell}_step{step+1}.pt")
+            model.save_checkpoint(ckpt_path, optimizer_state=optimizer.get_state(), step=step+1)
+
+        # Profile report every 100 steps during profiling
+        if profile and step > 0 and (step + 1) % 100 == 0:
+            print(f"\n--- Profile report (steps {step-98}-{step}) ---", flush=True)
+            print(profiler.report(), flush=True)
+            profiler.reset()
+            print("", flush=True)
+
+    # Final checkpoint
+    final_path = os.path.join(ckpt_dir, f"cell_{cell}_final.pt")
+    model.save_checkpoint(final_path, optimizer_state=optimizer.get_state(), step=max_steps)
+
+    # Final profile report
+    if profile and profiler.counts:
+        print(f"\n--- Final profile report ---", flush=True)
+        print(profiler.report(), flush=True)
+
+    avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
+    print(f"\nTotal time: {total_time:.1f}s", flush=True)
+    print(f"Avg step: {total_time/(max_steps-start_step):.2f}s", flush=True)
+    print(f"Avg throughput: {avg_tokens_per_sec:.0f} tokens/sec", flush=True)
+    print(f"Total tokens: {total_tokens:,}", flush=True)
+    ttnn.close_device(device)
+    print("Training complete.", flush=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="TT-nn native training")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to YAML config file")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Override max_steps from config")
+    parser.add_argument("--micro_batch", type=int, default=None,
+                        help="Override micro-batch size")
+    parser.add_argument("--accum_steps", type=int, default=None,
+                        help="Override gradient accumulation steps")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable per-section profiling")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="Override checkpoint directory")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    parser.add_argument("--device", type=int, default=0,
+                        help="Tenstorrent device ID (0-3 for Quietbox 2)")
+    args = parser.parse_args()
+
+    train(
+        config_path=args.config,
+        steps_override=args.steps,
+        micro_batch_override=args.micro_batch,
+        accum_steps_override=args.accum_steps,
+        profile=args.profile,
+        checkpoint_dir_override=args.checkpoint_dir,
+        resume=args.resume,
+        device_id=args.device,
+    )

@@ -1,0 +1,27 @@
+# Tenstorrent venv (project-local)
+.tt-venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# TT-metal generated files (kernel cache, watcher, inspector)
+generated/
+mamba-poc/generated/
+
+# Per-cell isolated run directories (workdirs, caches, checkpoints, logs)
+mamba-poc/run_A/
+mamba-poc/run_B/
+mamba-poc/run_C/
+mamba-poc/run_D/
+
+# Checkpoints and logs
+mamba-poc/checkpoints/
+mamba-poc/logs/
+
+# TT-metal kernel cache
+mamba-poc/tt_cache/
+mamba-poc/lib64
+
+# Temporary bug report
+mamba-poc/TT_BUG_REPORT.md
