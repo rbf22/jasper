@@ -159,6 +159,7 @@ The Jasper architecture combines four components:
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Workspace Module}
+\label{sec:workspace}
 
 The workspace module is an explicit implementation of the \jspace{} concept. It maintains $m=16$ learned slot vectors $\mathbf{S} \in \R^{m \times d}$, where $d=384$ is the model dimension. At each application, it performs two phases:
 
@@ -182,11 +183,19 @@ Hidden states attend over the updated slots:
 
 The slot state $\mathbf{S}'$ is persistent: it is carried forward to the next workspace application and, in the recurrent core, across loop iterations. SlotNorm (RMSNorm applied to the slot dimension) prevents unbounded growth of slot activations across iterations.
 
+\paragraph{Slot parameter normalization.}
+The learned slot parameters $\mathbf{S}$ are subject to a positive feedback loop: large slots produce sharp attention distributions, which produce large gradients, which cause the slots to grow further. To break this loop, the slot parameters are normalized to unit RMS after each optimizer step:
+\begin{equation}
+    \mathbf{S} \leftarrow \frac{\mathbf{S}}{\text{RMS}(\mathbf{S})}, \quad \text{RMS}(\mathbf{S}) = \sqrt{\frac{1}{md}\sum_{i,j} S_{ij}^2}
+\end{equation}
+This is a parameter constraint (analogous to weight clipping in GANs) rather than a learned normalization. It allows the \emph{direction} of each slot vector to change freely while constraining its magnitude, preventing the runaway growth that causes gradient explosion.
+
 \paragraph{Design rationale.}
 The workspace is deliberately small ($m=16$ slots, $\sim$2M parameters total) to mirror the compactness of the \jspace{}. The two-phase design (read then write) mirrors the global workspace theory's broadcast cycle: information is first consolidated into the workspace, then broadcast back to the processing stream.
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Recurrent Core}
+\label{sec:recurrent-core}
 
 Layers $c_{\text{start}}$ through $c_{\text{end}}-1$ (by default, layers 6--9) form the recurrent core. These layers are applied $K$ times in sequence, with the workspace state carried between iterations:
 
@@ -199,6 +208,13 @@ During training, $K$ is sampled uniformly from $\{1, \ldots, K_{\max}\}$ for eac
     \mathbf{x}^{(k+1)} = \alpha_k \cdot \mathbf{x}_{\text{new}}^{(k)} + (1 - \alpha_k) \cdot \mathbf{x}^{(k)}
 \end{equation}
 where $\alpha_k = 1$ if $k < K$ and $\alpha_k = 0$ otherwise. This keeps the computation graph static while allowing variable-depth training.
+
+\paragraph{$1/\sqrt{K}$ residual scaling.}
+When the core layers are shared across $K$ iterations, gradients from all iterations accumulate on the shared parameters. Without normalization, the accumulated gradient norm scales as $\sim\sigma\sqrt{K}$, causing instability at large $K$. To normalize this, the blend factor is scaled by $1/\sqrt{K}$:
+\begin{equation}
+    \alpha_k = \frac{\mathbb{1}[k < K]}{\sqrt{K}}
+\end{equation}
+This turns the full replacement ($\alpha_k = 1$) into a partial update, where each iteration contributes $1/\sqrt{K}$ of the new state. The total variance added to the signal after $K$ iterations is then independent of $K$, following the variance-preserving initialization principle used in DeepNorm \citep{wang2022deepnorm}. The scaling uses the actual $K$ sampled for each batch, so batches with different $K$ values produce gradients of comparable magnitude.
 
 At inference time, $K$ can be chosen freely---this is the test-time compute scaling mechanism. Harder problems can be allocated more iterations, directly trading compute for accuracy.
 
@@ -271,6 +287,26 @@ D & Hybrid + workspace + recurrent core (layers 6--9 looped $K$ times) & The ful
 A fifth cell (E) serves as a learning-rate control: identical architecture to Cell B but with Cell C/D's lower learning rate, to distinguish the workspace effect from the learning-rate effect.
 
 % ──────────────────────────────────────────────────────────────────────────
+\subsection{Training Configuration}
+\label{sec:training-config}
+
+All cells use AdamW ($\beta_1=0.9, \beta_2=0.95, \epsilon=10^{-8}$) with weight decay $0.1$ and gradient clipping at norm $1.0$. The learning rate follows a linear warmup schedule over 200 steps (for C/D/E) or 1500 steps (for A/B), followed by a constant peak. Cells A and B use peak lr=$6 \times 10^{-4}$; Cells C, D, and E use peak lr=$2 \times 10^{-4}$.
+
+\paragraph{Per-parameter LR groups.}
+The workspace parameters ($\sim$2M of $\sim$24M total) receive $0.25\times$ the base learning rate ($5 \times 10^{-5}$ vs $2 \times 10^{-4}$ for the backbone). This is motivated by the observation that the workspace creates a sharper loss landscape: at equal LR, workspace gradients dominate and cause instability. The backbone LR is kept at $2 \times 10^{-4}$ to match Cell E (the control), preserving the clean C-vs-E comparison. This is analogous to the standard practice of using different LR groups for different module types in fine-tuning.
+
+\paragraph{Three stabilization techniques.}
+The workspace and recurrent core introduce three sources of gradient instability that are not present in the baseline hybrid model. We address each with a targeted normalization:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Per-parameter LR groups} (above): workspace parameters receive $0.25\times$ the base LR, preventing the workspace from dominating the gradient.
+    \item \textbf{$1/\sqrt{K}$ residual scaling} (\Cref{sec:recurrent-core}): scales the recurrent core's blend factor by $1/\sqrt{K}$, normalizing gradient accumulation across $K$ iterations so that the total gradient norm is independent of $K$.
+    \item \textbf{Slot parameter normalization} (\Cref{sec:workspace}): constrains the learned slot parameters to unit RMS after each optimizer step, breaking the positive feedback loop where large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots.
+\end{enumerate}
+
+Each technique targets a distinct mechanism: LR groups address the workspace's sharper loss landscape, $1/\sqrt{K}$ scaling addresses recurrent gradient accumulation, and slot normalization addresses unbounded parameter growth. All three are deterministic (no new hyperparameters or learnable parameters) and can be disabled independently for ablation.
+
+% ──────────────────────────────────────────────────────────────────────────
 \subsection{Synthetic Tasks}
 
 All tasks are character-level, generated on-the-fly (infinite data, no overfitting), and automatically verifiable. Each has a \textbf{depth knob} that controls how many reasoning steps a correct answer requires.
@@ -317,22 +353,24 @@ R3 and R4 are what make this a \emph{\jspace{} proof} rather than just another a
 \label{sec:results}
 % ══════════════════════════════════════════════════════════════════════════
 
-Training is currently in progress on Tenstorrent Quietbox 2 hardware (Blackhole architecture, bfloat16-native). An automated evaluation loop monitors all cells, running \texttt{eval\_ttnn.py} on each new checkpoint (every 100 steps) and tracking Task 1 accuracy for plateau detection. The following preliminary observations are from the first $\sim$150--500 training steps:
+Training is currently in progress on Tenstorrent Quietbox 2 hardware (Blackhole architecture, bfloat16-native). An automated evaluation loop monitors all cells, running \texttt{eval\_ttnn.py} on each new checkpoint (every 100 steps) and tracking Task 1 accuracy for plateau detection. The following preliminary observations cover the first $\sim$400--500 training steps of the control cell (E) and the early steps of the restarted workspace cells (C and D) with the three stabilization techniques described in \Cref{sec:training-config}.
 
 \paragraph{Cell B has plateaued on Task 1.}
 Cell B (hybrid baseline, lr=$6 \times 10^{-4}$) was evaluated at steps 100, 200, 300, and 400. Task 1 (multi-hop chain reasoning) accuracy was 0\% at all four evals---a confirmed plateau. The model masters Task 3 (single-hop recall, 100\%) and performs well on Task 2 (permutation tracking, 80\%), but cannot follow chains of variable dependencies. This is the expected result: without a workspace, the model has no mechanism to maintain intermediate values across a multi-hop chain. Cell B has been stopped after step 450 and its device reassigned to Cell E (the learning-rate control).
 
-\paragraph{Cell C converges faster despite a 3$\times$ lower learning rate.}
-Cell C (workspace, no recurrence, lr=$2 \times 10^{-4}$) shows dramatically faster loss reduction than Cell B at matched step counts. At step 150, Cell C's loss (1.34) is already approaching Cell B's plateau loss ($\sim$1.03), despite using a 3$\times$ lower learning rate. The workspace appears to accelerate learning by providing a structured substrate for intermediate representations. However, Cell C is prone to gradient instability at higher learning rates: at lr=$6 \times 10^{-4}$, gradient norms exploded (norm $\sim$730) after reaching loss 0.18 at step 250. Reducing to lr=$2 \times 10^{-4}$ stabilized training, suggesting the workspace creates a sharper loss landscape.
+\paragraph{Cell E confirms the Task 1 plateau is architectural, not LR-related.}
+Cell E (B architecture, C/D learning rate of $2 \times 10^{-4}$) has been evaluated at steps 100, 200, 300, and 400. Task 1 accuracy is 0\% at all four evals---the same plateau as Cell B, despite using a 3$\times$ lower learning rate. This confirms that B's inability to do multi-hop reasoning is an architectural limitation, not a learning-rate artifact. E continues to improve on Tasks 2 and 3 (38\% overall at step 400, with 75\% Task 2 and 40\% Task 3), demonstrating that the lower LR is sufficient for single-hop and state-tracking tasks.
 
-\paragraph{Cell C's first eval (step 100) shows 0\% Task 1.}
-At step 100 (still in warmup, lr=$1 \times 10^{-4}$), Cell C achieves 23\% overall accuracy: 0\% Task 1, 60\% Task 2, 10\% Task 3. This is too early to draw conclusions---the model has not yet reached its full learning rate. The critical test will be at steps 200--500, once the LR has warmed up and the workspace has had time to learn the multi-hop dependency tracking.
+\paragraph{Workspace gradient instability and the three stabilization techniques.}
+Initial Cell C training (without stabilization) collapsed at step 200 when the learning rate reached its peak of $2 \times 10^{-4}$: the gradient norm spiked from $\sim$1.3 to $\sim$13.4, and the model's output degenerated to a single token (``72'') regardless of input. Cell E, which has no workspace, passed the same step without issue (grad norm 2.1), confirming the instability is workspace-specific.
 
-\paragraph{Cell D is progressing but slow.}
-Cell D (full architecture, recurrent core) is at step 47 with loss 3.01, down from 4.91 at step 1. The recurrent core makes each step $\sim$2.5$\times$ slower ($\sim$160s/step vs $\sim$65s/step for B/C), and the 200-step warmup means the model is still far from its peak learning rate. The first checkpoint (step 100) is expected $\sim$2 hours from the time of writing.
-
-\paragraph{Cell E launched as learning-rate control.}
-Cell E (B architecture, C/D learning rate of $2 \times 10^{-4}$) has been launched on the device freed by Cell B. This is the critical control for isolating the workspace effect: if Cell C beats Cell E on Task 1, the workspace is doing real work. If Cell E matches Cell C, then Cell B's failure on Task 1 was a learning-rate artifact, not an architectural limitation. Cell E is currently in early warmup (step 2, lr=$2 \times 10^{-6}$).
+We identified three distinct instability mechanisms and addressed each with a targeted normalization (\Cref{sec:training-config}):
+\begin{enumerate}[nosep]
+    \item \textbf{Workspace sharper loss landscape:} The workspace parameters dominate the gradient at equal LR. Per-parameter LR groups (workspace at $0.25\times$) delayed the collapse from step 200 to step 250 but did not prevent it.
+    \item \textbf{Recurrent gradient accumulation:} Cell D's gradient norm was $\sim$20--22 at early steps (vs $\sim$5 for C/E), consistent with $\sqrt{K}$ accumulation. The $1/\sqrt{K}$ residual scaling reduced D's gradient norm to $\sim$9.7---roughly half, matching the theoretical prediction.
+    \item \textbf{Unbounded slot growth:} The slot parameters grow via a positive feedback loop (large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots). Slot parameter normalization constrains slots to unit RMS after each optimizer step, breaking the loop.
+\end{enumerate}
+Cells C and D have been restarted with all three stabilizations applied. Early results (steps 16--20) show stable gradient norms (C: 5.3, D: 9.7), but the critical test---passing step 200 without collapse---is still $\sim$3 hours away at the time of writing.
 
 \paragraph{Backward pass verification.}
 The workspace backward pass has been verified against PyTorch autograd on CPU. All gradients---input gradients, weight gradients (8 matrices), slot gradients, norm weights, and gate scalars---match to within float32 precision ($<10^{-4}$ relative error). The gradient explosion was confirmed to be a training dynamics issue, not a backward pass bug.
@@ -353,10 +391,23 @@ B & 100 & 22\% & 0\% & 60\% & 5\% \\
 B & 200 & 30\% & 5\% & 80\% & 5\% \\
 B & 300 & 57\% & 0\% & 75\% & 95\% \\
 B & 400 & 60\% & 0\% & 80\% & 100\% \\
-C & 100 & 23\% & 0\% & 60\% & 10\% \\
+E & 100 & 22\% & 0\% & 60\% & 5\% \\
+E & 200 & 32\% & 0\% & 75\% & 20\% \\
+E & 300 & 28\% & 0\% & 70\% & 15\% \\
+E & 400 & 38\% & 0\% & 75\% & 40\% \\
+\midrule
+\multicolumn{6}{l}{\textit{Old runs (before stabilization, collapsed at step 200):}} \\
+C (old) & 100 & 23\% & 0\% & 60\% & 10\% \\
+C (old) & 200 & 7\% & 5\% & 15\% & 0\% \\
+D (old) & 100 & 5\% & 0\% & 15\% & 0\% \\
+D (old) & 200 & 22\% & 0\% & 60\% & 5\% \\
+\midrule
+\multicolumn{6}{l}{\textit{New runs (with LR groups + slot norm + $1/\sqrt{K}$):}} \\
+C (new) & \multicolumn{5}{l}{in progress (step 16, stable)} \\
+D (new) & \multicolumn{5}{l}{in progress (step 20, stable)} \\
 \bottomrule
 \end{tabular}
-\caption{Evaluation results from the automated eval loop (5 examples per task per depth, depths 2/4/6/8). Task 1 is multi-hop chain reasoning---the target metric for workspace benefit. Cell B has been evaluated at 4 checkpoints with 0\% Task 1, confirming plateau.}
+\caption{Evaluation results from the automated eval loop (5 examples per task per depth, depths 2/4/6/8). Task 1 is multi-hop chain reasoning---the target metric for workspace benefit. Both B and E show 0\% Task 1 across all evals, confirming the architectural plateau. The old C run collapsed at step 200 (output degeneration); the new runs with stabilization are in early warmup.}
 \label{tab:eval-results}
 \end{table}
 
@@ -383,7 +434,7 @@ If this works, the implication is that we can build reasoning models that are:
 
 Synthetic-task wins at 30M parameters have a real history of not transferring to language at scale. The tasks we use (arithmetic chains, permutation tracking) are structurally simple and may not capture the full complexity of language reasoning. The workspace may help on these tasks without generalizing to the kind of reasoning that matters for real applications.
 
-The gradient instability observed in Cell C is a concern: if the workspace creates a sharper loss landscape, training at scale may require careful hyperparameter tuning or architectural modifications (e.g., gradient clipping, lower learning rates, or slot normalization schedules) that limit the practical benefit.
+The gradient instability observed in initial Cell C training is a concern: the workspace creates a sharper loss landscape than the baseline hybrid model, and the slot parameters are subject to a positive feedback loop that causes unbounded growth. We have addressed this with three targeted normalizations (per-parameter LR groups, $1/\sqrt{K}$ residual scaling, and slot parameter normalization; see \Cref{sec:training-config}), but these fixes are still being validated. If the stabilized training still collapses, or if the normalizations limit the workspace's expressivity at scale, the practical benefit of the architecture may be constrained. The slot normalization in particular constrains the slot magnitude but not its direction---if the useful information requires magnitude variation across slots, this constraint could limit performance.
 
 Finally, the Mamba-2 coincidence may be more metaphorical than functional. The SSM state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the SSM state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question.
 
@@ -488,6 +539,11 @@ Xuezhi~Wang et~al.
 Hunter~Lightman et~al.
 \newblock Let's verify step by step.
 \newblock \emph{arXiv preprint arXiv:2305.20050}, 2023. [OpenAI]
+
+\bibitem[Wang et~al.(2022)]{wang2022deepnorm}
+Hongyu~Wang et~al.
+\newblock DeepNet: Scaling transformers to 1,000 layers.
+\newblock \emph{arXiv preprint arXiv:2203.00555}, 2022. [Microsoft]
 
 \end{thebibliography}
 

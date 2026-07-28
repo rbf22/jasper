@@ -322,6 +322,16 @@ class WorkspaceModule(nn.Module):
         self.read_gate = nn.Parameter(torch.zeros(1))
         self.write_gate = nn.Parameter(torch.zeros(1))
 
+    def normalize_slots(self):
+        """Normalize slot parameters to unit RMS to prevent unbounded growth.
+
+        This breaks the feedback loop where large slots → sharp attention →
+        large gradients → larger slots. Called after each optimizer step.
+        """
+        with torch.no_grad():
+            rms = self.slots.pow(2).mean().sqrt().clamp(min=1e-6)
+            self.slots.data.div_(rms)
+
     def forward(self, x: torch.Tensor, slot_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: (B, T, D) — hidden states
@@ -464,10 +474,20 @@ class MambaWorkspaceModel(nn.Module):
         if config.recurrent_core:
             core_layers = list(range(config.core_start, config.core_end))
 
+            # 1/sqrt(K) residual scaling: normalizes gradient accumulation across K
+            # iterations so that the total gradient norm is independent of K.
+            # The blend factor becomes active/sqrt(K) instead of active, turning the
+            # full replacement (x = x_new) into a partial update:
+            #   x = (1 - active/sqrt(K)) * x + (active/sqrt(K)) * x_new
+            import math as _math
+            K_val = K.item() if isinstance(K, torch.Tensor) else K
+            k_scale = 1.0 / _math.sqrt(K_val) if K_val > 0 else 0.0
+
             if use_padding:
                 # XLA-friendly: always loop k_max times, mask iterations >= K
                 for iteration in range(k_max):
                     active = (torch.tensor(float(iteration), device=x.device) < K).to(x.dtype)
+                    blend = active * k_scale  # scaled blend factor
 
                     # Run one core iteration
                     x_new = x
@@ -479,14 +499,10 @@ class MambaWorkspaceModel(nn.Module):
                     if config.use_workspace:
                         x_new, slot_state_new = self.workspace(x_new, slot_state_new)
 
-                    # Blend: active iterations use new state, padding keeps old state
-                    if slot_state is None:
-                        # First iteration is always active (K >= 1)
-                        x = x_new
-                        slot_state = slot_state_new
-                    else:
-                        x = active * x_new + (1 - active) * x
-                        slot_state = active * slot_state_new + (1 - active) * slot_state
+                    # Blend: active iterations partially update state (1/sqrt(K) scaling),
+                    # padding iterations keep old state.
+                    x = blend * x_new + (1 - blend) * x
+                    slot_state = blend * slot_state_new + (1 - blend) * slot_state
             else:
                 # Probing path: loop exactly K times (dynamic, not compiled)
                 K_int = int(K.item()) if isinstance(K, torch.Tensor) else K
@@ -522,6 +538,15 @@ class MambaWorkspaceModel(nn.Module):
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def normalize_workspace_slots(self):
+        """Normalize workspace slot parameters to unit RMS.
+
+        Called after each optimizer step to prevent unbounded slot growth.
+        No-op if the model has no workspace.
+        """
+        if self.workspace is not None:
+            self.workspace.normalize_slots()
 
 
 def random_k(k_max: int, device: torch.device) -> int:

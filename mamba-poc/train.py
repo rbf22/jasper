@@ -499,6 +499,11 @@ def train(cfg: dict, config_path: str):
             optimizer.step()
         scheduler.step()
 
+        # Normalize workspace slot parameters after each optimizer step.
+        # Prevents unbounded slot growth which causes attention sharpening
+        # and gradient explosion. No-op for cells without a workspace.
+        model.normalize_workspace_slots()
+
         # TT/XLA: sync to trigger graph execution at step boundary
         if tt:
             import torch_xla

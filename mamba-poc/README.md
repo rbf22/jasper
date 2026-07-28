@@ -114,6 +114,18 @@ The `WorkspaceModule` is a perceiver-style cross-attention block with 16 learned
 
 Slot state persists across recurrent iterations (passed as `slot_state`), so each loop iteration reads and revises the same workspace — the model can iteratively refine its reasoning in the slots rather than in the token stream.
 
+### Training stabilization
+
+The workspace and recurrent core introduce three sources of gradient instability that are not present in the baseline hybrid model. Each is addressed with a targeted normalization:
+
+1. **Per-parameter LR groups** (`lr_groups` config field): Workspace parameters receive 0.25x the base learning rate (5e-5 vs 2e-4 for the backbone). The workspace creates a sharper loss landscape where equal-LR training causes workspace gradients to dominate and destabilize. The backbone LR is kept at 2e-4 to match Cell E (the control). Config: `lr_groups: {ws_: 0.25}`
+
+2. **1/sqrt(K) residual scaling** (in `model_ttnn.py` / `model.py`): The recurrent core's blend factor is scaled by 1/sqrt(K), turning the full replacement (x = x_new) into a partial update (x = (1/sqrt(K)) * x_new + (1 - 1/sqrt(K)) * x). This normalizes gradient accumulation across K iterations so the total gradient norm is independent of K. Uses the actual K sampled per batch. Based on the variance-preserving principle from DeepNorm.
+
+3. **Slot parameter normalization** (in `model_ttnn.py` / `model.py`): The learned slot parameters are normalized to unit RMS after each optimizer step, breaking the positive feedback loop: large slots → sharp attention → large gradients → larger slots. This is a parameter constraint (like weight clipping in GANs) that allows slot direction to change freely while constraining magnitude. Applied automatically in the training loop via `model.normalize_workspace_slots()`.
+
+All three are deterministic (no new hyperparameters or learnable parameters) and can be disabled independently for ablation.
+
 ---
 
 ## How to run
@@ -265,6 +277,7 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | Field | Default | Description |
 |-------|---------|-------------|
 | `lr` | 6e-4 (A/B), 2e-4 (C/D/E) | Peak learning rate (AdamW). C/D/E use lower LR due to workspace gradient dynamics. |
+| `lr_groups` | (none) | Per-parameter LR groups: prefix-to-multiplier mapping. E.g. `{ws_: 0.25}` gives workspace params 0.25x the base LR. |
 | `max_steps` | 10000 | Total training steps |
 | `tokens_per_batch` | 250000 | Target tokens per batch (overrides `batch_size` if set) |
 | `seq_len` | 128 | Sequence length |

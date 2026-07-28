@@ -1186,6 +1186,12 @@ class TTWorkspaceModule:
         self.norm = TTRMSNorm(self.d_model, device)       # for x
         self.slot_norm = TTRMSNorm(self.d_model, device)  # for slots
 
+        # Fixed weight for slot parameter normalization (not learned)
+        self._slot_param_norm_weight = ttnn.from_torch(
+            torch.ones(self.d_model, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+
         # Gates (init 0 -> sigmoid(0) = 0.5)
         self.read_gate = ttnn.from_torch(torch.zeros(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
         self.write_gate = ttnn.from_torch(torch.zeros(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
@@ -1433,6 +1439,16 @@ class TTWorkspaceModule:
             "read_gate": self.read_gate, "write_gate": self.write_gate,
         }
 
+    def normalize_slots(self):
+        """Normalize slot parameters to unit RMS to prevent unbounded growth.
+
+        This breaks the feedback loop where large slots → sharp attention →
+        large gradients → larger slots. Called after each optimizer step.
+        Uses fixed weight=1 (not learned) so the slots are constrained to
+        unit RMS regardless of training dynamics.
+        """
+        self.slots = ttnn.rms_norm(self.slots, weight=self._slot_param_norm_weight, epsilon=1e-6)
+
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         key_map = {
             "slots": "slots", "read_q_weight": "read_q_weight", "read_k_weight": "read_k_weight",
@@ -1544,10 +1560,22 @@ class TTMambaWorkspaceModel:
             core_layer_indices = list(range(config.core_start, config.core_end))
             self._core_blend_info = []  # (iter, active_scalar_tensor, x_before, slot_before, x_new, slot_new)
 
+            # 1/sqrt(K) residual scaling: normalizes gradient accumulation across K
+            # iterations so that the total gradient norm is independent of K.
+            # Without this, gradients from K iterations sum to ~K*sigma, causing
+            # instability at large K. With 1/sqrt(K) scaling, they sum to ~sqrt(K)*sigma.
+            # The blend factor becomes active/sqrt(K) instead of active, turning the
+            # full replacement (x = x_new) into a partial update:
+            #   x = (1 - active/sqrt(K)) * x + (active/sqrt(K)) * x_new
+            import math
+            k_scale = 1.0 / math.sqrt(K) if K > 0 else 0.0
+
             for iteration in range(k_max):
                 active = 1.0 if iteration < K else 0.0
+                # Scale the blend factor by 1/sqrt(K) for gradient normalization
+                blend_factor = active * k_scale
                 active_tt = ttnn.from_torch(
-                    torch.tensor([active], dtype=torch.bfloat16),
+                    torch.tensor([blend_factor], dtype=torch.bfloat16),
                     dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
                 )
 
@@ -1568,13 +1596,22 @@ class TTMambaWorkspaceModel:
                     x_new, slot_state_new = self.workspace.forward(x_new, slot_state_new)
                     self._fwd_trace.append(("ws", "core_end", iteration, -1, was_none))
 
-                # Blend: active iterations use new state, padding keeps old state
+                # Blend: active iterations partially update state (1/sqrt(K) scaling),
+                # padding iterations keep old state.
                 if slot_state is None:
                     # First iteration is always active (K >= 1)
-                    x = x_new
-                    slot_state = slot_state_new
+                    # Use scaled blend: x = blend * x_new + (1 - blend) * x
+                    x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
+                        ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                       dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                        active_tt), x))
+                    slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
+                                          ttnn.mul(ttnn.sub(
+                                              ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                                             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                                              active_tt), slot_state_new))
                 else:
-                    # x = active * x_new + (1 - active) * x
+                    # x = blend * x_new + (1 - blend) * x
                     x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
                         ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
                                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
@@ -1768,29 +1805,24 @@ class TTMambaWorkspaceModel:
                 active = blend["active"]
                 active_tt = blend["active_tt"]
 
-                if iter_num == 0:
-                    # First iteration: x = x_new (no blend), slot = slot_new (no blend)
-                    # grad flows directly into the core iteration
-                    pass  # grad_x and grad_slot_state already correct
+                # All iterations (including the first) use the scaled blend:
+                # x = blend * x_new + (1 - blend) * x_old
+                # grad_x_new = blend * grad_x  (flows into core layers)
+                # grad_x_old = (1 - blend) * grad_x  (flows to previous iteration or pre-core)
+                grad_x_new = ttnn.mul(active_tt, grad_x)
+                grad_x_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_x)
+                grad_slot_new = ttnn.mul(active_tt, grad_slot_state) if grad_slot_state is not None else None
+                grad_slot_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_slot_state) if grad_slot_state is not None else None
+                # grad_x for the core iteration = grad_x_new
+                # grad_x_old accumulates into the previous iteration's output
+                grad_x = grad_x_new
+                if grad_slot_old is not None:
+                    grad_slot_state = grad_slot_new
+                    # grad_slot_old will be added to the previous iteration's grad
+                    self._pending_grad_slot_old = grad_slot_old
                 else:
-                    # Blend: x = active * x_new + (1-active) * x_old
-                    # grad_x_new = active * grad_x
-                    # grad_x_old = (1-active) * grad_x
-                    # Same for slot_state
-                    grad_x_new = ttnn.mul(active_tt, grad_x)
-                    grad_x_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_x)
-                    grad_slot_new = ttnn.mul(active_tt, grad_slot_state) if grad_slot_state is not None else None
-                    grad_slot_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_slot_state) if grad_slot_state is not None else None
-                    # grad_x for the core iteration = grad_x_new
-                    # grad_x_old accumulates into the previous iteration's output
-                    grad_x = grad_x_new
-                    if grad_slot_old is not None:
-                        grad_slot_state = grad_slot_new
-                        # grad_slot_old will be added to the previous iteration's grad
-                        self._pending_grad_slot_old = grad_slot_old
-                    else:
-                        grad_slot_state = None
-                        self._pending_grad_slot_old = None
+                    grad_slot_state = None
+                    self._pending_grad_slot_old = None
 
                 # Backward through this iteration's entries (reverse)
                 for entry in reversed(entries):
@@ -1819,15 +1851,17 @@ class TTMambaWorkspaceModel:
                         else:
                             grad_slot_state = grad_slots_in
 
-                # After processing this iteration, add grad_x_old from blend (if not first iter)
-                if iter_num > 0:
-                    grad_x = ttnn.add(grad_x, grad_x_old)
-                    if hasattr(self, '_pending_grad_slot_old') and self._pending_grad_slot_old is not None:
-                        if grad_slot_state is None:
-                            grad_slot_state = self._pending_grad_slot_old
-                        else:
-                            grad_slot_state = ttnn.add(grad_slot_state, self._pending_grad_slot_old)
-                    self._pending_grad_slot_old = None
+                # After processing this iteration, add grad_x_old from blend.
+                # For iter_num > 0, grad_x_old flows to the previous iteration.
+                # For iter_num == 0, grad_x_old flows to the pre-core layers
+                # (it will be picked up by the pre-core backward below).
+                grad_x = ttnn.add(grad_x, grad_x_old)
+                if hasattr(self, '_pending_grad_slot_old') and self._pending_grad_slot_old is not None:
+                    if grad_slot_state is None:
+                        grad_slot_state = self._pending_grad_slot_old
+                    else:
+                        grad_slot_state = ttnn.add(grad_slot_state, self._pending_grad_slot_old)
+                self._pending_grad_slot_old = None
 
         # --- Backward through pre-core layers (reverse) ---
         for entry in reversed(pre_trace):
@@ -1905,6 +1939,16 @@ class TTMambaWorkspaceModel:
             total += t_host.numel()
         return total
 
+    def normalize_workspace_slots(self):
+        """Normalize workspace slot parameters to unit RMS.
+
+        Called after each optimizer step to prevent unbounded slot growth,
+        which causes attention sharpening and gradient explosion.
+        No-op if the model has no workspace.
+        """
+        if self.workspace is not None:
+            self.workspace.normalize_slots()
+
     def save_checkpoint(self, path: str, optimizer_state: dict = None, step: int = 0):
         """Save model checkpoint to a PyTorch state dict file.
 
@@ -1976,6 +2020,9 @@ class TTMambaWorkspaceModel:
             layer_idx = int(parts[1])
             param_name = parts[2]
             self.layers[layer_idx].set_params({param_name: tt_tensor})
+        elif name.startswith("ws_") and self.workspace is not None:
+            ws_param_name = name[3:]  # strip "ws_" prefix
+            self.workspace.set_params({ws_param_name: tt_tensor})
         else:
             print(f"WARNING: Unknown param name {name}")
 

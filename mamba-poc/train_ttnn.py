@@ -145,15 +145,32 @@ class TTAdamW:
 
     All optimizer state (exp_avg, exp_avg_sq) is kept on device.
     No host-device transfers during the optimizer step.
+
+    Supports per-parameter LR groups via lr_groups: a dict mapping
+    param name prefixes to LR multipliers. For example:
+        lr_groups={"ws_": 0.25}  # workspace params get 0.25x the base LR
+    Params not matching any prefix use the base LR (multiplier 1.0).
     """
 
-    def __init__(self, params: dict, lr=6e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1):
+    def __init__(self, params: dict, lr=6e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
+                 lr_groups: dict = None):
         self.base_lr = lr
         self.lr = lr
         self.beta1, self.beta2 = betas
         self.eps = eps
         self.weight_decay = weight_decay
         self.step_count = 0
+
+        # Per-parameter LR groups: prefix -> multiplier
+        self.lr_groups = lr_groups or {}
+        self.param_lr_mult = {}  # name -> multiplier (resolved at init)
+        for name in params:
+            mult = 1.0
+            for prefix, prefix_mult in self.lr_groups.items():
+                if name.startswith(prefix):
+                    mult = prefix_mult
+                    break
+            self.param_lr_mult[name] = mult
 
         self.param_names = list(params.keys())
         self.device = None  # set from first param
@@ -172,6 +189,10 @@ class TTAdamW:
 
     def set_lr(self, lr: float):
         self.lr = lr
+
+    def get_param_lr(self, name: str) -> float:
+        """Get the effective LR for a parameter, applying group multipliers."""
+        return self.lr * self.param_lr_mult.get(name, 1.0)
 
     def step(self, grads: dict, model: TTMambaWorkspaceModel):
         """Apply one optimizer step — fully on device.
@@ -197,7 +218,8 @@ class TTAdamW:
                 if grad.dtype != ttnn.float32:
                     grad = ttnn.typecast(grad, ttnn.float32)
                 param = model.get_params()[name]  # current param on device
-                lr, b1, b2, eps, wd = self.lr, self.beta1, self.beta2, self.eps, self.weight_decay
+                lr = self.get_param_lr(name)
+                b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
                 # m = b1*m + (1-b1)*g
                 m = ttnn.add(ttnn.mul(m, b1), ttnn.mul(grad, 1.0 - b1))
                 # v = b2*v + (1-b2)*g^2
@@ -222,9 +244,10 @@ class TTAdamW:
                 if grad.dtype != ttnn.bfloat16:
                     grad = ttnn.typecast(grad, ttnn.bfloat16)
                 param = model.get_params()[name]
+                lr = self.get_param_lr(name)
                 result = ttnn.moreh_adamw(
                     param, grad, m, v,
-                    lr=self.lr, beta1=self.beta1, beta2=self.beta2,
+                    lr=lr, beta1=self.beta1, beta2=self.beta2,
                     eps=self.eps, weight_decay=self.weight_decay,
                     step=self.step_count,
                 )
@@ -548,7 +571,15 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     print(f"bf16 param memory: {n_params * 2 / 1e6:.1f} MB", flush=True)
 
     # Create optimizer
-    optimizer = TTAdamW(model.get_params(), lr=base_lr, weight_decay=weight_decay)
+    # Per-parameter LR groups: allows different LR for workspace vs backbone
+    # Config format: lr_groups: {"ws_": 0.25}  → workspace params get 0.25x base LR
+    lr_groups = cfg.get("lr_groups", None)
+    optimizer = TTAdamW(model.get_params(), lr=base_lr, weight_decay=weight_decay,
+                        lr_groups=lr_groups)
+    if lr_groups:
+        ws_mult = lr_groups.get("ws_", 1.0)
+        ws_lr = base_lr * ws_mult
+        print(f"LR groups: workspace={ws_lr:.2e} ({ws_mult}x), backbone={base_lr:.2e}", flush=True)
 
     # Resume from checkpoint
     start_step = 0
@@ -666,6 +697,11 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 optimizer.step(tt_grads, model)
         else:
             optimizer.step(tt_grads, model)
+
+        # Normalize workspace slot parameters after each optimizer step.
+        # This prevents unbounded slot growth which causes attention sharpening
+        # and gradient explosion. No-op for cells without a workspace.
+        model.normalize_workspace_slots()
 
         t_step_end = time.time()
         step_time = t_step_end - t_step_start

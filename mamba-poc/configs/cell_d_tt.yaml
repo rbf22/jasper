@@ -20,6 +20,10 @@ k_inference: 6
 
 # Training
 lr: 2.0e-4
+# Per-parameter LR groups: workspace gets 0.25x base LR (5e-5) to prevent
+# gradient explosion at warmup peak. Backbone stays at 2e-4 to match Cell E.
+lr_groups:
+  ws_: 0.25
 max_steps: 10000
 tokens_per_batch: 250000
 seq_len: 128
