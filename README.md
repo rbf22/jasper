@@ -43,9 +43,9 @@ jasper/
 
 ---
 
-## The four model cells
+## The model cells
 
-The POC trains four parameter-matched variants (~30M params each) on synthetic tasks with controllable reasoning depth. The cells form an ablation ladder — each adds one component, so the marginal contribution of each is isolated.
+The POC trains five parameter-matched variants (~25–30M params each) on synthetic tasks with controllable reasoning depth. Cells A–D form an ablation ladder — each adds one component, so the marginal contribution of each is isolated. Cell E is a learning-rate control.
 
 | Cell | Architecture | Layers | What it tests |
 |------|-------------|--------|---------------|
@@ -53,8 +53,9 @@ The POC trains four parameter-matched variants (~30M params each) on synthetic t
 | **B** | Hybrid (Mamba2 + attention) | 12 Mamba2 + 2 attention at positions 5, 10 | The real baseline the workspace must beat — hybridization recovers retrieval capability |
 | **C** | Hybrid + workspace | 11 Mamba2 + 2 attention + perceiver workspace (16 slots) | Does an engineered workspace help without recurrence? |
 | **D** | Hybrid + workspace + recurrent core | 11 Mamba2 + 2 attention + workspace + layers 6–9 looped K times | The full architecture — does recurrence + workspace beat the hybrid baseline? |
+| **E** | Hybrid (same as B) with lower LR | 12 Mamba2 + 2 attention | Learning-rate control — B architecture with C/D's LR (2e-4), isolating the workspace effect from the LR effect |
 
-Cell D is the go/no-go cell. If it doesn't beat Cell B, the architecture bet is dead at zero cloud cost.
+Cell D is the go/no-go cell. If it doesn't beat Cell B, the architecture bet is dead at zero cloud cost. Cell E disambiguates: if C beats E on Task 1, the workspace is doing real work (not just the lower learning rate).
 
 ---
 
