@@ -2022,5 +2022,14 @@ def get_cell_config(cell: str) -> ModelConfig:
             k_train_max=6,
             k_inference=6,
         )
+    elif cell == "E":
+        # Control: B architecture (Mamba2 + attention) with C/D learning rate
+        return ModelConfig(
+            n_layers=14,
+            use_attention=True,
+            attention_positions=[5, 10],
+            use_workspace=False,
+            recurrent_core=False,
+        )
     else:
         raise ValueError(f"Unknown cell: {cell}")

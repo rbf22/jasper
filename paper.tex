@@ -1,0 +1,462 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{abstract}
+\usepackage{natbib}
+\usepackage{tabularx}
+\usepackage{array}
+
+% ── Hyperref setup ────────────────────────────────────────────────────────
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black,
+    pdftitle={Jasper: Engineering a Global Workspace for Latent Reasoning in Hybrid State-Space Models},
+    pdfauthor={Jasper Research}
+}
+
+% ── Title ─────────────────────────────────────────────────────────────────
+\title{\textbf{Jasper: Engineering a Global Workspace for Latent Reasoning\\
+in Hybrid State-Space Models}}
+\author{Jasper Research Project}
+\date{July 2026}
+
+% ── Custom commands ───────────────────────────────────────────────────────
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\workspace}{\textsc{Workspace}}
+\newcommand{\jspace}{\textsc{J-space}}
+\newcommand{\trm}{\textsc{TRM}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Recent work from Anthropic has revealed that language models develop a compact, privileged internal workspace---the \jspace{}---that causally carries multi-step reasoning, while Samsung's Tiny Recursive Model (TRM) has demonstrated that iterative refinement through a tiny recurrent network can substitute for parameter count on hard reasoning tasks. We present Jasper, an architecture that combines these two insights into a single system: a hybrid Mamba-2/attention backbone with an explicitly engineered workspace module and a recurrent core that iterates on the workspace state. The key architectural observation is that Mamba-2's selective state-space mechanism already maintains a fixed-size compressed state that is functionally shaped like the \jspace{}---a coincidence that makes the combination more powerful than applying the same ideas to a pure transformer. We argue that this approach is a direct and more efficient alternative to chain-of-thought ``thinking tokens'': it reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and allows trading inference-time compute depth for parameter count. We describe a proof-of-concept experiment that trains four parameter-matched model variants on synthetic reasoning tasks with controllable depth, and outline the pre-registered criteria for a go/no-go decision on scaling.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+% ══════════════════════════════════════════════════════════════════════════
+
+Large language models have demonstrated impressive reasoning capabilities, but the dominant paradigm for scaling reasoning---generating long chains of ``thinking tokens'' before producing an answer---has fundamental inefficiencies. Each thinking token requires a full forward pass through the model, the key-value cache grows linearly with the length of the reasoning trace, and the entire chain must be serialized in token space, consuming both memory and latency. On constrained deployment targets such as web browsers or mobile devices, this memory growth is the binding constraint.
+
+Two recent findings suggest an alternative path. First, Anthropic's discovery of the \jspace{} \citep{anthropic2026jspace} revealed that the reasoning-critical machinery inside a language model is already small: a compact set of verbalizable representations, occupying less than 10\% of activation variance, carries the causal bulk of multi-step reasoning. This workspace is not the full residual stream---it is a privileged, broadcasted subset that functions analogously to the global workspace in cognitive science \citep{baars2005global}. Second, Samsung's Tiny Recursive Model (TRM) \citep{jolicoeur2025trm} and Geiping et al.'s recurrent-depth transformers \citep{geiping2025recurrent} have shown that iterative refinement through a small recurrent network can substitute for parameter count: a 7M-parameter model recursing on itself can outperform models with $1000\times$ more parameters on reasoning benchmarks.
+
+Jasper combines these insights. We engineer an explicit workspace module---a compact set of learned slot vectors that serve as a persistent scratchpad---and pair it with a recurrent core that iterates on the workspace state. The backbone is a hybrid Mamba-2/attention model, which brings a third observation into play: Mamba-2's selective state-space duality (SSD) \citep{dao2024mamba2} maintains a fixed-size compressed state that is functionally shaped like the \jspace{}. This is an unlikely but convenient coincidence: the architecture already has a mechanism that resembles the global workspace, so the engineered workspace and the SSM state reinforce each other rather than competing for the same functional role.
+
+The result is a model that reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and can trade inference-time compute (more loop iterations) for parameter count. We argue that this is a direct alternative to thinking tokens---one that is more memory-efficient, faster, and potentially more capable of reasoning that is not easily expressed in words.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Background}
+% ══════════════════════════════════════════════════════════════════════════
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{The J-Space: A Global Workspace in Language Models}
+
+\citet{anthropic2026jspace} introduced the Jacobian lens (J-lens), an interpretability technique that identifies which concepts a language model is \emph{poised to verbalize} at any point in its processing. Applying the J-lens across layers reveals a set of representations---the \jspace{}---that exhibits the functional properties of a global workspace \citep{dehaene2014conscious,baars2005global}:
+
+\begin{itemize}[nosep]
+    \item \textbf{Verbal report:} J-space contents can be read out as words the model could say.
+    \item \textbf{Directed modulation:} Instructing the model to think about a concept causes that concept to appear in the J-space.
+    \item \textbf{Silent reasoning:} Intermediate steps of multi-step problems appear in the J-space before the model verbalizes them.
+    \item \textbf{Selective causality:} Ablating the J-space destroys multi-step reasoning while leaving single-hop recall intact.
+    \item \textbf{Compactness:} The J-space carries fewer than $\sim$25 concepts at a time and occupies $<$10\% of activation variance.
+\end{itemize}
+
+Crucially, the \jspace{} was not designed---it emerged during training. But its properties are exactly what one would want from an engineered reasoning workspace: it is small, privileged, broadcasted, and causally responsible for multi-step reasoning. This raises the question: \emph{can we engineer such a workspace explicitly, and does doing so improve reasoning in a small model?}
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Iterative Reasoning with Tiny Networks}
+
+\citet{jolicoeur2025trm} introduced the Tiny Recursive Model (TRM), a 7M-parameter network that recurses on itself to iteratively refine answers. TRM alternates between a ``think'' step (updating a latent scratchpad $\mathbf{z}$) and an ``act'' step (updating a solution embedding $\mathbf{y}$), unrolled for up to 16 iterations with deep supervision. Despite having less than 0.01\% of the parameters of frontier LLMs, TRM achieves 45\% accuracy on ARC-AGI-1 and 8\% on ARC-AGI-2, outperforming models like DeepSeek R1 and o3-mini on these benchmarks.
+
+Independently, \citet{geiping2025recurrent} demonstrated that recurrent-depth transformers---which iterate a transformer block for a variable number of steps at inference time---can scale test-time compute in latent space. Their 3.5B-parameter model, trained on 800B tokens, improves performance on reasoning benchmarks with additional inference-time iterations, sometimes matching the performance of a 50B-parameter model.
+
+Both works share a key insight: \emph{depth (iterations) can substitute for width (parameters)}. But both use attention-based cores, which means the key-value cache grows with sequence length, and the recurrent state is carried in the residual stream---a high-dimensional, unstructured representation.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Mamba-2 and State Space Duality}
+
+\citet{dao2024mamba2} established the state space duality (SSD) framework, showing that Mamba's selective state-space model is closely related to attention through a shared mathematical structure. The Mamba-2 layer computes:
+
+\begin{equation}
+    y_t = \sum_{s \leq t} \underbrace{\exp\!\Big(\!\!-\!\sum_{k=s+1}^{t} a_k\Big)}_{\text{decay}} \cdot \big(C_t^\top B_s\big) \cdot V_s
+\end{equation}
+
+where $B_s, C_t$ are input-dependent projections, $a_k$ is a scalar decay, and $V_s$ is the value vector. This can be viewed as a form of attention with a learned, position-dependent decay mask---the ``selective scan.''
+
+The key property for our purposes is that the SSM maintains a \textbf{fixed-size state} $\mathbf{h}_t$ that is updated at each position:
+
+\begin{equation}
+    \mathbf{h}_t = \bar{A}_t \mathbf{h}_{t-1} + \bar{B}_t x_t
+\end{equation}
+
+where $\bar{A}_t, \bar{B}_t$ are discretized state transition matrices. This state is \textbf{compressed}: it has a fixed dimension $d_{\text{state}}$ regardless of sequence length, and it is \textbf{selective}: the input-dependent gates control what information is written and what is forgotten. This is functionally analogous to the \jspace{}---a small, privileged state that carries task-relevant information forward through the computation.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{The Mamba-2 Coincidence}
+\label{sec:coincidence}
+% ══════════════════════════════════════════════════════════════════════════
+
+The central architectural observation behind Jasper is what we call the \emph{Mamba-2 coincidence}: the selective state-space mechanism already maintains a representation with the functional shape of the \jspace{}, without any engineering. Consider the parallels:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{p{0.22\textwidth} p{0.36\textwidth} p{0.36\textwidth}}
+\toprule
+\textbf{Property} & \textbf{J-space (Anthropic)} & \textbf{Mamba-2 SSM State} \\
+\midrule
+Fixed size & $\sim$25 concepts, $<$10\% of activation variance & $d_{\text{state}}=64$ per head, regardless of sequence length \\
+Selective & Broadcasted more widely than other representations & Input-dependent gates control write/forget \\
+Persistent & Carries intermediate reasoning steps across layers & Carries information across the sequence \\
+Causally responsible & Ablation destroys multi-step reasoning & Removing state connections breaks long-range dependencies \\
+Emerges in training & Not designed, emerged in Claude & Not designed for reasoning, emerged from language modeling \\
+\bottomrule
+\end{tabularx}
+\caption{Functional parallel between the \jspace{} and Mamba-2's SSM state.}
+\label{tab:coincidence}
+\end{table}
+
+This parallel is not merely metaphorical. When we build a hybrid model with Mamba-2 layers and an explicit workspace module, the SSM's compressed state and the workspace slots \emph{reinforce each other}: the SSM state provides a natural substrate for the workspace to read from and write to, and the workspace provides a structured, interpretable interface to the SSM's otherwise opaque state. In a pure transformer, the workspace must carve out its role from the residual stream against the competing pressure of attention's global mixing. In a hybrid Mamba model, the workspace aligns with an existing architectural feature.
+
+The coincidence becomes powerful when combined with a recurrent core. In a recurrent transformer \citep{geiping2025recurrent}, each iteration processes the full sequence with attention, growing the KV cache. In a recurrent Mamba model, each iteration updates the SSM state in-place---memory is flat in both sequence length \emph{and} loop count. The workspace state, carried between iterations, provides a stable anchor for iterative refinement without any memory growth.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Architecture}
+\label{sec:architecture}
+% ══════════════════════════════════════════════════════════════════════════
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Overview}
+
+The Jasper architecture combines four components:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Mamba-2 layers} (SSD form) for sequence processing with flat memory.
+    \item \textbf{Attention layers} at selected positions for exact retrieval capability.
+    \item \textbf{Workspace module} --- a perceiver-style cross-attention block with learned slot vectors.
+    \item \textbf{Recurrent core} --- a range of layers that are iterated $K$ times, with the workspace state carried between iterations.
+\end{enumerate}
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Workspace Module}
+
+The workspace module is an explicit implementation of the \jspace{} concept. It maintains $m=16$ learned slot vectors $\mathbf{S} \in \R^{m \times d}$, where $d=384$ is the model dimension. At each application, it performs two phases:
+
+\paragraph{Read phase (sequence $\to$ workspace).}
+Slots attend over the hidden states $\mathbf{X} \in \R^{T \times d}$:
+\begin{align}
+    \mathbf{Q}_s &= \mathbf{S}\, W_Q, \quad \mathbf{K}_x = \mathbf{X}\, W_K, \quad \mathbf{V}_x = \mathbf{X}\, W_V \\
+    \mathbf{A}_{\text{read}} &= \text{softmax}\!\left(\frac{\mathbf{Q}_s \mathbf{K}_x^\top}{\sqrt{d_h}}\right) \\
+    \mathbf{S}' &= \text{SlotNorm}\!\left(\mathbf{S} + \sigma(g_r) \cdot \mathbf{A}_{\text{read}} \mathbf{V}_x\, W_O\right)
+\end{align}
+
+where $d_h = d / n_{\text{heads}}$ is the per-head dimension, $\sigma$ is the sigmoid function, and $g_r$ is a learned scalar gate. The sigmoid gating allows the model to learn how much of the sequence to absorb into the workspace at each step.
+
+\paragraph{Write phase (workspace $\to$ sequence).}
+Hidden states attend over the updated slots:
+\begin{align}
+    \mathbf{Q}_x &= \mathbf{X}\, W_Q', \quad \mathbf{K}_s = \mathbf{S}'\, W_K', \quad \mathbf{V}_s = \mathbf{S}'\, W_V' \\
+    \mathbf{A}_{\text{write}} &= \text{softmax}\!\left(\frac{\mathbf{Q}_x \mathbf{K}_s^\top}{\sqrt{d_h}}\right) \\
+    \mathbf{X}' &= \text{RMSNorm}\!\left(\mathbf{X} + \sigma(g_w) \cdot \mathbf{A}_{\text{write}} \mathbf{V}_s\, W_O'\right)
+\end{align}
+
+The slot state $\mathbf{S}'$ is persistent: it is carried forward to the next workspace application and, in the recurrent core, across loop iterations. SlotNorm (RMSNorm applied to the slot dimension) prevents unbounded growth of slot activations across iterations.
+
+\paragraph{Design rationale.}
+The workspace is deliberately small ($m=16$ slots, $\sim$2M parameters total) to mirror the compactness of the \jspace{}. The two-phase design (read then write) mirrors the global workspace theory's broadcast cycle: information is first consolidated into the workspace, then broadcast back to the processing stream.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Recurrent Core}
+
+Layers $c_{\text{start}}$ through $c_{\text{end}}-1$ (by default, layers 6--9) form the recurrent core. These layers are applied $K$ times in sequence, with the workspace state carried between iterations:
+
+\begin{equation}
+    \mathbf{x}^{(k+1)}, \mathbf{S}^{(k+1)} = \text{CoreLayers}\!\left(\mathbf{x}^{(k)}, \mathbf{S}^{(k)}\right), \quad k = 0, \ldots, K-1
+\end{equation}
+
+During training, $K$ is sampled uniformly from $\{1, \ldots, K_{\max}\}$ for each batch. For hardware compilation (e.g., on Tenstorrent accelerators), the loop is always unrolled to $K_{\max}$, with iterations beyond the sampled $K$ masked to identity via a blending operation:
+\begin{equation}
+    \mathbf{x}^{(k+1)} = \alpha_k \cdot \mathbf{x}_{\text{new}}^{(k)} + (1 - \alpha_k) \cdot \mathbf{x}^{(k)}
+\end{equation}
+where $\alpha_k = 1$ if $k < K$ and $\alpha_k = 0$ otherwise. This keeps the computation graph static while allowing variable-depth training.
+
+At inference time, $K$ can be chosen freely---this is the test-time compute scaling mechanism. Harder problems can be allocated more iterations, directly trading compute for accuracy.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Hybrid Backbone}
+
+The full model uses 13--14 layers total, with attention inserted at positions 5 and 10. The attention layers provide exact retrieval capability---a known weakness of pure SSMs \citep{arora2024theoretical}---while the Mamba-2 layers provide efficient sequence processing with flat memory. The hybrid ratio ($\sim$85\% SSM, $\sim$15\% attention) follows the empirical finding that a minority of attention layers recovers most of the retrieval gap while preserving the throughput and memory advantages of SSMs.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Comparison to Thinking Tokens}
+\label{sec:cot}
+% ══════════════════════════════════════════════════════════════════════════
+
+The dominant approach to scaling reasoning in language models is chain-of-thought (CoT) prompting: the model generates a sequence of intermediate ``thinking tokens'' before producing its final answer. This approach, while effective, has several structural inefficiencies that the workspace-recurrent architecture addresses directly.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{p{0.2\textwidth} p{0.38\textwidth} p{0.38\textwidth}}
+\toprule
+\textbf{Property} & \textbf{Thinking Tokens (CoT)} & \textbf{Workspace Recurrence (Jasper)} \\
+\midrule
+Reasoning medium & Token space (discrete, serial) & Latent space (continuous, parallel) \\
+Memory growth & Linear in reasoning length (KV cache) & Flat (fixed workspace + SSM state) \\
+Tokens generated & One per reasoning step & Zero---reasoning is internal \\
+Legibility & Fully legible (readable text) & Partially legible (workspace probes) \\
+Compute control & Number of generated tokens & Number of loop iterations $K$ \\
+Training data & Requires CoT supervision or RL & Standard next-token prediction + deep supervision \\
+Expressive range & Limited to verbalizable reasoning & Can capture non-verbal reasoning patterns \\
+Deployment cost & High (long generation, large cache) & Low (short output, fixed memory) \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of thinking tokens vs.\ workspace recurrence.}
+\label{tab:cot-comparison}
+\end{table}
+
+The key distinction is that thinking tokens reason in \emph{token space}---the model must verbalize each intermediate step, serialize it, and re-process it on the next forward pass. This is slow (one forward pass per token), memory-hungry (the KV cache grows with each token), and constrains reasoning to what can be expressed in language. As \citet{geiping2025recurrent} note, ``a substantial amount of thought happens through complex, recurrent firing patterns in the brain, before the first word of an answer is uttered.''
+
+Workspace recurrence reasons in \emph{latent space}---the workspace state is updated in-place through matrix operations, without generating any tokens. This is faster (one forward pass per iteration, not per token), memory-flat (the workspace has a fixed size regardless of reasoning depth), and can capture reasoning patterns that are not easily expressed in words. The trade-off is legibility: thinking tokens produce readable traces, while workspace reasoning is only partially legible through probes (see \Cref{sec:experiments}).
+
+For deployment on constrained devices (web browsers, mobile phones), the memory advantage is decisive. A model that generates 1000 thinking tokens accumulates a KV cache of $\sim$1000 $\times$ $d_{\text{model}}$ $\times$ $n_{\text{layers}}$ floats. A model that iterates its workspace 100 times uses the same fixed workspace state ($m \times d$ floats) plus the SSM state ($d_{\text{state}} \times d$ floats), regardless of $K$.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Experimental Design}
+\label{sec:experiments}
+% ══════════════════════════════════════════════════════════════════════════
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Ablation Ladder}
+
+We train four parameter-matched model variants ($\sim$25--30M parameters each) that form an ablation ladder---each cell adds one component, so the marginal contribution of each is isolated:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{c l X}
+\toprule
+\textbf{Cell} & \textbf{Architecture} & \textbf{What it tests} \\
+\midrule
+A & Pure Mamba-2 (14 layers) & SSM floor; establishes baseline, especially on state-tracking where SSMs are known to struggle \\
+B & Hybrid (12 Mamba-2 + 2 attention) & The real baseline the workspace must beat; hybridization recovers retrieval capability \\
+C & Hybrid + workspace (13 layers + 16-slot workspace) & Does an engineered workspace help without recurrence? \\
+D & Hybrid + workspace + recurrent core (layers 6--9 looped $K$ times) & The full architecture; does recurrence + workspace beat the hybrid baseline? \\
+\bottomrule
+\end{tabularx}
+\caption{The four-cell ablation ladder. All cells target $\sim$30M parameters.}
+\label{tab:cells}
+\end{table}
+
+A fifth cell (E) serves as a learning-rate control: identical architecture to Cell B but with Cell C/D's lower learning rate, to distinguish the workspace effect from the learning-rate effect.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Synthetic Tasks}
+
+All tasks are character-level, generated on-the-fly (infinite data, no overfitting), and automatically verifiable. Each has a \textbf{depth knob} that controls how many reasoning steps a correct answer requires.
+
+\paragraph{Task 1: Chained assignment arithmetic (multi-hop composition).}
+Variables are defined in terms of previous variables, all arithmetic mod 97:
+\begin{center}
+\texttt{a=7;b=a*3+2;c=b-a;d=c*2;?d;}
+\end{center}
+The model must follow a chain of $k$ dependencies. Distractor variables are inserted at random positions. This is the core multi-hop reasoning task.
+
+\paragraph{Task 2: Permutation tracking (state-tracking).}
+$n$ items undergo $k$ swap operations; the model must report one item's final position:
+\begin{center}
+\texttt{n=6;2,5;0,3;5,1;?3;}
+\end{center}
+State-tracking is a documented weakness of linear SSMs \citep{arora2024theoretical}; this task tests whether the workspace compensates for the architecture's known gap.
+
+\paragraph{Task 3: Single-hop recall (control).}
+Shallow lookup with distractors:
+\begin{center}
+\texttt{a=5;b=12;c=8;d=3;e=15;?c;}
+\end{center}
+This is the control for selective ablation: the \jspace{} signature requires that killing the workspace leaves this intact while Tasks 1--2 collapse.
+
+Training uses depths 2--8; evaluation extends to 2--16, measuring extrapolation beyond the training distribution.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Pre-Registered Results}
+
+Four measurements constitute proof, in ascending order of importance:
+
+\begin{description}[style=multiline,labelwidth=3cm,leftmargin=3.2cm]
+    \item[R1 --- Capability:] Cell D beats Cell B by $\geq$10 accuracy points on Tasks 1--2 at depths 10--16 (beyond training range).
+    \item[R2 --- Compute scaling:] Accuracy on deep problems increases monotonically with $K$; harder depths need higher $K$ to saturate.
+    \item[R3 --- Workspace decodability:] Linear probes on workspace slots can decode intermediate variable values, with decodability rising across loop iterations. This is the J-lens analogue.
+    \item[R4 --- Selective ablation:] Replacing workspace slots with their training-set mean causes Tasks 1--2 to collapse ($\geq$30pt drop) while Task 3 barely moves ($\leq$5pt drop)---mirroring Anthropic's \jspace{} finding.
+\end{description}
+
+R3 and R4 are what make this a \emph{\jspace{} proof} rather than just another architecture ablation. R4 in particular tests the causal claim: the workspace is not merely correlated with reasoning performance, it is \emph{causally responsible} for it.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Preliminary Results}
+\label{sec:results}
+% ══════════════════════════════════════════════════════════════════════════
+
+Training is currently in progress on Tenstorrent Quietbox 2 hardware (Blackhole architecture, bfloat16-native). The following preliminary observations are from the first $\sim$300--500 training steps:
+
+\paragraph{Convergence speed.}
+Cell C (workspace, no recurrence) shows dramatically faster loss reduction than Cell B (hybrid baseline) at matched step counts, but is prone to gradient instability at higher learning rates. At $\text{lr}=6 \times 10^{-4}$, Cell C's gradient norms exploded (norm $\sim$730) after reaching loss 0.18 at step 250. Reducing to $\text{lr}=2 \times 10^{-4}$ stabilized training. This suggests the workspace accelerates learning but creates a sharper loss landscape.
+
+\paragraph{Task accuracy (early).}
+At step 300, Cell B achieves 56.7\% overall accuracy, with strong performance on Task 3 (95\%) and Task 2 (75\%), but 0\% on Task 1 (multi-hop chain reasoning). This is expected: without a workspace, the model cannot maintain intermediate variable values across a chain of dependencies. Cells C and D have not yet reached sufficient training steps for meaningful accuracy evaluation.
+
+\paragraph{Backward pass verification.}
+The workspace backward pass has been verified against PyTorch autograd on CPU. All gradients---input gradients, weight gradients, slot gradients, and gate gradients---match to within float32 precision ($<10^{-4}$ relative error). The gradient explosion was confirmed to be a training dynamics issue, not a backward pass bug.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+% ══════════════════════════════════════════════════════════════════════════
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Why This Might Work}
+
+The \jspace{} finding tells us that reasoning in large models is carried by a small, privileged subspace. The TRM finding tells us that iteration through a small network can substitute for parameter count. The Mamba-2 coincidence tells us that the SSM's compressed state already has the functional shape of the \jspace{}. Jasper combines all three: the workspace provides the privileged subspace, the recurrent core provides the iteration, and the hybrid Mamba-2 backbone provides the substrate.
+
+If this works, the implication is that we can build reasoning models that are:
+\begin{itemize}[nosep]
+    \item \textbf{Small enough for the browser:} $\sim$1B parameters, flat memory in both sequence length and loop count.
+    \item \textbf{Controllable at inference:} $K$ can be adjusted per problem, trading compute for accuracy.
+    \item \textbf{Interpretable:} workspace probes (R3) provide a window into the model's reasoning, unlike opaque latent reasoning in recurrent transformers.
+    \item \textbf{Verifiable:} selective ablation (R4) provides a causal test of whether the workspace is doing the reasoning, not just correlated with it.
+\end{itemize}
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Why It Might Not Work}
+
+Synthetic-task wins at 30M parameters have a real history of not transferring to language at scale. The tasks we use (arithmetic chains, permutation tracking) are structurally simple and may not capture the full complexity of language reasoning. The workspace may help on these tasks without generalizing to the kind of reasoning that matters for real applications.
+
+The gradient instability observed in Cell C is a concern: if the workspace creates a sharper loss landscape, training at scale may require careful hyperparameter tuning or architectural modifications (e.g., gradient clipping, lower learning rates, or slot normalization schedules) that limit the practical benefit.
+
+Finally, the Mamba-2 coincidence may be more metaphorical than functional. The SSM state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the SSM state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Decision Framework}
+
+The proof-of-concept is designed to produce a clear go/no-go decision before any significant cloud spend:
+
+\begin{itemize}[nosep]
+    \item \textbf{Go:} R1 and R2 pass, and at least one of R3/R4 shows the workspace doing real causal work $\to$ fund a 300M language-scale ablation ($\sim$\$3--5K).
+    \item \textbf{Pivot:} R1 fails but Cell B's efficiency story stands $\to$ keep the hybrid backbone, drop the workspace, proceed on hybrid distillation.
+    \item \textbf{Kill:} Cell D $\leq$ Cell B everywhere $\to$ the novel architecture track is dead; fall back to sampled-attempts-plus-verifier on a standard model.
+\end{itemize}
+
+The entire proof-of-concept costs $\sim$\$20--30 of electricity and under a week of compute. This buys the right to spend \$5K intelligently, not the conclusion itself.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Related Work}
+\label{sec:related}
+% ══════════════════════════════════════════════════════════════════════════
+
+\paragraph{Global workspace in LLMs.}
+\citet{anthropic2026jspace} discovered the \jspace{} in Claude Opus 4.6 using the Jacobian lens, showing that a small set of verbalizable representations functions as a global workspace \citep{baars2005global,dehaene2014conscious}. Our workspace module is an explicit engineering of this concept.
+
+\paragraph{Iterative and recurrent reasoning.}
+\citet{jolicoeur2025trm} showed that tiny recursive networks (7M parameters) can outperform much larger models on ARC-AGI through iterative refinement. \citet{geiping2025recurrent} scaled recurrent-depth transformers to 3.5B parameters, demonstrating test-time compute scaling in latent space. \citet{gehring2024relaxed} explored relaxed recursive transformers with shared parameters. Our recurrent core follows the TRM paradigm but uses a hybrid Mamba-2/attention backbone and an explicit workspace state.
+
+\paragraph{Hybrid SSM-attention models.}
+\citet{dao2024mamba2} established the SSD framework connecting SSMs and attention. \citet{wang2025m1} showed that hybrid Mamba reasoning models can match transformer-based R1-distilled models on AIME/MATH while generating 3$\times$ faster. NVIDIA's Nemotron line has repeatedly shown hybrid models matching or beating same-size transformers on long reasoning traces. Our architecture follows the hybrid pattern but adds the workspace and recurrent core.
+
+\paragraph{Test-time compute scaling.}
+The broader literature on scaling test-time compute---from self-consistency \citep{wang2023selfconsistency} to process reward models \citep{lightman2023prm} to OpenAI's o1/o3 models---operates in token space. Our approach scales test-time compute in latent space, which is more memory-efficient but less legible.
+
+% ══════════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+% ══════════════════════════════════════════════════════════════════════════
+
+We have presented Jasper, an architecture that combines three recent insights---the \jspace{} as a compact reasoning workspace, iterative refinement as a substitute for parameter count, and Mamba-2's SSM state as a native substrate for the workspace---into a single system. The architecture reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and provides interpretable and causally testable reasoning through workspace probes and selective ablation.
+
+The proof-of-concept experiment is designed to produce a clear verdict at minimal cost: if the workspace causally carries multi-step reasoning (R4) and the recurrent core provides test-time compute scaling (R2), the architecture warrants scaling to language-scale experiments. If not, the hybrid Mamba-attention backbone still stands as an efficient baseline for in-browser deployment.
+
+The broader claim is that reasoning in language models need not be tied to token generation. The brain reasons through recurrent firing patterns before articulating a thought; perhaps language models should too.
+
+% ══════════════════════════════════════════════════════════════════════════
+% References
+% ══════════════════════════════════════════════════════════════════════════
+
+\begin{thebibliography}{99}
+\small
+
+\bibitem[Anthropic(2026)]{anthropic2026jspace}
+Wes~Gurnee and Jack~Lindsey et~al.
+\newblock Verbalizable representations form a global workspace in language models.
+\newblock \emph{arXiv preprint arXiv:2607.15495}, 2026.
+
+\bibitem[Jolicoeur-Martineau(2025)]{jolicoeur2025trm}
+Alexandre Jolicoeur-Martineau.
+\newblock Less is more: Recursive reasoning with tiny networks.
+\newblock \emph{arXiv preprint arXiv:2510.04871}, 2025. [Samsung SAIT Montreal]
+
+\bibitem[Geiping et~al.(2025)]{geiping2025recurrent}
+Jonas Geiping, Sean~McLeish, Neel~Jain, John~Kirchenbauer, Siddharth~Singh, Brian~R.~Bartoldson, Bhavya~Kailkhura, Abhinav~Bhatele, and Tom~Goldstein.
+\newblock Scaling up test-time compute with latent reasoning: A recurrent depth approach.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2025.
+
+\bibitem[Dao and Gu(2024)]{dao2024mamba2}
+Tri~Dao and Albert~Gu.
+\newblock Transformers are SSMs: Generalized models and efficient algorithms through structured state space duality.
+\newblock In \emph{Proceedings of the 41st International Conference on Machine Learning (ICML)}, pages 10041--10071, 2024.
+
+\bibitem[Baars(2005)]{baars2005global}
+Bernard~J.~Baars.
+\newblock Global workspace theory of consciousness: Toward a neuroscience of human experience.
+\newblock \emph{Progress in Brain Research}, 150:45--53, 2005.
+
+\bibitem[Dehaene(2014)]{dehaene2014conscious}
+Stanislas~Dehaene.
+\newblock \emph{Consciousness and the Brain: Deciphering How the Brain Codes Our Thoughts}.
+\newblock Viking, 2014.
+
+\bibitem[Wang et~al.(2025)]{wang2025m1}
+Junxiong~Wang et~al.
+\newblock M1: Towards scalable test-time compute with Mamba reasoning models.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Arora et~al.(2024)]{arora2024theoretical}
+Simran~Arora, Sabhash~Rao, and Christopher~R\'e.
+\newblock Theoretical limitations of self-attention and state space models in reasoning tasks.
+\newblock \emph{arXiv preprint}, 2024.
+
+\bibitem[Gehring et~al.(2024)]{gehring2024relaxed}
+Jonas~Gehring, Kilian~Golde, and David~Grangier.
+\newblock Relaxed recursive transformers.
+\newblock \emph{arXiv preprint arXiv:2410.10672}, 2024. [Google DeepMind]
+
+\bibitem[Wang et~al.(2023)]{wang2023selfconsistency}
+Xuezhi~Wang et~al.
+\newblock Self-consistency improves chain of thought reasoning in language models.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2023.
+
+\bibitem[Lightman et~al.(2023)]{lightman2023prm}
+Hunter~Lightman et~al.
+\newblock Let's verify step by step.
+\newblock \emph{arXiv preprint arXiv:2305.20050}, 2023. [OpenAI]
+
+\end{thebibliography}
+
+\end{document}

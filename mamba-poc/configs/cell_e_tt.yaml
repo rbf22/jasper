@@ -1,18 +1,24 @@
-# Cell C on Tenstorrent Quietbox 2 — hybrid + workspace (perceiver)
-# Blackhole bfloat16-native, single chip, no fp16 AMP / GradScaler needed
-cell: C
+# Cell E on Tenstorrent Quietbox 2 — CONTROL for workspace comparison
+# Identical architecture to Cell B (Mamba2 + attention, no workspace)
+# but with Cell C/D's learning rate (2e-4) to isolate the workspace effect
+# from the learning rate effect.
+#
+# Comparison:
+#   B vs E  → effect of learning rate (same architecture, different LR)
+#   E vs C  → effect of workspace (same LR, E has no workspace, C does)
+#   E vs D  → effect of workspace + recurrence (same LR)
+cell: E
 d_model: 384
-n_layers: 13
+n_layers: 14
 expand: 4
 d_state: 64
 n_heads: 4
 use_attention: true
 attention_positions: [5, 10]
-use_workspace: true
-n_workspace_slots: 16
+use_workspace: false
 recurrent_core: false
 
-# Training
+# Training — matches Cell C/D learning rate
 lr: 2.0e-4
 max_steps: 10000
 tokens_per_batch: 250000
@@ -37,7 +43,7 @@ micro_batch_size: 0
 # Wandb
 wandb: false
 wandb_project: mamba-workspace-poc
-run_name: cellC-tt-seed1
+run_name: cellE-tt-seed1
 
 # Checkpointing — local only (no Google Drive on QB2)
 ckpt_dir: checkpoints
