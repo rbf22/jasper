@@ -1,6 +1,7 @@
 # venv artifacts
 bin/
 lib/
+lib64/
 include/
 share/
 pyvenv.cfg

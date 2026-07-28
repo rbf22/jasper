@@ -6,7 +6,7 @@ Features:
   - Checkpoint every 15 minutes with auto-resume
   - Wandb logging
   - CLI args for cell selection and hyperparameters
-  - MPS/CUDA/CPU device auto-detection
+  - MPS/CUDA/CPU/TT (Tenstorrent) device auto-detection
 """
 
 import os
@@ -23,6 +23,18 @@ from contextlib import nullcontext as _nullcontext
 from pathlib import Path
 from typing import Optional, Dict
 
+# Suppress noisy TT-Metal internal warnings (ROW MAJOR layout, motherboard
+# discovery, etc.). These are compiler-internal and not actionable from PyTorch
+# code. TT uses loguru (not stdlib logging), so we filter via loguru's API.
+os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
+try:
+    from loguru import logger as _loguru_logger
+    # Remove default sink and re-add at ERROR level (keeps errors, drops warnings/info)
+    _loguru_logger.remove()
+    _loguru_logger.add(lambda msg: print(msg, end=""), level="ERROR")
+except ImportError:
+    pass
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 GDRIVE_DIR = "/content/drive/MyDrive"
 
@@ -30,7 +42,33 @@ from data import Vocab, sample_batch, generate_eval_set, TASK_VERIFIERS
 from model import MambaWorkspaceModel, get_cell_config, ModelConfig
 
 
+# --- Tenstorrent / TT-XLA support ---
+def _is_tt_available() -> bool:
+    try:
+        import tt_torch  # noqa: F401 — registers "tt" backend
+        import torch_xla  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+TT_AVAILABLE = _is_tt_available()
+
+
 def get_device():
+    if TT_AVAILABLE:
+        import torch_xla
+        import torch_xla.runtime as xr
+        xr.set_device_type("TT")
+        # Enable persistent XLA compilation cache — the first step of training
+        # takes 10+ minutes to JIT-compile the XLA graphs, but with the persistent
+        # cache, subsequent process starts reuse the cached compilations (fast).
+        cache_dir = os.environ.get("XLA_PERSISTENT_CACHE_PATH",
+                                   str(Path.home() / ".cache" / "tt-xla-cache"))
+        if not torch_xla._XLAC._xla_computation_cache_is_initialized():
+            xr.initialize_cache(cache_dir, readonly=False)
+            print(f"XLA persistent cache: {cache_dir}")
+        return torch_xla.device()
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -38,8 +76,15 @@ def get_device():
     return torch.device("cpu")
 
 
+def is_tt_device(device: torch.device) -> bool:
+    """Check if device is a Tenstorrent XLA device."""
+    return device.type == "xla" and TT_AVAILABLE
+
+
 def should_use_amp(cfg: dict, device: torch.device) -> bool:
-    """Auto-enable AMP on CUDA unless explicitly disabled."""
+    """Auto-enable AMP on CUDA unless explicitly disabled. TT uses bf16 natively (no fp16 AMP)."""
+    if is_tt_device(device):
+        return False  # Blackhole is bf16-native; no fp16 GradScaler needed
     if device.type != "cuda":
         return False
     return cfg.get("use_amp", True)
@@ -55,7 +100,8 @@ def build_model_config(cfg: dict) -> ModelConfig:
     config = get_cell_config(cell)
     # Override with any config file values
     for key in ["d_model", "n_layers", "vocab_size", "d_state", "d_conv", "expand",
-                "n_heads", "n_workspace_slots", "k_train_max", "k_inference", "dropout"]:
+                "n_heads", "n_workspace_slots", "k_train_max", "k_inference", "dropout",
+                "use_gradient_checkpointing"]:
         if key in cfg:
             setattr(config, key, cfg[key])
     if "attention_positions" in cfg:
@@ -85,7 +131,7 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, path, config):
         shutil.copy2(path, prev_path)
 
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "step": step,
@@ -118,7 +164,7 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
 
 
 @torch.no_grad()
-def evaluate(model, eval_set, vocab, device, max_new=10, use_amp=False):
+def evaluate(model, eval_set, vocab, device, max_new=10, use_amp=False, is_tt=False):
     """Evaluate accuracy on the eval set by generating answers and verifying."""
     model.eval()
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
@@ -146,6 +192,9 @@ def evaluate(model, eval_set, vocab, device, max_new=10, use_amp=False):
             next_logits = out["logits"][:, -1, :]
             next_token = next_logits.argmax(dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
+            if is_tt:
+                import torch_xla
+                torch_xla.sync()
             if next_token.item() == vocab.EOS:
                 break
 
@@ -176,21 +225,48 @@ def evaluate(model, eval_set, vocab, device, max_new=10, use_amp=False):
 
 def train(cfg: dict, config_path: str):
     device = get_device()
-    print(f"Using device: {device}")
+    tt = is_tt_device(device)
+    print(f"Using device: {device}" + (" (Tenstorrent Blackhole, bf16-native)" if tt else ""))
 
     # Build model config
     model_config = build_model_config(cfg)
     cell = cfg.get("cell", "D")
     print(f"Cell: {cell}, Params: ", end="")
 
-    model = MambaWorkspaceModel(model_config).to(device)
+    # On TT: disable gradient checkpointing (ample device DRAM, may interfere with XLA compile)
+    if tt:
+        model_config.use_gradient_checkpointing = False
+
+    model = MambaWorkspaceModel(model_config)
     n_params = model.get_num_params()
     print(f"{n_params / 1e6:.1f}M")
 
-    # AMP (auto-enabled on CUDA)
+    # On TT: cast to bfloat16 (Blackhole native) for full hardware throughput
+    # Use eager XLA mode for training (torch.compile with aot_autograd has bugs in TT backend).
+    # XLA JIT-compiles each op automatically; torch_xla.sync() at step boundaries triggers execution.
+    # The first training step takes 10+ minutes (XLA graph compilation), but the persistent
+    # cache (enabled in get_device()) makes subsequent process starts fast.
+    # torch.compile(backend="tt") is kept as an inference-only option (tt_compile config flag).
+    compiled_model = None
+    if tt:
+        model = model.to(torch.bfloat16)
+        model = model.to(device)
+        if cfg.get("tt_compile", False):
+            print("Compiling model with torch.compile(backend='tt') for inference...")
+            compiled_model = torch.compile(model, backend="tt")
+        else:
+            print("TT eager XLA mode (bf16, JIT-compiled per-op, autograd supported)")
+            print("NOTE: First step will be slow (XLA compilation ~10 min). Subsequent steps fast.")
+    else:
+        model = model.to(device)
+
+    # AMP (auto-enabled on CUDA; TT uses bf16 natively)
     use_amp = should_use_amp(cfg, device)
     scaler = torch.amp.GradScaler("cuda", init_scale=16, enabled=use_amp) if use_amp else None
-    print(f"AMP (fp16): {use_amp}")
+    print(f"AMP (fp16): {use_amp}" + (" | TT bf16-native: no AMP needed" if tt else ""))
+
+    # The model used for forward passes (compiled if available)
+    fwd_model = compiled_model if compiled_model is not None else model
 
     # Training hyperparameters
     lr = cfg.get("lr", 6e-4)
@@ -325,30 +401,36 @@ def train(cfg: dict, config_path: str):
             input_ids = input_ids.to(device)
             labels = labels.to(device)
 
-            # Forward (with AMP autocast on CUDA)
-            # Model runs in fp16, but logits + loss computed in fp32 to avoid overflow
+            # Forward — on TT the model is already bf16 (no autocast needed)
+            # On CUDA, AMP autocast runs the model in fp16
             amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else _nullcontext()
+
+            # On TT: pre-generate K on CPU (torch.randint uses remainder op unsupported on TT)
+            k_value = None
+            if tt and model_config.recurrent_core:
+                k_value = torch.randint(1, model_config.k_train_max + 1, (1,),
+                                        device="cpu").to(torch.float32).to(device)
+
             with amp_ctx:
-                out = model(input_ids)
+                out = fwd_model(input_ids, k_value=k_value)
                 logits = out["logits"]
 
             # Compute loss in fp32 — logits and cross-entropy are the main overflow risk
-            with torch.amp.autocast("cuda", enabled=False):
-                logits = logits.float()
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_labels = labels[:, :-1].contiguous()
+            logits = logits.float()
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, :-1].contiguous()
 
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-                # z-loss: penalize log-partition drift to keep logit scale stable (PaLM-style)
-                z = torch.logsumexp(shift_logits, dim=-1)  # (B, T-1)
-                z_mask = shift_labels != -100
-                z_loss = z_loss_coef * (z[z_mask].clamp(max=50) ** 2).mean()
-                loss = loss + z_loss
-                loss = loss / grad_accum_steps
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+            # z-loss: penalize log-partition drift to keep logit scale stable (PaLM-style)
+            z = torch.logsumexp(shift_logits, dim=-1)  # (B, T-1)
+            z_mask = shift_labels != -100
+            z_loss = z_loss_coef * (z[z_mask].clamp(max=50) ** 2).mean()
+            loss = loss + z_loss
+            loss = loss / grad_accum_steps
 
             # Backward (accumulate)
             if scaler is not None:
@@ -417,6 +499,11 @@ def train(cfg: dict, config_path: str):
             optimizer.step()
         scheduler.step()
 
+        # TT/XLA: sync to trigger graph execution at step boundary
+        if tt:
+            import torch_xla
+            torch_xla.sync()
+
         step += 1
         avg_loss = total_loss / grad_accum_steps
 
@@ -439,7 +526,7 @@ def train(cfg: dict, config_path: str):
         # Evaluation
         if step % eval_interval == 0:
             print(f"\n--- Evaluation at step {step} ---")
-            eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp)
+            eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp, is_tt=tt)
             for k, v in sorted(eval_results.items()):
                 print(f"  {k}: {v:.3f}")
             if use_wandb:
@@ -455,7 +542,7 @@ def train(cfg: dict, config_path: str):
     # Final checkpoint and eval
     save_checkpoint(model, optimizer, scheduler, step, avg_loss, str(ckpt_path), cfg)
     print(f"\nFinal checkpoint saved at step {step}")
-    eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp)
+    eval_results = evaluate(model, eval_set, vocab, device, max_new=5, use_amp=use_amp, is_tt=tt)
     print("Final evaluation:")
     for k, v in sorted(eval_results.items()):
         print(f"  {k}: {v:.3f}")

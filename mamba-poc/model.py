@@ -44,6 +44,7 @@ class ModelConfig:
     k_inference: int = 6             # K at inference (can be swept)
     # Training
     dropout: float = 0.0
+    use_gradient_checkpointing: bool = True  # set False for TT/XLA (ample device DRAM)
     # Derived
     @property
     def d_inner(self):
@@ -66,8 +67,11 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * norm).type_as(x) * (1 + self.weight)
+        # NOTE: Use pow(-0.5) instead of rsqrt() — TT XLA backend has a bug where
+        # rsqrt()/sqrt() inside torch.compile(aot_autograd) corrupts the output graph,
+        # producing wrong shapes. pow(-0.5) is mathematically equivalent and works correctly.
+        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).pow(-0.5)
+        return (x.float() * norm).type_as(x) * (1 + self.weight.to(x.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -81,17 +85,18 @@ class GatedBlock(nn.Module):
     Lets the recurrent core learn to fade or sharpen each layer per iteration.
     """
 
-    def __init__(self, layer: nn.Module, d_model: int):
+    def __init__(self, layer: nn.Module, d_model: int, use_checkpoint: bool = True):
         super().__init__()
         self.layer = layer
         self.norm = RMSNorm(d_model)
         self.gate = nn.Parameter(torch.zeros(1))
+        self.use_checkpoint = use_checkpoint
 
     def _inner_forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.layer(self.norm(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
+        if self.training and self.use_checkpoint:
             inner = checkpoint(
                 self._inner_forward, x, use_reentrant=False
             )
@@ -147,13 +152,14 @@ class Mamba2Layer(nn.Module):
         returns: (B, T, D)
         """
         B, T, D = x.shape
+        w_dtype = self.conv1d.weight.dtype
 
         # Project to x_branch and z
         xz = self.in_proj(x)  # (B, T, 2*d_inner)
         x_branch, z = xz.chunk(2, dim=-1)  # each (B, T, d_inner)
 
-        # Causal conv1d
-        x_conv = x_branch.transpose(1, 2)  # (B, d_inner, T)
+        # Causal conv1d — cast input to weight dtype (TT XLA may promote Linear to fp32)
+        x_conv = x_branch.transpose(1, 2).to(w_dtype)  # (B, d_inner, T)
         x_conv = self.conv1d(x_conv)[:, :, :T]  # causal: keep first T
         x_conv = x_conv.transpose(1, 2)  # (B, T, d_inner)
         x_conv = F.silu(x_conv)
@@ -175,33 +181,31 @@ class Mamba2Layer(nn.Module):
         CB = torch.matmul(C_mat, B_mat.transpose(1, 2))  # (B, T, T)
 
         # Decay matrix L[b, h, t, s] = prod_{i=s+1}^{t} decay[i, h]
-        # Using log-space for stability:
-        # log_L[t, s] = cumsum(log_decay)[t] - cumsum(log_decay)[s]  for s < t
-        #             = 0  for s = t
-        #             = -inf  for s > t (masked out)
+        # Uses segment_sum (HuggingFace approach) instead of outer subtraction
+        # of cumsum — the outer subtraction triggers a graph-truncation bug in
+        # TT's AOT autograd backend.
         log_decay = torch.log(decay.clamp(min=1e-8))  # (B, T, n_heads)
-        cumsum_log = torch.cumsum(log_decay, dim=1)  # (B, T, n_heads)
+        # segment_sum operates on the last dim — permute (B, T, H) -> (B, H, T)
+        log_decay_h = log_decay.permute(0, 2, 1)  # (B, H, T)
+        # Expand: (B, H, T) -> (B, H, T, T) where [t, s] = log_decay_h[t]
+        log_decay_exp = log_decay_h.unsqueeze(-1).expand(B, self.n_heads, T, T)  # (B, H, T, T)
+        # Mask: keep strictly lower triangular (s < t), zero rest
+        mask_low = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=-1)
+        log_decay_exp = log_decay_exp.masked_fill(~mask_low, 0.0)
+        # Cumsum along dim=-2 (the t dimension)
+        log_L = torch.cumsum(log_decay_exp, dim=-2)  # (B, H, T, T)
+        # Mask: keep lower triangular incl diag (s <= t), -inf rest
+        mask_causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
+        log_L = log_L.masked_fill(~mask_causal, float("-inf"))
+        L = torch.exp(log_L)  # (B, H, T, T)
 
-        # L[b, h, t, s] = exp(cumsum_log[b, t, h] - cumsum_log[b, s, h]) for s <= t
-        # = exp(cumsum_log[b, t, h]) / exp(cumsum_log[b, s, h])
-        # We compute: L = exp(cumsum_log[:,:,None,:] - cumsum_log[:,None,:,:])
-        # Shape: (B, T, T, n_heads) — but this is the full matrix, we mask upper triangle
-        log_L = cumsum_log.unsqueeze(2) - cumsum_log.unsqueeze(1)  # (B, T, T, n_heads)
-        # For s = t, log_L = 0 (exp = 1), which is correct
-        # For s > t, we need to mask out (set to -inf)
-        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        log_L = log_L.masked_fill(mask.unsqueeze(0).unsqueeze(-1), float("-inf"))
-        L = torch.exp(log_L)  # (B, T, T, n_heads)
-
-        # scores[b, h, t, s] = CB[b, t, s] * L[b, t, s, h]
-        # CB: (B, T, T), L: (B, T, T, n_heads) -> permute to (B, n_heads, T, T)
-        scores = CB.unsqueeze(1) * L.permute(0, 3, 1, 2)  # (B, n_heads, T, T)
+        # scores[b, h, t, s] = CB[b, t, s] * L[b, h, t, s]
+        scores = CB.unsqueeze(1) * L  # (B, n_heads, T, T)
 
         # Y[b, h, t, i] = sum_s scores[b, h, t, s] * V[b, s, h, i]
-        # Upcast only this matmul to fp32 — accumulation over T=128 can overflow fp16
+        # Upcast only this matmul to fp32 — accumulation over T=128 can overflow bf16/fp16
         V_h = V.permute(0, 2, 1, 3)  # (B, n_heads, T, d_head)
-        with torch.amp.autocast("cuda", enabled=False):
-            Y = torch.matmul(scores.float(), V_h.float()).type_as(x)
+        Y = torch.matmul(scores.float(), V_h.float()).type_as(x)
 
         # Skip connection (D residual)
         Y = Y + self.D.view(1, self.n_heads, 1, 1) * V_h
@@ -243,8 +247,8 @@ class AttentionLayer(nn.Module):
 
     def _apply_rope(self, x: torch.Tensor, T: int) -> torch.Tensor:
         """Apply RoPE to x: (B, n_heads, T, d_head)"""
-        positions = torch.arange(T, device=x.device).float()
-        angles = torch.outer(positions, self.rope_freqs)  # (T, d_rope/2)
+        positions = torch.arange(T, device=x.device).to(x.dtype)
+        angles = torch.outer(positions, self.rope_freqs.to(x.dtype))  # (T, d_rope/2)
         cos = torch.cos(angles).unsqueeze(0).unsqueeze(0)  # (1, 1, T, d_rope/2)
         sin = torch.sin(angles).unsqueeze(0).unsqueeze(0)
 
@@ -379,7 +383,7 @@ class MambaWorkspaceModel(nn.Module):
                 inner = AttentionLayer(config)
             else:
                 inner = Mamba2Layer(config)
-            self.layers.append(GatedBlock(inner, config.d_model))
+            self.layers.append(GatedBlock(inner, config.d_model, use_checkpoint=config.use_gradient_checkpointing))
 
         # Workspace module
         if config.use_workspace:
@@ -409,21 +413,40 @@ class MambaWorkspaceModel(nn.Module):
         input_ids: torch.Tensor,
         k_override: Optional[int] = None,
         return_workspace_states: bool = False,
+        k_value: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         input_ids: (B, T)
         k_override: override K for inference (otherwise use config.k_inference)
         return_workspace_states: if True, return workspace states per iteration (for probing)
+        k_value: pre-sampled K tensor for training (passed from outside to avoid
+                 torch.randint inside the compiled graph — TT hardware doesn't
+                 support the remainder op that randint uses internally)
 
         Returns dict with 'logits' and optionally 'workspace_states'.
+
+        K_max padding: when not probing, the recurrent core always loops k_train_max
+        times (static loop count for XLA compilation). Iterations beyond the sampled
+        K are masked to identity via blend: x = active * x_new + (1-active) * x.
         """
         config = self.config
         B, T = input_ids.shape
         x = self.token_emb(input_ids)  # (B, T, D)
 
-        K = k_override if k_override is not None else config.k_inference
+        # Determine K (number of active recurrent iterations)
+        k_max = config.k_train_max  # static loop count for XLA
         if self.training:
-            K = random_k(config.k_train_max, device=input_ids.device)
+            if k_value is not None:
+                K = k_value  # pre-generated tensor passed from training loop
+            else:
+                K = random_k_tensor(config.k_train_max, device=input_ids.device)
+        elif k_override is not None:
+            K = k_override
+        else:
+            K = config.k_inference
+
+        # For probing (return_workspace_states), use dynamic loop with exact K (not compiled)
+        use_padding = config.recurrent_core and not return_workspace_states
 
         workspace_states = [] if return_workspace_states else None
         slot_state = None
@@ -437,22 +460,48 @@ class MambaWorkspaceModel(nn.Module):
                     workspace_states.append(("pre_layer", i, slot_state.clone()))
             x = self.layers[i](x)
 
-        # Phase 2: recurrent core (core_start..core_end-1) applied K times
+        # Phase 2: recurrent core (core_start..core_end-1)
         if config.recurrent_core:
             core_layers = list(range(config.core_start, config.core_end))
-            for iteration in range(K):
-                for i in core_layers:
-                    if config.use_workspace and i in config.attention_positions:
+
+            if use_padding:
+                # XLA-friendly: always loop k_max times, mask iterations >= K
+                for iteration in range(k_max):
+                    active = (torch.tensor(float(iteration), device=x.device) < K).to(x.dtype)
+
+                    # Run one core iteration
+                    x_new = x
+                    slot_state_new = slot_state
+                    for i in core_layers:
+                        if config.use_workspace and i in config.attention_positions:
+                            x_new, slot_state_new = self.workspace(x_new, slot_state_new)
+                        x_new = self.layers[i](x_new)
+                    if config.use_workspace:
+                        x_new, slot_state_new = self.workspace(x_new, slot_state_new)
+
+                    # Blend: active iterations use new state, padding keeps old state
+                    if slot_state is None:
+                        # First iteration is always active (K >= 1)
+                        x = x_new
+                        slot_state = slot_state_new
+                    else:
+                        x = active * x_new + (1 - active) * x
+                        slot_state = active * slot_state_new + (1 - active) * slot_state
+            else:
+                # Probing path: loop exactly K times (dynamic, not compiled)
+                K_int = int(K.item()) if isinstance(K, torch.Tensor) else K
+                for iteration in range(K_int):
+                    for i in core_layers:
+                        if config.use_workspace and i in config.attention_positions:
+                            x, slot_state = self.workspace(x, slot_state)
+                            if return_workspace_states:
+                                workspace_states.append(("iter", iteration, i, slot_state.clone()))
+                        x = self.layers[i](x)
+
+                    if config.use_workspace:
                         x, slot_state = self.workspace(x, slot_state)
                         if return_workspace_states:
-                            workspace_states.append(("iter", iteration, i, slot_state.clone()))
-                    x = self.layers[i](x)
-
-                # Workspace read/write inside the loop (even at non-attention positions)
-                if config.use_workspace:
-                    x, slot_state = self.workspace(x, slot_state)
-                    if return_workspace_states:
-                        workspace_states.append(("iter_end", iteration, slot_state.clone()))
+                            workspace_states.append(("iter_end", iteration, slot_state.clone()))
 
         # Phase 3: post-core layers (core_end..n_layers-1)
         post_core_start = config.core_end if config.recurrent_core else config.n_layers
@@ -476,8 +525,18 @@ class MambaWorkspaceModel(nn.Module):
 
 
 def random_k(k_max: int, device: torch.device) -> int:
-    """Sample K uniformly from {1..k_max} during training."""
+    """Sample K uniformly from {1..k_max} during training. Returns a Python int."""
     return torch.randint(1, k_max + 1, (1,), device=device).item()
+
+
+def random_k_tensor(k_max: int, device: torch.device) -> torch.Tensor:
+    """Sample K uniformly from {1..k_max} as a tensor (no host sync — XLA-friendly).
+
+    Generated on CPU then moved to device — torch.randint uses a remainder op
+    internally that is not supported on TT hardware with UINT32.
+    """
+    k = torch.randint(1, k_max + 1, (1,), device="cpu").to(torch.float32)
+    return k.to(device)
 
 
 # ---------------------------------------------------------------------------
