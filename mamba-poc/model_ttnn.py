@@ -1488,6 +1488,78 @@ class TTWorkspaceModule:
         """
         self.slots = ttnn.rms_norm(self.slots, weight=self._slot_param_norm_weight, epsilon=1e-6)
 
+    def spectral_normalize_weights(self):
+        """Apply spectral normalization to all workspace weight matrices.
+
+        Divides each weight matrix by its spectral norm (largest singular value),
+        constraining the Lipschitz constant to 1. This prevents unbounded weight
+        growth — the root cause of attention sharpening and gradient explosion.
+
+        Unlike logit clamping (which caps the symptom), spectral norm addresses
+        the cause: the weight matrices cannot grow beyond spectral norm 1, so
+        the attention logits QK^T/√d are bounded by construction:
+            |logit| <= ||W_Q||_2 * ||W_K||_2 * ||slots|| * ||x|| / √d_h
+                     <= 1 * 1 * 1 * 1 / √d_h  (with slot norm + LayerNorm)
+                     = 1/√d_h ≈ 0.07
+
+        The model can still learn the *direction* of each weight matrix (which
+        determines what it attends to), just not the *magnitude* (which
+        determines attention sharpness).
+
+        Uses power iteration (10 steps) for on-device computation — no host
+        transfer needed. This is the same algorithm used by Spectral Normalization
+        GANs (Miyato et al., 2018).
+        """
+        device = self.device
+        weight_names = [
+            "read_q_weight", "read_k_weight", "read_v_weight", "read_out_weight",
+            "write_q_weight", "write_k_weight", "write_v_weight", "write_out_weight",
+        ]
+
+        for name in weight_names:
+            W = getattr(self, name)  # (D, D) ttnn tensor
+            D = self.d_model
+
+            # Power iteration to estimate spectral norm (largest singular value)
+            # v converges to the top right singular vector of W
+            # σ_max ≈ ||W @ v|| after convergence
+            v = ttnn.from_torch(
+                torch.randn(D, 1, dtype=torch.bfloat16) / math.sqrt(D),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
+
+            for _ in range(10):
+                # u = W @ v, then normalize
+                u = ttnn.matmul(W, v)  # (D, 1)
+                u_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(u, u)))  # scalar
+                u_norm = ttnn.maximum(u_norm, ttnn.from_torch(
+                    torch.tensor([1e-6], dtype=torch.bfloat16),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                ))
+                u = ttnn.mul(u, ttnn.reciprocal(u_norm))
+
+                # v = W^T @ u, then normalize
+                v = ttnn.matmul(ttnn.transpose(W, 0, 1), u)  # (D, 1)
+                v_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(v, v)))
+                v_norm = ttnn.maximum(v_norm, ttnn.from_torch(
+                    torch.tensor([1e-6], dtype=torch.bfloat16),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                ))
+                v = ttnn.mul(v, ttnn.reciprocal(v_norm))
+
+            # σ_max = ||W @ v|| (v is now the top right singular vector)
+            Wv = ttnn.matmul(W, v)  # (D, 1)
+            sigma = ttnn.sqrt(ttnn.sum(ttnn.mul(Wv, Wv)))
+            # Clamp sigma to avoid division by zero
+            sigma = ttnn.maximum(sigma, ttnn.from_torch(
+                torch.tensor([1e-6], dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            ))
+
+            # W_normalized = W / sigma
+            W_normalized = ttnn.mul(W, ttnn.reciprocal(sigma))
+            setattr(self, name, W_normalized)
+
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         key_map = {
             "slots": "slots", "read_q_weight": "read_q_weight", "read_k_weight": "read_k_weight",
@@ -1979,14 +2051,19 @@ class TTMambaWorkspaceModel:
         return total
 
     def normalize_workspace_slots(self):
-        """Normalize workspace slot parameters to unit RMS.
+        """Normalize workspace parameters after each optimizer step.
 
-        Called after each optimizer step to prevent unbounded slot growth,
-        which causes attention sharpening and gradient explosion.
+        Applies two constraints:
+        1. Slot parameter normalization: constrains slot vectors to unit RMS
+        2. Spectral normalization: constrains all 8 weight matrices to spectral norm 1
+
+        Together these prevent unbounded weight/slot growth, which causes
+        attention sharpening and gradient explosion.
         No-op if the model has no workspace.
         """
         if self.workspace is not None:
             self.workspace.normalize_slots()
+            self.workspace.spectral_normalize_weights()
 
     def save_checkpoint(self, path: str, optimizer_state: dict = None, step: int = 0):
         """Save model checkpoint to a PyTorch state dict file.

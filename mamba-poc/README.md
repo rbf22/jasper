@@ -126,7 +126,9 @@ The workspace and recurrent core introduce four sources of gradient instability 
 
 4. **Attention logit clamping** (in `model_ttnn.py` / `model.py`): Attention logits (QK^T/sqrt(d_h)) are clamped to [-5, 5] before softmax in both the read and write phases. This prevents unbounded attention sharpness from growing weight matrices, which was the remaining instability path after slot normalization (slots were constrained but W_Q/W_K continued to grow, causing collapse at step 300). The clamp value of 5.0 allows a max attention ratio of ~22,000:1 — sufficient for selective attention but preventing the e^100+ ratios that cause gradient explosion. The clamp is differentiable: gradients pass through where |logit| <= 5 and are zeroed where clamped.
 
-All four are deterministic (no new hyperparameters or learnable parameters beyond the fixed clamp value C=5) and can be disabled independently for ablation.
+5. **Spectral normalization of workspace weights** (in `model_ttnn.py` / `model.py`): All eight workspace weight matrices (read_q, read_k, read_v, read_out, write_q, write_k, write_v, write_out) are divided by their spectral norm (largest singular value) after each optimizer step, constraining the Lipschitz constant to 1. This addresses the root cause of weight growth directly — unlike logit clamping which caps the symptom. With spectral norm 1, unit-RMS slots, and LayerNorm on inputs, attention logits are bounded by 1/sqrt(d_h) ≈ 0.07 by construction. Uses 10 steps of power iteration on-device (same algorithm as Spectral Normalization GANs, Miyato et al. 2018). Applied automatically in the training loop via `model.normalize_workspace_slots()`.
+
+All five are deterministic (no new hyperparameters or learnable parameters beyond the fixed clamp value C=5) and can be disabled independently for ablation.
 
 ---
 

@@ -336,6 +336,33 @@ class WorkspaceModule(nn.Module):
             rms = self.slots.pow(2).mean().sqrt().clamp(min=1e-6)
             self.slots.data.div_(rms)
 
+    def spectral_normalize_weights(self):
+        """Apply spectral normalization to all workspace weight matrices.
+
+        Divides each weight matrix by its spectral norm (largest singular value),
+        constraining the Lipschitz constant to 1. This prevents unbounded weight
+        growth — the root cause of attention sharpening and gradient explosion.
+
+        Uses power iteration (10 steps) for efficiency — same algorithm as
+        Spectral Normalization GANs (Miyato et al., 2018).
+        """
+        weight_modules = [
+            self.read_q, self.read_k, self.read_v, self.read_out,
+            self.write_q, self.write_k, self.write_v, self.write_out,
+        ]
+        with torch.no_grad():
+            for module in weight_modules:
+                W = module.weight  # (D, D)
+                D = W.shape[0]
+                v = torch.randn(D, 1, device=W.device, dtype=W.dtype) / math.sqrt(D)
+                for _ in range(10):
+                    u = W @ v
+                    u = u / u.norm().clamp(min=1e-6)
+                    v = W.t() @ u
+                    v = v / v.norm().clamp(min=1e-6)
+                sigma = (W @ v).norm()
+                module.weight.data.div_(sigma.clamp(min=1e-6))
+
     def forward(self, x: torch.Tensor, slot_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: (B, T, D) — hidden states
@@ -546,13 +573,14 @@ class MambaWorkspaceModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def normalize_workspace_slots(self):
-        """Normalize workspace slot parameters to unit RMS.
+        """Normalize workspace parameters after each optimizer step.
 
-        Called after each optimizer step to prevent unbounded slot growth.
-        No-op if the model has no workspace.
+        Applies slot normalization (unit RMS) and spectral normalization
+        (spectral norm 1 for all weight matrices). No-op if no workspace.
         """
         if self.workspace is not None:
             self.workspace.normalize_slots()
+            self.workspace.spectral_normalize_weights()
 
 
 def random_k(k_max: int, device: torch.device) -> int:

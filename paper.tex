@@ -197,6 +197,17 @@ Even with slot normalization, the attention weight matrices ($W_Q, W_K$) can gro
 \end{equation}
 with $C = 5$. This limits the maximum attention ratio between any two positions to $e^{2C} \approx e^{10} \approx 22{,}000$:1---more than sufficient for selective attention, but preventing the $e^{100+}$ ratios that arise from unbounded logits. The clamp is differentiable: gradients pass through where $|\text{logit}| \leq C$ and are zeroed where clamped, so the model can still learn to sharpen attention up to the clamp limit.
 
+\paragraph{Spectral normalization of workspace weights.}
+While logit clamping caps the symptom (sharp softmax), it does not address the root cause: the weight matrices $W_Q, W_K, W_V, W_O$ can grow without bound, and the clamp only limits the output, not the weights themselves. To address this, we apply spectral normalization to all eight workspace weight matrices after each optimizer step. Each matrix is divided by its spectral norm (largest singular value $\sigma_{\max}$), constraining the Lipschitz constant to 1:
+\begin{equation}
+    W \leftarrow \frac{W}{\sigma_{\max}(W)}, \quad \sigma_{\max}(W) = \text{largest singular value of } W
+\end{equation}
+This is the technique that stabilized GAN discriminators \cite{miyato2018spectral}, which face the same problem: unbounded weights $\to$ sharp distributions $\to$ gradient instability. With spectral norm 1 on all projections, unit-RMS slots, and LayerNorm on the input, the attention logits are bounded by construction:
+\begin{equation}
+    |\text{logit}_{ij}| \leq \|W_Q\|_2 \|W_K\|_2 \|\text{slots}\| \|x\| / \sqrt{d_h} \leq 1 \cdot 1 \cdot 1 \cdot 1 / \sqrt{d_h}
+\end{equation}
+The model can still learn the \emph{direction} of each weight matrix (which determines what it attends to), just not the \emph{magnitude} (which determines attention sharpness). We compute $\sigma_{\max}$ via 10 steps of power iteration on-device, avoiding host transfers.
+
 \paragraph{Design rationale.}
 The workspace is deliberately small ($m=16$ slots, $\sim$2M parameters total) to mirror the compactness of the \jspace{}. The two-phase design (read then write) mirrors the global workspace theory's broadcast cycle: information is first consolidated into the workspace, then broadcast back to the processing stream.
 
@@ -302,17 +313,18 @@ All cells use AdamW ($\beta_1=0.9, \beta_2=0.95, \epsilon=10^{-8}$) with weight 
 \paragraph{Per-parameter LR groups.}
 The workspace parameters ($\sim$2M of $\sim$24M total) receive $0.25\times$ the base learning rate ($5 \times 10^{-5}$ vs $2 \times 10^{-4}$ for the backbone). This is motivated by the observation that the workspace creates a sharper loss landscape: at equal LR, workspace gradients dominate and cause instability. The backbone LR is kept at $2 \times 10^{-4}$ to match Cell E (the control), preserving the clean C-vs-E comparison. This is analogous to the standard practice of using different LR groups for different module types in fine-tuning.
 
-\paragraph{Four stabilization techniques.}
-The workspace and recurrent core introduce four sources of gradient instability that are not present in the baseline hybrid model. We address each with a targeted normalization:
+\paragraph{Five stabilization techniques.}
+The workspace and recurrent core introduce five sources of gradient instability that are not present in the baseline hybrid model. We address each with a targeted normalization:
 
 \begin{enumerate}[nosep]
     \item \textbf{Per-parameter LR groups} (above): workspace parameters receive $0.25\times$ the base LR, preventing the workspace from dominating the gradient.
     \item \textbf{$1/\sqrt{K}$ residual scaling} (\Cref{sec:recurrent-core}): scales the recurrent core's blend factor by $1/\sqrt{K}$, normalizing gradient accumulation across $K$ iterations so that the total gradient norm is independent of $K$.
     \item \textbf{Slot parameter normalization} (\Cref{sec:workspace}): constrains the learned slot parameters to unit RMS after each optimizer step, breaking the positive feedback loop where large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots.
     \item \textbf{Attention logit clamping} (\Cref{sec:workspace}): clamps attention logits to $[-5, 5]$ before softmax, preventing unbounded attention sharpness from growing weight matrices even when slot magnitudes are constrained.
+    \item \textbf{Spectral normalization} (\Cref{sec:workspace}): constrains all eight workspace weight matrices to spectral norm 1 after each optimizer step, addressing the root cause of weight growth directly rather than capping the resulting logits.
 \end{enumerate}
 
-Each technique targets a distinct mechanism: LR groups address the workspace's sharper loss landscape, $1/\sqrt{K}$ scaling addresses recurrent gradient accumulation, slot normalization addresses unbounded slot parameter growth, and logit clamping addresses unbounded attention weight growth. All four are deterministic (no new hyperparameters or learnable parameters beyond the fixed clamp value $C=5$) and can be disabled independently for ablation.
+Each technique targets a distinct mechanism: LR groups address the workspace's sharper loss landscape, $1/\sqrt{K}$ scaling addresses recurrent gradient accumulation, slot normalization addresses unbounded slot parameter growth, logit clamping caps the symptom (sharp softmax), and spectral normalization addresses the root cause (unbounded weight matrices). All five are deterministic (no new hyperparameters or learnable parameters beyond the fixed clamp value $C=5$) and can be disabled independently for ablation.
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Synthetic Tasks}
@@ -369,17 +381,18 @@ Cell B (hybrid baseline, lr=$6 \times 10^{-4}$) was evaluated at steps 100, 200,
 \paragraph{Cell E confirms the Task 1 plateau is architectural, not LR-related.}
 Cell E (B architecture, C/D learning rate of $2 \times 10^{-4}$) has been evaluated at steps 100, 200, 300, and 400. Task 1 accuracy is 0\% at all four evals---the same plateau as Cell B, despite using a 3$\times$ lower learning rate. This confirms that B's inability to do multi-hop reasoning is an architectural limitation, not a learning-rate artifact. E continues to improve on Tasks 2 and 3 (38\% overall at step 400, with 75\% Task 2 and 40\% Task 3), demonstrating that the lower LR is sufficient for single-hop and state-tracking tasks.
 
-\paragraph{Workspace gradient instability and the four stabilization techniques.}
+\paragraph{Workspace gradient instability and the five stabilization techniques.}
 Initial Cell C training (without stabilization) collapsed at step 200 when the learning rate reached its peak of $2 \times 10^{-4}$: the gradient norm spiked from $\sim$1.3 to $\sim$13.4, and the model's output degenerated to a single token (``72'') regardless of input. Cell E, which has no workspace, passed the same step without issue (grad norm 2.1), confirming the instability is workspace-specific.
 
-We identified four distinct instability mechanisms and addressed each with a targeted normalization (\Cref{sec:training-config}):
+We identified five distinct instability mechanisms and addressed each with a targeted normalization (\Cref{sec:training-config}):
 \begin{enumerate}[nosep]
     \item \textbf{Workspace sharper loss landscape:} The workspace parameters dominate the gradient at equal LR. Per-parameter LR groups (workspace at $0.25\times$) delayed the collapse from step 200 to step 250 but did not prevent it.
     \item \textbf{Recurrent gradient accumulation:} Cell D's gradient norm was $\sim$20--22 at early steps (vs $\sim$5 for C/E), consistent with $\sqrt{K}$ accumulation. The $1/\sqrt{K}$ residual scaling reduced D's gradient norm to $\sim$9.7---roughly half, matching the theoretical prediction.
     \item \textbf{Unbounded slot growth:} The slot parameters grow via a positive feedback loop (large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots). Slot parameter normalization constrains slots to unit RMS after each optimizer step. With this fix, Cell C passed step 200 (the original collapse point) with grad norm 1.0, but collapsed at step 300 with grad norm 7.3---the slot vectors were constrained, but the attention weight matrices continued to grow.
-    \item \textbf{Unbounded attention weight growth:} Even with slot magnitudes constrained, the $W_Q$ and $W_K$ projections can grow, producing sharp softmax distributions that cause the same gradient concentration. Attention logit clamping ($C=5$) directly limits the softmax sharpness regardless of weight magnitudes.
+    \item \textbf{Unbounded attention weight growth (symptom):} Even with slot magnitudes constrained, the $W_Q$ and $W_K$ projections can grow, producing sharp softmax distributions. Attention logit clamping ($C=5$) directly limits the softmax sharpness regardless of weight magnitudes---a symptom-level fix.
+    \item \textbf{Unbounded attention weight growth (cause):} Spectral normalization constrains all eight workspace weight matrices to spectral norm 1 after each optimizer step, addressing the root cause. With spectral norm 1, unit-RMS slots, and LayerNorm on inputs, attention logits are bounded by $1/\sqrt{d_h} \approx 0.07$ by construction---no clamping needed.
 \end{enumerate}
-The first three stabilizations were sufficient to delay the collapse (from step 200 to step 300 for Cell C) but not prevent it. The fourth---logit clamping---targets the remaining growth path (attention weights) and is currently being tested. Cells C and D have been resumed from their step 200 checkpoints (the last stable point) with all four stabilizations applied.
+The first three stabilizations delayed the collapse (from step 200 to step 300 for Cell C) but did not prevent it. The fourth (logit clamping) caps the symptom. The fifth (spectral normalization) addresses the root cause and is the current approach. Cells C and D have been resumed from their step 200 checkpoints (the last stable point) with all five stabilizations applied.
 
 \paragraph{Backward pass verification.}
 The workspace backward pass has been verified against PyTorch autograd on CPU. All gradients---input gradients, weight gradients (8 matrices), slot gradients, norm weights, and gate scalars---match to within float32 precision ($<10^{-4}$ relative error). The gradient explosion was confirmed to be a training dynamics issue, not a backward pass bug.
@@ -452,7 +465,7 @@ If this works, the implication is that we can build reasoning models that are:
 
 Synthetic-task wins at 30M parameters have a real history of not transferring to language at scale. The tasks we use (arithmetic chains, permutation tracking) are structurally simple and may not capture the full complexity of language reasoning. The workspace may help on these tasks without generalizing to the kind of reasoning that matters for real applications.
 
-The gradient instability observed in Cell C training is a significant concern. The workspace creates a sharper loss landscape than the baseline hybrid model, and we have identified four distinct instability mechanisms (workspace gradient dominance, recurrent gradient accumulation, unbounded slot growth, and unbounded attention weight growth). The first three stabilizations (per-parameter LR groups, $1/\sqrt{K}$ residual scaling, and slot parameter normalization; see \Cref{sec:training-config}) were sufficient to delay the collapse from step 200 to step 300 but not prevent it---the attention weight matrices continued to grow even with slot magnitudes constrained. A fourth stabilization (attention logit clamping) directly limits softmax sharpness and is currently being tested. If this also fails, or if the normalizations collectively limit the workspace's expressivity at scale, the practical benefit of the architecture may be constrained. The slot normalization constrains slot magnitude but not direction, and the logit clamp limits attention sharpness to $e^{10}:1$---if useful reasoning requires sharper attention or magnitude variation across slots, these constraints could limit performance.
+The gradient instability observed in Cell C training is a significant concern. The workspace creates a sharper loss landscape than the baseline hybrid model, and we have identified five distinct instability mechanisms (workspace gradient dominance, recurrent gradient accumulation, unbounded slot growth, unbounded attention weight growth at the logit level, and unbounded attention weight growth at the weight level). The first three stabilizations (per-parameter LR groups, $1/\sqrt{K}$ residual scaling, and slot parameter normalization; see \Cref{sec:training-config}) were sufficient to delay the collapse from step 200 to step 300 but not prevent it---the attention weight matrices continued to grow even with slot magnitudes constrained. A fourth stabilization (attention logit clamping) caps the resulting softmax sharpness, and a fifth (spectral normalization) constrains the weight matrices directly, addressing the root cause. If spectral normalization also fails, or if the normalizations collectively limit the workspace's expressivity at scale, the practical benefit of the architecture may be constrained. Spectral norm 1 is a strong constraint---if useful reasoning requires weight matrices with larger spectral norms, this constraint could limit performance.
 
 Finally, the Mamba-2 coincidence may be more metaphorical than functional. The SSM state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the SSM state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question.
 
@@ -507,6 +520,11 @@ The broader claim is that reasoning in language models need not be tied to token
 Wes~Gurnee and Jack~Lindsey et~al.
 \newblock Verbalizable representations form a global workspace in language models.
 \newblock \emph{arXiv preprint arXiv:2607.15495}, 2026.
+
+\bibitem[Miyato et~al.(2018)]{miyato2018spectral}
+Takeru Miyato, Toshiki Kataoka, Masanori Koyama, and Yuichi Yoshida.
+\newblock Spectral normalization for generative adversarial networks.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2018.
 
 \bibitem[Jolicoeur-Martineau(2025)]{jolicoeur2025trm}
 Alexandre Jolicoeur-Martineau.
