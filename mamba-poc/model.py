@@ -322,6 +322,10 @@ class WorkspaceModule(nn.Module):
         self.read_gate = nn.Parameter(torch.zeros(1))
         self.write_gate = nn.Parameter(torch.zeros(1))
 
+        # Attention logit clamp: prevents sharp softmax distributions that cause
+        # gradient explosion. Scores are clamped to [-C, C] before softmax.
+        self.logit_clamp = 5.0
+
     def normalize_slots(self):
         """Normalize slot parameters to unit RMS to prevent unbounded growth.
 
@@ -352,6 +356,7 @@ class WorkspaceModule(nn.Module):
         rv = self.read_v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
         read_attn = torch.matmul(rq, rk.transpose(-2, -1)) * self.scale  # (B, n_heads, m, T)
+        read_attn = read_attn.clamp(min=-self.logit_clamp, max=self.logit_clamp)
         read_attn = F.softmax(read_attn, dim=-1)
         read_out = torch.matmul(read_attn, rv)  # (B, n_heads, m, d_head)
         read_out = read_out.transpose(1, 2).contiguous().view(B, self.n_slots, D)
@@ -363,6 +368,7 @@ class WorkspaceModule(nn.Module):
         wv = self.write_v(slots).view(B, self.n_slots, self.n_heads, self.d_head).transpose(1, 2)
 
         write_attn = torch.matmul(wq, wk.transpose(-2, -1)) * self.scale  # (B, n_heads, T, m)
+        write_attn = write_attn.clamp(min=-self.logit_clamp, max=self.logit_clamp)
         write_attn = F.softmax(write_attn, dim=-1)
         write_out = torch.matmul(write_attn, wv)  # (B, n_heads, T, d_head)
         write_out = write_out.transpose(1, 2).contiguous().view(B, T, D)

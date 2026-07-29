@@ -116,7 +116,7 @@ Slot state persists across recurrent iterations (passed as `slot_state`), so eac
 
 ### Training stabilization
 
-The workspace and recurrent core introduce three sources of gradient instability that are not present in the baseline hybrid model. Each is addressed with a targeted normalization:
+The workspace and recurrent core introduce four sources of gradient instability that are not present in the baseline hybrid model. Each is addressed with a targeted normalization:
 
 1. **Per-parameter LR groups** (`lr_groups` config field): Workspace parameters receive 0.25x the base learning rate (5e-5 vs 2e-4 for the backbone). The workspace creates a sharper loss landscape where equal-LR training causes workspace gradients to dominate and destabilize. The backbone LR is kept at 2e-4 to match Cell E (the control). Config: `lr_groups: {ws_: 0.25}`
 
@@ -124,7 +124,9 @@ The workspace and recurrent core introduce three sources of gradient instability
 
 3. **Slot parameter normalization** (in `model_ttnn.py` / `model.py`): The learned slot parameters are normalized to unit RMS after each optimizer step, breaking the positive feedback loop: large slots → sharp attention → large gradients → larger slots. This is a parameter constraint (like weight clipping in GANs) that allows slot direction to change freely while constraining magnitude. Applied automatically in the training loop via `model.normalize_workspace_slots()`.
 
-All three are deterministic (no new hyperparameters or learnable parameters) and can be disabled independently for ablation.
+4. **Attention logit clamping** (in `model_ttnn.py` / `model.py`): Attention logits (QK^T/sqrt(d_h)) are clamped to [-5, 5] before softmax in both the read and write phases. This prevents unbounded attention sharpness from growing weight matrices, which was the remaining instability path after slot normalization (slots were constrained but W_Q/W_K continued to grow, causing collapse at step 300). The clamp value of 5.0 allows a max attention ratio of ~22,000:1 — sufficient for selective attention but preventing the e^100+ ratios that cause gradient explosion. The clamp is differentiable: gradients pass through where |logit| <= 5 and are zeroed where clamped.
+
+All four are deterministic (no new hyperparameters or learnable parameters beyond the fixed clamp value C=5) and can be disabled independently for ablation.
 
 ---
 
