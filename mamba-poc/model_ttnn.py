@@ -1170,13 +1170,6 @@ class TTWorkspaceModule:
         slots = torch.randn(self.n_slots, self.d_model, dtype=torch.bfloat16) * 0.02
         self.slots = to_device(slots, device)
 
-        # Attention logit clamp: prevents sharp softmax distributions that cause
-        # gradient explosion. Scores are clamped to [-C, C] before softmax.
-        # The clamp value of 5.0 corresponds to a max attention ratio of e^10 ≈ 22000:1
-        # between the most and least attended positions — more than enough for
-        # selective attention, but prevents the e^100+ ratios that cause instability.
-        self.logit_clamp = 5.0
-
         # Read projections: Q from slots, K/V from x
         self.read_q_weight = to_device(torch.randn(self.d_model, self.d_model, dtype=torch.bfloat16) * 0.02, device)
         self.read_k_weight = to_device(torch.randn(self.d_model, self.d_model, dtype=torch.bfloat16) * 0.02, device)
@@ -1220,29 +1213,6 @@ class TTWorkspaceModule:
         grad_sum = ttnn.expand(grad_sum, [B, H, L_q, L_k])
         return ttnn.mul(ttnn.sub(grad_attn, grad_sum), attn)
 
-    def _clamp_backward(self, grad, scores):
-        """Backward through clamp(scores, -C, C).
-
-        Gradient passes through where |scores| <= C, zero where clamped.
-        scores: the pre-clamp scores (cached from forward).
-        """
-        C = self.logit_clamp
-        # mask = 1 where |scores| <= C, 0 otherwise
-        # Use clamp to detect: if clamp(scores) == scores, then within range
-        clamped = ttnn.clamp(scores, min=-C, max=C)
-        # mask = where(scores == clamped, 1, 0) — but ttnn doesn't have a direct where
-        # Instead: mask = 1 - |sign(scores - clamped)|, which gives 1 where equal, 0 where different
-        diff = ttnn.sub(scores, clamped)
-        # |diff|: where diff is 0, |diff| is 0; where diff != 0, |diff| > 0
-        # Use clamp to make a binary mask: clamp(|diff|, 0, 1) gives 0 where diff=0, 1 where diff!=0
-        abs_diff = ttnn.abs(diff)
-        mask = ttnn.sub(
-            ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                           dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device),
-            ttnn.clamp(abs_diff, min=0.0, max=1.0)
-        )
-        return ttnn.mul(grad, mask)
-
     def forward(self, x: "ttnn.Tensor", slot_state: Optional["ttnn.Tensor"]) -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
         """x: (B, T, D), slot_state: (B, m, D) or None -> (x_out, slot_state_out)"""
         B, T, D = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
@@ -1266,9 +1236,7 @@ class TTWorkspaceModule:
 
         read_scores = ttnn.matmul(rq, ttnn.transpose(rk, -2, -1))  # (B, H, m, T)
         read_scores = ttnn.mul(read_scores, scale_tt)
-        # Clamp attention logits to prevent sharp softmax (gradient explosion)
-        read_scores_clamped = ttnn.clamp(read_scores, min=-self.logit_clamp, max=self.logit_clamp)
-        read_attn = ttnn.softmax(read_scores_clamped, dim=-1)       # (B, H, m, T)
+        read_attn = ttnn.softmax(read_scores, dim=-1)               # (B, H, m, T)
         read_out_4d = ttnn.matmul(read_attn, rv)                    # (B, H, m, d_h)
         read_out = self._reshape_from_heads(read_out_4d, B, m)      # (B, m, D)
         read_out_proj = ttnn.linear(read_out, self.read_out_weight)  # (B, m, D)
@@ -1285,9 +1253,7 @@ class TTWorkspaceModule:
 
         write_scores = ttnn.matmul(wq, ttnn.transpose(wk, -2, -1))  # (B, H, T, m)
         write_scores = ttnn.mul(write_scores, scale_tt)
-        # Clamp attention logits to prevent sharp softmax (gradient explosion)
-        write_scores_clamped = ttnn.clamp(write_scores, min=-self.logit_clamp, max=self.logit_clamp)
-        write_attn = ttnn.softmax(write_scores_clamped, dim=-1)      # (B, H, T, m)
+        write_attn = ttnn.softmax(write_scores, dim=-1)              # (B, H, T, m)
         write_out_4d = ttnn.matmul(write_attn, wv)                   # (B, H, T, d_h)
         write_out = self._reshape_from_heads(write_out_4d, B, T)     # (B, T, D)
         write_out_proj = ttnn.linear(write_out, self.write_out_weight)  # (B, T, D)
@@ -1308,7 +1274,6 @@ class TTWorkspaceModule:
             "write_out": write_out, "write_out_proj": write_out_proj,
             "write_gate_val": write_gate_val,
             "x_pre_norm": x_pre_norm, "scale_tt": scale_tt,
-            "read_scores": read_scores, "write_scores": write_scores,
             "B": B, "T": T, "m": m,
         }
 
@@ -1353,10 +1318,8 @@ class TTWorkspaceModule:
         grad_write_attn = ttnn.matmul(grad_write_out_4d, ttnn.transpose(wv, -2, -1))  # (B, H, T, m)
         grad_wv = ttnn.matmul(ttnn.transpose(c["write_attn"], -2, -1), grad_write_out_4d)  # (B, H, m, d_h)
 
-        # --- Backward through write_attn = softmax(clamp(write_scores * scale)) ---
+        # --- Backward through write_attn = softmax(write_scores * scale) ---
         grad_write_scores = self._softmax_backward(grad_write_attn, c["write_attn"], B, H, T, m)
-        # Backward through clamp: zero gradient where scores were clamped
-        grad_write_scores = self._clamp_backward(grad_write_scores, c["write_scores"])
         grad_write_scores = ttnn.mul(grad_write_scores, scale_tt)
 
         # grad_wq = grad_write_scores @ wk, grad_wk = grad_write_scores^T @ wq
@@ -1413,10 +1376,8 @@ class TTWorkspaceModule:
         grad_read_attn = ttnn.matmul(grad_read_out_4d, ttnn.transpose(rv, -2, -1))  # (B, H, m, T)
         grad_rv = ttnn.matmul(ttnn.transpose(c["read_attn"], -2, -1), grad_read_out_4d)  # (B, H, T, d_h)
 
-        # --- Backward through read_attn = softmax(clamp(read_scores * scale)) ---
+        # --- Backward through read_attn = softmax(read_scores * scale) ---
         grad_read_scores = self._softmax_backward(grad_read_attn, c["read_attn"], B, H, m, T)
-        # Backward through clamp: zero gradient where scores were clamped
-        grad_read_scores = self._clamp_backward(grad_read_scores, c["read_scores"])
         grad_read_scores = ttnn.mul(grad_read_scores, scale_tt)
 
         # grad_rq = grad_read_scores @ rk, grad_rk = grad_read_scores^T @ rq
