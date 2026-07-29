@@ -48,6 +48,7 @@ class ModelConfig:
     k_inference: int = 6
     dropout: float = 0.0
     use_gradient_checkpointing: bool = True
+    spectral_norm_bound: float = 5.0
 
     @property
     def d_inner(self):
@@ -1165,6 +1166,7 @@ class TTWorkspaceModule:
         self.n_heads = config.n_heads
         self.d_head = config.d_model // config.n_heads
         self.scale = 1.0 / (self.d_head ** 0.5)
+        self.spectral_norm_bound = config.spectral_norm_bound
 
         # Learnable slot embeddings: (n_slots, d_model)
         slots = torch.randn(self.n_slots, self.d_model, dtype=torch.bfloat16) * 0.02
@@ -1453,19 +1455,18 @@ class TTWorkspaceModule:
         """Apply spectral normalization to all workspace weight matrices.
 
         Divides each weight matrix by its spectral norm (largest singular value),
-        constraining the Lipschitz constant to 1. This prevents unbounded weight
-        growth — the root cause of attention sharpening and gradient explosion.
+        then scales to the configured bound. This constrains the Lipschitz constant
+        to spectral_norm_bound, preventing unbounded weight growth while allowing
+        sufficient attention selectivity.
 
-        Unlike logit clamping (which caps the symptom), spectral norm addresses
-        the cause: the weight matrices cannot grow beyond spectral norm 1, so
-        the attention logits QK^T/√d are bounded by construction:
-            |logit| <= ||W_Q||_2 * ||W_K||_2 * ||slots|| * ||x|| / √d_h
-                     <= 1 * 1 * 1 * 1 / √d_h  (with slot norm + LayerNorm)
-                     = 1/√d_h ≈ 0.07
+        With bound C, unit-RMS slots, and LayerNorm on inputs, attention logits are
+        bounded by:
+            |logit| <= C² * ||slots|| * ||x|| / √d_h
+                     <= C² / √d_h  (with slot norm + LayerNorm)
 
-        The model can still learn the *direction* of each weight matrix (which
-        determines what it attends to), just not the *magnitude* (which
-        determines attention sharpness).
+        For C=5, d_h=96: max logit ≈ 2.55, max attention ratio ≈ 164:1 — enough
+        for selective attention, but preventing the e^100+ ratios that cause
+        gradient explosion.
 
         Uses power iteration (10 steps) for on-device computation — no host
         transfer needed. This is the same algorithm used by Spectral Normalization
@@ -1517,8 +1518,18 @@ class TTWorkspaceModule:
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
             ))
 
-            # W_normalized = W / sigma
-            W_normalized = ttnn.mul(W, ttnn.reciprocal(sigma))
+            # Cap spectral norm at bound: if sigma > bound, scale down to bound.
+            # If sigma <= bound, leave weights unchanged (cap, not target).
+            # This lets the optimizer grow weights naturally up to the bound,
+            # and prevents a sudden scaling jump when resuming from a checkpoint
+            # saved with a different (or no) bound.
+            bound_tt = ttnn.from_torch(
+                torch.tensor([self.spectral_norm_bound], dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
+            # scale = min(1, bound/sigma) = bound / max(bound, sigma)
+            scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma)))
+            W_normalized = ttnn.mul(W, scale_factor)
             setattr(self, name, W_normalized)
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):

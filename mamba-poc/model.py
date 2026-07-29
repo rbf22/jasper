@@ -301,6 +301,7 @@ class WorkspaceModule(nn.Module):
         self.n_heads = config.n_heads
         self.d_head = config.d_model // config.n_heads
         self.scale = 1.0 / math.sqrt(self.d_head)
+        self.spectral_norm_bound = getattr(config, 'spectral_norm_bound', 5.0)
 
         # Learnable slot embeddings
         self.slots = nn.Parameter(torch.randn(self.n_slots, self.d_model) * 0.02)
@@ -336,12 +337,14 @@ class WorkspaceModule(nn.Module):
         """Apply spectral normalization to all workspace weight matrices.
 
         Divides each weight matrix by its spectral norm (largest singular value),
-        constraining the Lipschitz constant to 1. This prevents unbounded weight
-        growth — the root cause of attention sharpening and gradient explosion.
+        then scales to the configured bound. This constrains the Lipschitz constant
+        to spectral_norm_bound, preventing unbounded weight growth while allowing
+        sufficient attention selectivity.
 
         Uses power iteration (10 steps) for efficiency — same algorithm as
         Spectral Normalization GANs (Miyato et al., 2018).
         """
+        bound = self.spectral_norm_bound
         weight_modules = [
             self.read_q, self.read_k, self.read_v, self.read_out,
             self.write_q, self.write_k, self.write_v, self.write_out,
@@ -356,8 +359,10 @@ class WorkspaceModule(nn.Module):
                     u = u / u.norm().clamp(min=1e-6)
                     v = W.t() @ u
                     v = v / v.norm().clamp(min=1e-6)
-                sigma = (W @ v).norm()
-                module.weight.data.div_(sigma.clamp(min=1e-6))
+                sigma = (W @ v).norm().clamp(min=1e-6)
+                # Cap: only scale down if sigma > bound, leave unchanged if below
+                scale = min(1.0, bound / sigma.item())
+                module.weight.data.mul_(scale)
 
     def forward(self, x: torch.Tensor, slot_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """

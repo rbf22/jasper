@@ -17,6 +17,7 @@ core_start: 6
 core_end: 10
 k_train_max: 6
 k_inference: 6
+spectral_norm_bound: 5.0
 
 # Training
 lr: 2.0e-4

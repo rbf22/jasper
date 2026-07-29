@@ -129,6 +129,7 @@ def build_model_config(cfg: dict) -> ModelConfig:
         k_train_max=cfg.get("k_train_max", 6),
         k_inference=cfg.get("k_inference", 6),
         use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
+        spectral_norm_bound=cfg.get("spectral_norm_bound", 5.0),
     )
 
 
