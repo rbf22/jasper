@@ -150,11 +150,11 @@ The regularizers proved the workspace CAN learn selective attention (write entro
 
 Two architectural changes make the workspace stable by construction — a "tennis ball in a bucket" rather than a knife edge:
 
-7. **Zero-initialized gates** (`gate_init: -5`): Gate parameters are initialized to -5, giving sigmoid(-5) ≈ 0.007. The workspace starts as near-identity — the feedback loop is essentially inactive. The gates gradually open as the model learns that the workspace is useful, at which point the model has already adapted to handle the feedback. This is the same principle as zero-initialization in LoRA and is proven to stabilize training of additive modules.
+7. **Zero-initialized gates** (`gate_init: -2`): Gate parameters are initialized to -2, giving sigmoid(-2) ≈ 0.12. The workspace starts with a small but non-trivial contribution — the feedback loop is mostly inactive. The gates gradually open as the model learns that the workspace is useful. A gate-specific LR group (10x workspace LR) ensures the gates reach sigmoid(0) = 0.5 within ~1,000 steps, fitting the 3,000-step training budget. This is the same principle as zero-initialization in LoRA, tuned for a shorter training horizon.
 
 8. **Slot decay** (`slot_decay_init: 1.0`): The slot update changes from `slots = norm(slots + gate * read_out)` to `slots = norm(decay * slots + gate * read_out)` where `decay` is a learned scalar initialized at 1.0. The decay makes the slot update contractive: old information naturally fades unless the read gate actively reinforces it. The feedback loop now has a restoring force — if attention gets too sharp and overwrites a slot, the decay pulls it back toward the learned slot embedding.
 
-Together, these make the workspace start stable (near-zero gates) and stay stable (decaying slots). The external constraints become less critical because the architecture itself is contractive rather than amplifying. Config: `gate_init` (default -5), `slot_decay_init` (default 1.0) in the YAML configs.
+Together, these make the workspace start stable (near-zero gates) and stay stable (decaying slots). The external constraints become less critical because the architecture itself is contractive rather than amplifying. Config: `gate_init` (default -2), `slot_decay_init` (default 1.0) in the YAML configs.
 
 ---
 

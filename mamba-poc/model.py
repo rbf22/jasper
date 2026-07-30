@@ -321,7 +321,7 @@ class WorkspaceModule(nn.Module):
         self.norm = RMSNorm(self.d_model)
         self.slot_norm = RMSNorm(self.d_model)
         # Zero-init gates: sigmoid(-5) ≈ 0.007, workspace starts as near-identity
-        gate_init = getattr(config, 'gate_init', -5.0)
+        gate_init = getattr(config, 'gate_init', -2.0)
         self.read_gate = nn.Parameter(torch.tensor([gate_init]))
         self.write_gate = nn.Parameter(torch.tensor([gate_init]))
         # Slot decay: makes the slot update contractive (restoring force)

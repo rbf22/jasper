@@ -51,7 +51,7 @@ class ModelConfig:
     spectral_norm_bound: float = 5.0
     ws_entropy_weight: float = 0.0       # weight for attention entropy regularizer
     ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer
-    gate_init: float = -5.0             # gate parameter init value (sigmoid(gate_init) ≈ 0.007)
+    gate_init: float = -2.0             # gate parameter init value (sigmoid(-2) ≈ 0.12)
     slot_decay_init: float = 1.0        # slot decay factor init (1.0 = no decay, <1.0 = forgetful)
 
     @property

@@ -132,7 +132,7 @@ def build_model_config(cfg: dict) -> ModelConfig:
         spectral_norm_bound=cfg.get("spectral_norm_bound", 5.0),
         ws_entropy_weight=cfg.get("ws_entropy_weight", 0.0),
         ws_diversity_weight=cfg.get("ws_diversity_weight", 0.0),
-        gate_init=cfg.get("gate_init", -5.0),
+        gate_init=cfg.get("gate_init", -2.0),
         slot_decay_init=cfg.get("slot_decay_init", 1.0),
     )
 
