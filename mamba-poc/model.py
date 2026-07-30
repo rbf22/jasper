@@ -320,8 +320,13 @@ class WorkspaceModule(nn.Module):
 
         self.norm = RMSNorm(self.d_model)
         self.slot_norm = RMSNorm(self.d_model)
-        self.read_gate = nn.Parameter(torch.zeros(1))
-        self.write_gate = nn.Parameter(torch.zeros(1))
+        # Zero-init gates: sigmoid(-5) ≈ 0.007, workspace starts as near-identity
+        gate_init = getattr(config, 'gate_init', -5.0)
+        self.read_gate = nn.Parameter(torch.tensor([gate_init]))
+        self.write_gate = nn.Parameter(torch.tensor([gate_init]))
+        # Slot decay: makes the slot update contractive (restoring force)
+        slot_decay_init = getattr(config, 'slot_decay_init', 1.0)
+        self.slot_decay = nn.Parameter(torch.tensor([slot_decay_init]))
 
     def normalize_slots(self):
         """Normalize slot parameters to unit RMS to prevent unbounded growth.
@@ -387,7 +392,7 @@ class WorkspaceModule(nn.Module):
         read_attn = F.softmax(read_attn, dim=-1)
         read_out = torch.matmul(read_attn, rv)  # (B, n_heads, m, d_head)
         read_out = read_out.transpose(1, 2).contiguous().view(B, self.n_slots, D)
-        slots = self.slot_norm(slots + torch.sigmoid(self.read_gate) * self.read_out(read_out))  # gated residual + normalize to prevent growth over K iterations
+        slots = self.slot_norm(self.slot_decay * slots + torch.sigmoid(self.read_gate) * self.read_out(read_out))  # decay + gated residual + normalize
 
         # --- Write: hidden states attend over slots ---
         wq = self.write_q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)

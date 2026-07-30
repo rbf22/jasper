@@ -51,6 +51,8 @@ class ModelConfig:
     spectral_norm_bound: float = 5.0
     ws_entropy_weight: float = 0.0       # weight for attention entropy regularizer
     ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer
+    gate_init: float = -5.0             # gate parameter init value (sigmoid(gate_init) ≈ 0.007)
+    slot_decay_init: float = 1.0        # slot decay factor init (1.0 = no decay, <1.0 = forgetful)
 
     @property
     def d_inner(self):
@@ -1196,9 +1198,18 @@ class TTWorkspaceModule:
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
 
-        # Gates (init 0 -> sigmoid(0) = 0.5)
-        self.read_gate = ttnn.from_torch(torch.zeros(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.write_gate = ttnn.from_torch(torch.zeros(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # Gates (zero-init: sigmoid(gate_init) ≈ 0.007, workspace starts as near-identity)
+        # The gates gradually open as the model learns to use the workspace.
+        # This is the same principle as zero-initialization in LoRA.
+        gate_init_val = config.gate_init
+        self.read_gate = ttnn.from_torch(torch.tensor([gate_init_val], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.write_gate = ttnn.from_torch(torch.tensor([gate_init_val], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+        # Slot decay: learned scalar that makes the slot update contractive.
+        # slots_out = norm(decay * slots_in + gate * read_out)
+        # Initialized at slot_decay_init (1.0 = no decay). The decay provides a
+        # restoring force: old information fades unless actively reinforced.
+        self.slot_decay = ttnn.from_torch(torch.tensor([config.slot_decay_init], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         self._cache = {}
         self._forward_caches = []  # list of dicts, one per forward call (for regularizers)
@@ -1246,9 +1257,12 @@ class TTWorkspaceModule:
         read_out = self._reshape_from_heads(read_out_4d, B, m)      # (B, m, D)
         read_out_proj = ttnn.linear(read_out, self.read_out_weight)  # (B, m, D)
 
-        # slots = slot_norm(slots + sigmoid(read_gate) * read_out_proj)
+        # slots = slot_norm(decay * slots + sigmoid(read_gate) * read_out_proj)
+        # The decay factor makes the slot update contractive — old information
+        # fades unless the read gate actively reinforces it.
         read_gate_val = ttnn.sigmoid(self.read_gate)
-        slots_pre_norm = ttnn.add(slots, ttnn.mul(read_gate_val, read_out_proj))
+        decayed_slots = ttnn.mul(self.slot_decay, slots)
+        slots_pre_norm = ttnn.add(decayed_slots, ttnn.mul(read_gate_val, read_out_proj))
         slots_out = self.slot_norm.forward(slots_pre_norm)
 
         # --- Write: hidden states attend over slots ---
@@ -1270,7 +1284,8 @@ class TTWorkspaceModule:
 
         # Cache for backward
         self._cache = {
-            "x": x, "slots_in": slots, "slots_pre_norm": slots_pre_norm,
+            "x": x, "slots_in": slots, "decayed_slots": decayed_slots,
+            "slots_pre_norm": slots_pre_norm,
             "rq": rq, "rk": rk, "rv": rv, "read_attn": read_attn, "read_out_4d": read_out_4d,
             "read_out": read_out, "read_out_proj": read_out_proj,
             "read_gate_val": read_gate_val,
@@ -1373,8 +1388,8 @@ class TTWorkspaceModule:
         # --- Backward through slots_out = slot_norm(slots_pre_norm) ---
         grad_slots_pre_norm, grad_slot_norm_w = self.slot_norm.backward(grad_slots_total, c["slots_pre_norm"])
 
-        # --- Backward through slots_pre_norm = slots_in + sigmoid(read_gate) * read_out_proj ---
-        grad_slots_in_from_read = grad_slots_pre_norm  # residual
+        # --- Backward through slots_pre_norm = decay * slots_in + sigmoid(read_gate) * read_out_proj ---
+        grad_slots_in_from_read = ttnn.mul(grad_slots_pre_norm, self.slot_decay)  # residual * decay
         grad_read_out_proj = ttnn.mul(grad_slots_pre_norm, c["read_gate_val"])
 
         # grad_read_gate
@@ -1382,6 +1397,10 @@ class TTWorkspaceModule:
         read_sig_prime = ttnn.mul(read_gate_val, ttnn.sub(ones_1, read_gate_val))
         grad_read_gate = ttnn.mul(ttnn.mul(grad_slots_pre_norm, c["read_out_proj"]), read_sig_prime)
         grad_read_gate = ttnn.sum(ttnn.sum(ttnn.sum(grad_read_gate, dim=0), dim=0), dim=0)
+
+        # grad_slot_decay = sum(grad_slots_pre_norm * slots_in)
+        grad_slot_decay = ttnn.mul(grad_slots_pre_norm, c["slots_in"])
+        grad_slot_decay = ttnn.sum(ttnn.sum(ttnn.sum(grad_slot_decay, dim=0), dim=0), dim=0)
 
         # --- Backward through read_out_proj = linear(read_out) ---
         grad_read_out = ttnn.linear(grad_read_out_proj, ttnn.transpose(self.read_out_weight, 0, 1))
@@ -1445,6 +1464,7 @@ class TTWorkspaceModule:
             "ws_slot_norm_weight": grad_slot_norm_w,
             "read_gate": grad_read_gate,
             "write_gate": grad_write_gate,
+            "slot_decay": grad_slot_decay,
         }
 
         return grad_x, grad_slots_in, grads
@@ -1458,6 +1478,7 @@ class TTWorkspaceModule:
             "write_v_weight": self.write_v_weight, "write_out_weight": self.write_out_weight,
             "ws_norm_weight": self.norm.weight, "ws_slot_norm_weight": self.slot_norm.weight,
             "read_gate": self.read_gate, "write_gate": self.write_gate,
+            "slot_decay": self.slot_decay,
         }
 
     def normalize_slots(self):
@@ -1559,6 +1580,7 @@ class TTWorkspaceModule:
             "write_v_weight": "write_v_weight", "write_out_weight": "write_out_weight",
             "ws_norm_weight": "norm", "ws_slot_norm_weight": "slot_norm",
             "read_gate": "read_gate", "write_gate": "write_gate",
+            "slot_decay": "slot_decay",
         }
         for k, v in params.items():
             if k == "ws_norm_weight":

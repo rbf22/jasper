@@ -144,6 +144,18 @@ Two task-agnostic regularizers address this (both can remain active during langu
 
 Both are computed via host-side PyTorch autograd on the cached attention and slot tensors, with gradients injected into the workspace backward pass at the softmax and slot-state boundaries. They contribute ~5% of the total loss signal — a gentle nudge, not a dominant force. Config: `ws_entropy_weight`, `ws_diversity_weight` in the YAML configs.
 
+### Architectural stability: zero-init gates and slot decay
+
+The regularizers proved the workspace CAN learn selective attention (write entropy dropped from 2.75 to 0.224), but the model collapsed at step 450 — the sharpening exceeded what external constraints could stably support. Analysis revealed the root cause: the workspace has a **feedback loop with gain** (read from x → update slots → write back to x), and this loop is amplifying rather than contractive. External constraints (spectral norm, slot norm, regularizers) cap individual components but don't make the loop itself stable.
+
+Two architectural changes make the workspace stable by construction — a "tennis ball in a bucket" rather than a knife edge:
+
+7. **Zero-initialized gates** (`gate_init: -5`): Gate parameters are initialized to -5, giving sigmoid(-5) ≈ 0.007. The workspace starts as near-identity — the feedback loop is essentially inactive. The gates gradually open as the model learns that the workspace is useful, at which point the model has already adapted to handle the feedback. This is the same principle as zero-initialization in LoRA and is proven to stabilize training of additive modules.
+
+8. **Slot decay** (`slot_decay_init: 1.0`): The slot update changes from `slots = norm(slots + gate * read_out)` to `slots = norm(decay * slots + gate * read_out)` where `decay` is a learned scalar initialized at 1.0. The decay makes the slot update contractive: old information naturally fades unless the read gate actively reinforces it. The feedback loop now has a restoring force — if attention gets too sharp and overwrites a slot, the decay pulls it back toward the learned slot embedding.
+
+Together, these make the workspace start stable (near-zero gates) and stay stable (decaying slots). The external constraints become less critical because the architecture itself is contractive rather than amplifying. Config: `gate_init` (default -5), `slot_decay_init` (default 1.0) in the YAML configs.
+
 ---
 
 ## How to run
