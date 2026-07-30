@@ -584,7 +584,12 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     if lr_groups:
         ws_mult = lr_groups.get("ws_", 1.0)
         ws_lr = base_lr * ws_mult
-        print(f"LR groups: workspace={ws_lr:.2e} ({ws_mult}x), backbone={base_lr:.2e}", flush=True)
+        gate_mult = lr_groups.get("ws_read_gate", None)
+        if gate_mult is not None:
+            gate_lr = base_lr * gate_mult
+            print(f"LR groups: workspace={ws_lr:.2e} ({ws_mult}x), gates={gate_lr:.2e} ({gate_mult}x), backbone={base_lr:.2e}", flush=True)
+        else:
+            print(f"LR groups: workspace={ws_lr:.2e} ({ws_mult}x), backbone={base_lr:.2e}", flush=True)
 
     # Resume from checkpoint
     start_step = 0

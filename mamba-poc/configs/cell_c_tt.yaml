@@ -20,8 +20,13 @@ slot_decay_init: 1.0
 # Training
 lr: 2.0e-4
 # Per-parameter LR groups: workspace gets 0.25x base LR (5e-5) to prevent
-# gradient explosion at warmup peak. Backbone stays at 2e-4 to match Cell E.
+# gradient explosion at warmup peak. Gates get 10x base LR (2e-3) so they
+# open fast enough to contribute within the training budget — without this,
+# sigmoid'(-5) ≈ 0.007 suppresses the gradient and the gates barely move.
+# Backbone stays at 2e-4 to match Cell E.
 lr_groups:
+  ws_read_gate: 10.0
+  ws_write_gate: 10.0
   ws_: 0.25
 max_steps: 10000
 tokens_per_batch: 250000
