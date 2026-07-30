@@ -130,6 +130,8 @@ def build_model_config(cfg: dict) -> ModelConfig:
         k_inference=cfg.get("k_inference", 6),
         use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
         spectral_norm_bound=cfg.get("spectral_norm_bound", 5.0),
+        ws_entropy_weight=cfg.get("ws_entropy_weight", 0.0),
+        ws_diversity_weight=cfg.get("ws_diversity_weight", 0.0),
     )
 
 
@@ -610,7 +612,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     if profile:
         print(f"  Profiling: ENABLED", flush=True)
 
-    print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10}", flush=True)
+    print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10} {'Entropy':>10} {'Diversity':>10}", flush=True)
 
     profiler = Profiler()
     total_time = 0
@@ -626,6 +628,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         # Gradient accumulation
         accum_grads = {}  # host-side accumulated gradients
         step_loss = 0.0
+        step_entropy = 0.0
+        step_diversity = 0.0
 
         for accum_idx in range(accum_steps):
             # Sample micro-batch
@@ -659,6 +663,12 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
 
             step_loss += loss_val
 
+            # Workspace regularizers (entropy + diversity)
+            # Computes regularizer losses and stores gradients for backward
+            ent_loss, div_loss = model.compute_workspace_regularizers()
+            step_entropy += ent_loss
+            step_diversity += div_loss
+
             # Backward
             if profile:
                 with profiler.time_section("backward"):
@@ -675,6 +685,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
 
         # Average loss over accumulation steps
         step_loss /= accum_steps
+        step_entropy /= accum_steps
+        step_diversity /= accum_steps
 
         # Convert accumulated gradients to tt-nn tensors
         if profile:
@@ -712,7 +724,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
 
         if step < 50 or step % log_interval == 0 or step == max_steps - 1:
             print(f"{step:>6} {step_loss:>10.4f} {current_lr:>10.6f} "
-                  f"{step_time:>7.2f}s {tokens_per_sec:>10.0f} {grad_norm:>10.4f}", flush=True)
+                  f"{step_time:>7.2f}s {tokens_per_sec:>10.0f} {grad_norm:>10.4f} "
+                  f"{step_entropy:>10.4f} {step_diversity:>10.4f}", flush=True)
 
         # Checkpoint
         if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:

@@ -49,6 +49,8 @@ class ModelConfig:
     dropout: float = 0.0
     use_gradient_checkpointing: bool = True
     spectral_norm_bound: float = 5.0
+    ws_entropy_weight: float = 0.0       # weight for attention entropy regularizer
+    ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer
 
     @property
     def d_inner(self):
@@ -1199,6 +1201,7 @@ class TTWorkspaceModule:
         self.write_gate = ttnn.from_torch(torch.zeros(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         self._cache = {}
+        self._forward_caches = []  # list of dicts, one per forward call (for regularizers)
 
     def _reshape_to_heads(self, x, B, L):
         """(B, L, D) -> (B, H, L, d_head)"""
@@ -1279,13 +1282,23 @@ class TTWorkspaceModule:
             "B": B, "T": T, "m": m,
         }
 
+        # Accumulate for regularizers (entropy + diversity)
+        self._forward_caches.append({
+            "read_attn": read_attn,       # (B, H, m, T)
+            "write_attn": write_attn,     # (B, H, T, m)
+            "slots_out": slots_out,       # (B, m, D)
+        })
+
         return x_out, slots_out
 
-    def backward(self, grad_x_out: "ttnn.Tensor", grad_slots_out: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor", Dict[str, "ttnn.Tensor"]]:
+    def backward(self, grad_x_out: "ttnn.Tensor", grad_slots_out: "ttnn.Tensor",
+                 extra_grad_read_attn=None, extra_grad_write_attn=None, extra_grad_slots_out=None
+                 ) -> Tuple["ttnn.Tensor", "ttnn.Tensor", Dict[str, "ttnn.Tensor"]]:
         """Backward through workspace module — all on device.
 
         grad_x_out: (B, T, D)
         grad_slots_out: (B, m, D) — gradient w.r.t. slots_out
+        extra_grad_*: optional regularizer gradients to add (from entropy/diversity losses)
         Returns: (grad_x, grad_slots_in, grads_dict)
         """
         c = self._cache
@@ -1318,6 +1331,8 @@ class TTWorkspaceModule:
         grad_write_out_4d = self._reshape_to_heads(grad_write_out, B, T)  # (B, H, T, d_h)
         wv = c["wv"]
         grad_write_attn = ttnn.matmul(grad_write_out_4d, ttnn.transpose(wv, -2, -1))  # (B, H, T, m)
+        if extra_grad_write_attn is not None:
+            grad_write_attn = ttnn.add(grad_write_attn, extra_grad_write_attn)
         grad_wv = ttnn.matmul(ttnn.transpose(c["write_attn"], -2, -1), grad_write_out_4d)  # (B, H, m, d_h)
 
         # --- Backward through write_attn = softmax(write_scores * scale) ---
@@ -1350,8 +1365,10 @@ class TTWorkspaceModule:
         grad_slots_from_wk = ttnn.reshape(ttnn.matmul(grad_wk_2d, ttnn.transpose(self.write_k_weight, 0, 1)), [B, m, D])
         grad_slots_from_wv = ttnn.reshape(ttnn.matmul(grad_wv_2d, ttnn.transpose(self.write_v_weight, 0, 1)), [B, m, D])
 
-        # Total grad_slots_out (from write path + incoming grad_slots_out)
+        # Total grad_slots_out (from write path + incoming grad_slots_out + regularizer)
         grad_slots_total = ttnn.add(grad_slots_out, ttnn.add(grad_slots_from_wk, grad_slots_from_wv))
+        if extra_grad_slots_out is not None:
+            grad_slots_total = ttnn.add(grad_slots_total, extra_grad_slots_out)
 
         # --- Backward through slots_out = slot_norm(slots_pre_norm) ---
         grad_slots_pre_norm, grad_slot_norm_w = self.slot_norm.backward(grad_slots_total, c["slots_pre_norm"])
@@ -1376,6 +1393,8 @@ class TTWorkspaceModule:
         grad_read_out_4d = self._reshape_to_heads(grad_read_out, B, m)  # (B, H, m, d_h)
         rv = c["rv"]
         grad_read_attn = ttnn.matmul(grad_read_out_4d, ttnn.transpose(rv, -2, -1))  # (B, H, m, T)
+        if extra_grad_read_attn is not None:
+            grad_read_attn = ttnn.add(grad_read_attn, extra_grad_read_attn)
         grad_rv = ttnn.matmul(ttnn.transpose(c["read_attn"], -2, -1), grad_read_out_4d)  # (B, H, T, d_h)
 
         # --- Backward through read_attn = softmax(read_scores * scale) ---
@@ -1626,6 +1645,8 @@ class TTMambaWorkspaceModel:
         # Each entry: ("pre", layer_idx, ws_was_none) or ("core", iter, layer_idx, ws_was_none) or ("post", layer_idx, ws_was_none)
         # Plus blend info for recurrent core
         self._fwd_trace = []
+        if self.workspace is not None:
+            self.workspace._forward_caches = []
         slot_state = None
 
         # --- Phase 1: pre-core layers (0..core_start-1) ---
@@ -1732,6 +1753,131 @@ class TTMambaWorkspaceModel:
 
         return logits
 
+    def compute_workspace_regularizers(self):
+        """Compute entropy and diversity regularizer losses from the forward pass.
+
+        Must be called after forward() and before backward().
+
+        Returns: (entropy_loss, diversity_loss) as scalar floats (host-side).
+        Also stores gradient contributions in self._reg_grads for the backward pass.
+
+        entropy_loss: mean entropy of read/write attention — minimizing this pushes
+                      the workspace toward selective (low-entropy) attention.
+        diversity_loss: mean cosine similarity between slots — minimizing this pushes
+                        slots to carry different information.
+
+        Both are 0.0 if no workspace or no forward caches.
+        """
+        if self.workspace is None:
+            self._reg_grads = None
+            return 0.0, 0.0
+        caches = self.workspace._forward_caches
+        if not caches:
+            self._reg_grads = None
+            return 0.0, 0.0
+
+        config = self.config
+        entropy_weight = config.ws_entropy_weight
+        diversity_weight = config.ws_diversity_weight
+
+        if entropy_weight == 0 and diversity_weight == 0:
+            self._reg_grads = None
+            return 0.0, 0.0
+
+        # Compute on host using torch autograd for the regularizer gradients.
+        # The attention and slot values are already on device; we move them to
+        # host, compute losses + gradients with PyTorch autograd, then convert
+        # the gradients back to ttnn tensors for injection into the backward pass.
+        reg_grads = []  # list of (grad_read_attn, grad_write_attn, grad_slots_out) per ws call
+
+        total_entropy = 0.0
+        total_diversity = 0.0
+        n_entropy_terms = 0
+        n_diversity_terms = 0
+
+        for cache in caches:
+            read_attn_tt = cache["read_attn"]     # (B, H, m, T)
+            write_attn_tt = cache["write_attn"]   # (B, H, T, m)
+            slots_out_tt = cache["slots_out"]     # (B, m, D)
+
+            grad_read = None
+            grad_write = None
+            grad_slots = None
+
+            # --- Entropy regularizer (host-side autograd) ---
+            if entropy_weight > 0:
+                read_attn = ttnn.to_torch(read_attn_tt).float().requires_grad_(True)
+                write_attn = ttnn.to_torch(write_attn_tt).float().requires_grad_(True)
+
+                # Entropy = -sum(p * log(p)) over last dim
+                def entropy_fn(p):
+                    return -(p * (p + 1e-8).log()).sum(dim=-1).mean()
+
+                read_ent = entropy_fn(read_attn)
+                write_ent = entropy_fn(write_attn)
+                ent_loss = (read_ent + write_ent) * entropy_weight
+                ent_loss.backward()
+
+                total_entropy += ent_loss.item()
+                n_entropy_terms += 1
+
+                grad_read = read_attn.grad.clone()
+                grad_write = write_attn.grad.clone()
+
+            # --- Diversity regularizer (host-side autograd) ---
+            if diversity_weight > 0:
+                slots_out = ttnn.to_torch(slots_out_tt).float().requires_grad_(True)
+                B, m, D = slots_out.shape
+
+                # Normalize slots to unit length
+                slot_norms = slots_out.norm(dim=-1, keepdim=True) + 1e-8  # (B, m, 1)
+                slots_norm = slots_out / slot_norms  # (B, m, D)
+
+                # Cosine similarity matrix: (B, m, m)
+                sim = torch.matmul(slots_norm, slots_norm.transpose(-1, -2))
+
+                # Off-diagonal mean (exclude self-similarity)
+                eye = torch.eye(m, device=sim.device).unsqueeze(0)  # (1, m, m)
+                off_diag = sim * (1 - eye)  # zero out diagonal
+                div_loss = off_diag.sum() / (B * m * (m - 1)) * diversity_weight
+                div_loss.backward()
+
+                total_diversity += div_loss.item()
+                n_diversity_terms += 1
+
+                grad_slots = slots_out.grad.clone()
+
+            reg_grads.append((grad_read, grad_write, grad_slots))
+
+        self._reg_grads = reg_grads
+
+        mean_entropy = total_entropy / max(n_entropy_terms, 1)
+        mean_diversity = total_diversity / max(n_diversity_terms, 1)
+        return mean_entropy, mean_diversity
+
+    def _pop_reg_grads(self):
+        """Pop regularizer gradients for the next workspace backward call (reverse order).
+
+        Returns (extra_read, extra_write, extra_slots) as ttnn tensors on device, or None.
+        """
+        if not hasattr(self, '_reg_grads') or self._reg_grads is None or len(self._reg_grads) == 0:
+            return None, None, None
+        grad_read, grad_write, grad_slots = self._reg_grads.pop()
+        device = self.device
+        extra_read = None
+        extra_write = None
+        extra_slots = None
+        if grad_read is not None:
+            extra_read = ttnn.from_torch(grad_read.to(torch.bfloat16),
+                                         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        if grad_write is not None:
+            extra_write = ttnn.from_torch(grad_write.to(torch.bfloat16),
+                                          dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        if grad_slots is not None:
+            extra_slots = ttnn.from_torch(grad_slots.to(torch.bfloat16),
+                                          dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        return extra_read, extra_write, extra_slots
+
     def backward(self, grad_logits: "ttnn.Tensor") -> Dict[str, "ttnn.Tensor"]:
         """Backward pass through the full model — fully on device.
 
@@ -1833,7 +1979,9 @@ class TTMambaWorkspaceModel:
                     m = self.workspace.n_slots
                     grad_slot_state = ttnn.zeros((B, m, config.d_model), dtype=ttnn.bfloat16,
                                                   layout=ttnn.TILE_LAYOUT, device=device)
-                grad_x, grad_slots_in, ws_grads = self.workspace.backward(grad_x, grad_slot_state)
+                extra_r, extra_w, extra_s = self._pop_reg_grads()
+                grad_x, grad_slots_in, ws_grads = self.workspace.backward(
+                    grad_x, grad_slot_state, extra_r, extra_w, extra_s)
                 accum_ws_grads(ws_grads)
                 if was_none:
                     grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
@@ -1922,7 +2070,9 @@ class TTMambaWorkspaceModel:
                             m = self.workspace.n_slots
                             grad_slot_state = ttnn.zeros((B, m, config.d_model), dtype=ttnn.bfloat16,
                                                           layout=ttnn.TILE_LAYOUT, device=device)
-                        grad_x, grad_slots_in, ws_grads = self.workspace.backward(grad_x, grad_slot_state)
+                        extra_r, extra_w, extra_s = self._pop_reg_grads()
+                        grad_x, grad_slots_in, ws_grads = self.workspace.backward(
+                            grad_x, grad_slot_state, extra_r, extra_w, extra_s)
                         accum_ws_grads(ws_grads)
                         if was_none:
                             grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
@@ -1960,7 +2110,9 @@ class TTMambaWorkspaceModel:
                     m = self.workspace.n_slots
                     grad_slot_state = ttnn.zeros((B, m, config.d_model), dtype=ttnn.bfloat16,
                                                   layout=ttnn.TILE_LAYOUT, device=device)
-                grad_x, grad_slots_in, ws_grads = self.workspace.backward(grad_x, grad_slot_state)
+                extra_r, extra_w, extra_s = self._pop_reg_grads()
+                grad_x, grad_slots_in, ws_grads = self.workspace.backward(
+                    grad_x, grad_slot_state, extra_r, extra_w, extra_s)
                 accum_ws_grads(ws_grads)
                 if was_none:
                     grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
