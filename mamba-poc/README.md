@@ -130,6 +130,20 @@ The workspace and recurrent core introduce four sources of gradient instability 
 
 All four are deterministic (one hyperparameter: the spectral norm bound C=5) and can be disabled independently for ablation.
 
+### Attention regularizers (entropy + diversity)
+
+Even with stable training, diagnostic inspection revealed that the workspace was in a **degenerate state**: read attention was nearly uniform (entropy 3.79/4.85 max), write attention was completely uniform (entropy 2.75/2.77 max), and slots did not change across recurrent core iterations. The workspace was acting as a global average pool rather than selective memory — every position wrote equally to every slot, and every slot read equally from every position.
+
+This degeneracy arises because the cross-entropy loss provides only a diffuse gradient signal for workspace selectivity. The model gets the same loss whether the workspace averages or selects, so there's no pressure to become selective.
+
+Two task-agnostic regularizers address this (both can remain active during language training):
+
+5. **Attention entropy penalty** (`ws_entropy_weight: 0.01`): Minimizes the mean entropy of read/write attention distributions, pushing the workspace toward selective (low-entropy) attention. Directly targets the observed uniformity without specifying *what* to attend to.
+
+6. **Slot diversity penalty** (`ws_diversity_weight: 0.01`): Minimizes the mean cosine similarity between pairs of slots, pushing the 16 slots to carry different information rather than collapsing to identical averaged representations.
+
+Both are computed via host-side PyTorch autograd on the cached attention and slot tensors, with gradients injected into the workspace backward pass at the softmax and slot-state boundaries. They contribute ~5% of the total loss signal — a gentle nudge, not a dominant force. Config: `ws_entropy_weight`, `ws_diversity_weight` in the YAML configs.
+
 ---
 
 ## How to run
