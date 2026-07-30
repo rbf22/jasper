@@ -18,8 +18,12 @@ core_end: 10
 k_train_max: 6
 k_inference: 6
 spectral_norm_bound: 5.0
-ws_entropy_weight: 0.01
-ws_diversity_weight: 0.01
+# Attention entropy/diversity regularizers: DISABLED — measured harmful.
+# See cell_c_tt.yaml for the full evidence. Summary: entropy rewards peakedness,
+# not input-dependence; the cheapest low-entropy solution is a fixed routing that
+# ignores the input, and the model mode-collapsed to a constant answer.
+ws_entropy_weight: 0.0
+ws_diversity_weight: 0.0
 gate_init: -2.0
 slot_decay_init: 1.0
 

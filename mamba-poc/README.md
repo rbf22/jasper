@@ -130,7 +130,25 @@ The workspace and recurrent core introduce four sources of gradient instability 
 
 All four are deterministic (one hyperparameter: the spectral norm bound C=5) and can be disabled independently for ablation.
 
-### Attention regularizers (entropy + diversity)
+### Attention regularizers (entropy + diversity) — IMPLEMENTED, MEASURED HARMFUL, DISABLED
+
+> **Do not re-enable these.** Set to 0 in all configs. At weight 0.01 they produced
+> our lowest-ever answer-token loss (0.55 vs the control's 0.94) together with our
+> *worst* evaluation (12.5% overall, 28% Task 2 — against 33%/85% for the same
+> architecture without them and 62%/80% for the no-workspace control). Generated
+> answers were near-constant regardless of input ("19", "13", "18", "18", ...).
+>
+> **Why:** entropy measures *peakedness*, not *input-dependence*. The cheapest way
+> to minimize attention entropy is a **fixed** one-hot routing that ignores the
+> input — zero entropy, zero information. The regularizer selected for exactly the
+> degeneracy it was meant to cure. Probing the checkpoint with 16 distinct inputs:
+> the write path had entropy 0.08–0.33 (very sharp) but TV 0.016 and **98.3% of
+> positions routed to the same slot for every input**. A fixed positional bucket,
+> not a content-addressed memory.
+>
+> Use the input-dependence metric (below) to measure selectivity. Never optimize entropy.
+
+The original (now superseded) rationale follows, kept for reproducibility of the negative result.
 
 Even with stable training, diagnostic inspection revealed that the workspace was in a **degenerate state**: read attention was nearly uniform (entropy 3.79/4.85 max), write attention was completely uniform (entropy 2.75/2.77 max), and slots did not change across recurrent core iterations. The workspace was acting as a global average pool rather than selective memory — every position wrote equally to every slot, and every slot read equally from every position.
 
@@ -155,6 +173,67 @@ Two architectural changes make the workspace stable by construction — a "tenni
 8. **Slot decay** (`slot_decay_init: 1.0`): The slot update changes from `slots = norm(slots + gate * read_out)` to `slots = norm(decay * slots + gate * read_out)` where `decay` is a learned scalar initialized at 1.0. The decay makes the slot update contractive: old information naturally fades unless the read gate actively reinforces it. The feedback loop now has a restoring force — if attention gets too sharp and overwrites a slot, the decay pulls it back toward the learned slot embedding.
 
 Together, these make the workspace start stable (near-zero gates) and stay stable (decaying slots). The external constraints become less critical because the architecture itself is contractive rather than amplifying. Config: `gate_init` (default -2), `slot_decay_init` (default 1.0) in the YAML configs.
+
+---
+
+## Diagnostics: measuring selectivity correctly
+
+Two metrics replace the discarded entropy objective. Both exist because entropy and
+free-generation accuracy each conflated things we needed to tell apart.
+
+### 1. Attention input-dependence (`diagnose_workspace.py`)
+
+Probes the model with N=16 distinct inputs of **identical token length** (so attention
+tensors align), then for each `(head, position)` holds the index fixed and measures how
+far each input's attention distribution sits from the across-input mean, in **total
+variation distance** (`0.5 * L1`, range [0,1]).
+
+```bash
+python diagnose_workspace.py --config configs/cell_c_tt.yaml --device 0 \
+    --checkpoint run_C/checkpoints/cell_C_step500.pt --n-probe 16 \
+    --json-output diag.json
+```
+
+| Reading | Meaning |
+|---|---|
+| `TV = 0` | Attention identical for every input → **fixed routing table**, zero information about input. Entropy is meaningless here. |
+| `TV < 0.02` | Degenerate. |
+| `TV < 0.10` | Weak — mostly fixed routing with small content-driven perturbation. |
+| `TV > 0.10` | Input-dependent (content-addressed). Whether it stores the *right* content is a separate question. |
+
+Also reports **top-1 routing fixed %**: the fraction of `(head, position)` pairs whose
+argmax target is the same for *every* probe input. 100% = completely fixed.
+
+Crucially this **cannot be gamed by sharpening** — a fixed one-hot routing scores TV=0
+and 100% fixed no matter how peaked it is. Reported **per path** (read and write): a
+functioning read path otherwise masks a degenerate write path, and those failures mean
+different things. A fixed *write* path means information enters the slots independently
+of content, so the slots are positional buckets regardless of how good reads look.
+
+### 2. Teacher-forced answer accuracy (`eval_ttnn.py`)
+
+Free generation is autoregressive, so one wrong digit corrupts every later step. A low
+generation score therefore conflates "cannot reason" with "cannot recover from its own
+mistakes" (exposure bias). The eval now reports both, feeding the gold prefix at every
+answer position for the teacher-forced pass:
+
+```
+  task                             gen  tf exact  tf/token
+  Task1 (chain arithmetic)       5.0%      2.5%     22.4%
+  Task2 (2-var arithmetic)      27.5%     47.5%     47.6%
+```
+
+- **tf >> gen** → exposure bias; the model knows each token given a correct history.
+- **tf also low** → genuine reasoning failure. Task 1 above is 22.4% per-token against a
+  **10% chance baseline** over ten digits, so even with a perfect prefix the model cannot
+  compute the answer. That is not a decoding artifact.
+
+### Known metric caveat: answer-loss is diluted by EOS
+
+The label mask (`data.py`) spans the answer digits **and** the terminating EOS. For a
+two-digit answer that means ~1/3 of supervised positions are trivially predictable, which
+deflates the reported "answer loss." This is why loss 0.55 could coexist with 12.5%
+accuracy. Do not compare loss across configurations without keeping this in mind.
 
 ---
 

@@ -93,6 +93,17 @@ def main():
     total_by_depth = {}
     samples_shown = 0
 
+    # Teacher-forced accuracy, measured alongside free generation.
+    # Generation is autoregressive: one wrong digit corrupts every later step, so
+    # a low generation score conflates "cannot reason" with "cannot recover from
+    # its own mistakes" (exposure bias). Teacher-forcing feeds the gold prefix at
+    # every answer position, isolating whether the model knows each digit given a
+    # correct history. Large tf >> gen gap = exposure bias; tf also low = the
+    # model genuinely does not compute the answer.
+    tf_correct = {1: 0, 2: 0, 3: 0}      # all answer tokens correct
+    tf_tok_correct = {1: 0, 2: 0, 3: 0}  # per-token
+    tf_tok_total = {1: 0, 2: 0, 3: 0}
+
     with torch.no_grad():
         for i, ex in enumerate(eval_set):
             input_ids = ex["input_ids"].unsqueeze(0)  # (1, T)
@@ -125,6 +136,25 @@ def main():
             total[task_id] += 1
             correct[task_id] += int(is_correct)
 
+            # --- Teacher-forced pass: gold prefix at every answer position ---
+            # encode() wraps in BOS/EOS, so take the bare answer chars. This makes
+            # prompt_len the index of the first answer token (matches data.py).
+            answer_tokens = [vocab.stoi[c] for c in answer_str if c in vocab.stoi]
+            if answer_tokens:
+                tf_input = torch.cat([
+                    input_ids[:, :prompt_len],
+                    torch.tensor([answer_tokens], dtype=input_ids.dtype),
+                ], dim=1)
+                tf_logits = ttnn.to_torch(model.forward(tf_input))  # (1, L, V)
+                n_tok_ok = 0
+                for j, gold in enumerate(answer_tokens):
+                    # logit at index (prompt_len + j - 1) predicts token at prompt_len + j
+                    pred = tf_logits[0, prompt_len + j - 1].argmax().item()
+                    n_tok_ok += int(pred == gold)
+                tf_tok_correct[task_id] += n_tok_ok
+                tf_tok_total[task_id] += len(answer_tokens)
+                tf_correct[task_id] += int(n_tok_ok == len(answer_tokens))
+
             if depth not in correct_by_depth:
                 correct_by_depth[depth] = 0
                 total_by_depth[depth] = 0
@@ -144,11 +174,29 @@ def main():
     print(f"\n{'='*60}")
     print(f"Results: Cell {cell} (step {step})")
     print(f"{'='*60}")
-    print(f"\nPer-task accuracy:")
+    print(f"\nPer-task accuracy (gen = free generation, tf = teacher-forced):")
+    print(f"  {'task':<28} {'gen':>7} {'tf exact':>9} {'tf/token':>9}")
     for tid in [1, 2, 3]:
         acc = correct[tid] / max(total[tid], 1)
+        tf_acc = tf_correct[tid] / max(total[tid], 1)
+        tf_tok = tf_tok_correct[tid] / max(tf_tok_total[tid], 1)
         task_name = TASK_NAMES.get(tid, f"Task{tid}")
-        print(f"  {task_name}: {correct[tid]}/{total[tid]} = {acc:.1%}")
+        print(f"  {task_name:<28} {acc:>6.1%} {tf_acc:>9.1%} {tf_tok:>9.1%}")
+
+    gen_all = sum(correct.values()) / max(sum(total.values()), 1)
+    tf_all = sum(tf_correct.values()) / max(sum(total.values()), 1)
+    tf_tok_all = sum(tf_tok_correct.values()) / max(sum(tf_tok_total.values()), 1)
+    print(f"\n  Interpretation: tf exact ({tf_all:.1%}) vs gen ({gen_all:.1%}) — ", end="")
+    if tf_all - gen_all > 0.15:
+        print("large gap => exposure bias.")
+        print("  The model largely knows each token given a correct prefix but cannot")
+        print("  recover from its own errors. Reasoning is partly there; decoding is not.")
+    elif tf_tok_all < 0.3:
+        print("both low => genuine failure.")
+        print("  Even with the gold prefix the model cannot produce the answer tokens.")
+        print("  This is a reasoning failure, not a decoding artifact.")
+    else:
+        print("similar => decoding is not the bottleneck.")
 
     print(f"\nPer-depth accuracy:")
     for depth in sorted(total_by_depth.keys()):
@@ -170,6 +218,16 @@ def main():
                 f"task{tid}": correct[tid] / max(total[tid], 1)
                 for tid in [1, 2, 3]
             },
+            "teacher_forced_exact": {
+                f"task{tid}": tf_correct[tid] / max(total[tid], 1)
+                for tid in [1, 2, 3]
+            },
+            "teacher_forced_token": {
+                f"task{tid}": tf_tok_correct[tid] / max(tf_tok_total[tid], 1)
+                for tid in [1, 2, 3]
+            },
+            "teacher_forced_exact_overall": tf_all,
+            "teacher_forced_token_overall": tf_tok_all,
             "depth_accuracy": {
                 str(d): correct_by_depth[d] / max(total_by_depth[d], 1)
                 for d in sorted(total_by_depth.keys())
