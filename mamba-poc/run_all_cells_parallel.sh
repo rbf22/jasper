@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Train all four cells in PARALLEL — one cell per Blackhole chip.
+# Train cells C, D, E in PARALLEL — one cell per Blackhole chip.
 #
 # Quietbox 2 has 4 Blackhole chips (device IDs 0-3).
-# This runs Cell A on chip 0, B on chip 1, C on chip 2, D on chip 3
-# simultaneously, finishing in ~5h instead of ~12h sequential.
+# This runs Cell E on chip 1, C on chip 2, D on chip 3.
+# Chip 0 is left free for diagnostics/eval.
+#
+# Cells A and B have been removed. A (pure Mamba2) plateaued at ~35% and
+# served only as a floor. B (Mamba2+attention, lr=6e-4) plateaued at 60%/0%
+# Task 1 — identical to E (same architecture, lr=2e-4) at 62%/5% Task 1,
+# confirming the Task 1 plateau is architectural, not LR-related.
 #
 # Usage:
-#   ./run_all_cells_parallel.sh              # fresh start, all 4 cells
+#   ./run_all_cells_parallel.sh              # fresh start, all 3 cells
 #   ./run_all_cells_parallel.sh --resume     # resume from checkpoints
 #   ./run_all_cells_parallel.sh --steps 500  # override step count
 #
@@ -18,7 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PYTHON="${PYTHON:-/home/ttuser/Documents/jasper/.tt-venv/bin/python}"
+PYTHON="${PYTHON:-/home/rfenwick/Documents/jasper/.tt-venv/bin/python}"
 LOG_DIR="$SCRIPT_DIR/logs"
 CKPT_DIR="$SCRIPT_DIR/checkpoints"
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
@@ -42,29 +47,28 @@ done
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# Cell → device ID mapping
+# Cell → device ID mapping (device 0 left free for eval/diagnostics)
 declare -A CELL_DEVICE
-CELL_DEVICE[A]=0
-CELL_DEVICE[B]=1
+CELL_DEVICE[E]=1
 CELL_DEVICE[C]=2
 CELL_DEVICE[D]=3
 
 # Cell → config
 declare -A CELL_CONFIG
-CELL_CONFIG[A]="configs/cell_a_tt.yaml"
-CELL_CONFIG[B]="configs/cell_b_tt.yaml"
+CELL_CONFIG[E]="configs/cell_e_tt.yaml"
 CELL_CONFIG[C]="configs/cell_c_tt.yaml"
 CELL_CONFIG[D]="configs/cell_d_tt.yaml"
 
 echo "============================================"
-echo "  Parallel Training — 4 cells on 4 chips"
+echo "  Parallel Training — 3 cells on 3 chips"
 echo "  Start: $(date)"
 echo "============================================"
 
 PIPELINE_START=$(date +%s)
 PIDS=()
 
-for CELL in A B C D; do
+CELLS=(E C D)
+for CELL in "${CELLS[@]}"; do
     CONFIG="${CELL_CONFIG[$CELL]}"
     DEV_ID="${CELL_DEVICE[$CELL]}"
     LOG_FILE="$LOG_DIR/cell_${CELL}_parallel_${TIMESTAMP}.log"
@@ -94,14 +98,14 @@ for CELL in A B C D; do
 done
 
 echo ""
-echo "  All 4 cells launched. Waiting for completion..."
+echo "  All 3 cells launched. Waiting for completion..."
 echo "  Monitor with: tail -f $LOG_DIR/cell_*_parallel_${TIMESTAMP}.log"
 echo ""
 
 # Wait for all to finish
 FAILED=0
 for i in "${!PIDS[@]}"; do
-    CELL="ABCD"[$i]
+    CELL="${CELLS[$i]}"
     PID="${PIDS[$i]}"
     if wait "$PID"; then
         echo "  Cell $CELL (PID $PID) completed successfully"
