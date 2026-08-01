@@ -631,6 +631,18 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
 
     print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10} {'Entropy':>10} {'Diversity':>10}", flush=True)
 
+    # Early stopping: stop if smoothed loss hasn't improved for plateau_patience steps.
+    # Uses an EMA of the loss to avoid noise from individual steps, and requires
+    # a relative improvement of plateau_min_delta to count as "better".
+    plateau_patience = cfg.get("plateau_patience", 500)
+    plateau_min_delta = cfg.get("plateau_min_delta", 1e-4)  # relative improvement
+    plateau_ema_beta = 0.99  # EMA smoothing factor
+    best_loss_ema = float("inf")
+    loss_ema = None
+    steps_since_best = 0
+    if plateau_patience > 0:
+        print(f"  Early stopping: patience={plateau_patience}, min_delta={plateau_min_delta}", flush=True)
+
     profiler = Profiler()
     total_time = 0
     total_tokens = 0
@@ -749,6 +761,25 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             print(f"{step:>6} {step_loss:>10.4f} {current_lr:>10.6f} "
                   f"{step_time:>7.2f}s {tokens_per_sec:>10.0f} {grad_norm:>10.4f} "
                   f"{step_entropy:>10.4f} {step_diversity:>10.4f}", flush=True)
+
+        # Early stopping: track EMA of loss, stop if no improvement for plateau_patience steps.
+        # Skip during warmup (LR is ramping, loss behavior is not representative).
+        if plateau_patience > 0 and step >= warmup_steps:
+            if loss_ema is None:
+                loss_ema = step_loss
+            else:
+                loss_ema = plateau_ema_beta * loss_ema + (1 - plateau_ema_beta) * step_loss
+            # Check for improvement (relative improvement over best)
+            if loss_ema < best_loss_ema * (1 - plateau_min_delta):
+                best_loss_ema = loss_ema
+                steps_since_best = 0
+            else:
+                steps_since_best += 1
+            if steps_since_best >= plateau_patience:
+                print(f"\n*** Early stopping at step {step}: loss EMA plateaued "
+                      f"(best={best_loss_ema:.4f}, current={loss_ema:.4f}, "
+                      f"no improvement for {plateau_patience} steps) ***", flush=True)
+                break
 
         # Checkpoint
         if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:
