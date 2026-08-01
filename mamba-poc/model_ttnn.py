@@ -1124,6 +1124,11 @@ class TTRetentionLayer:
         self._rope_sin = None
         self._rope_T = 0
 
+        # Decay matrix cache (diff and causal mask, precomputed per T on device)
+        self._diff_tt = None
+        self._causal_tt = None
+        self._decay_T = 0
+
         self._cache = {}
 
     def _init_rope(self, T, device):
@@ -1164,20 +1169,39 @@ class TTRetentionLayer:
         return ttnn.concat([grad_x1, grad_x2], dim=-1)
 
     def _get_decay_matrix(self, T, device):
-        """Precompute D[t,s] = gamma^(t-s) for s <= t, else 0.
+        """Compute D[t,s] = gamma^(t-s) for s <= t, else 0 — fully on device.
 
         Returns: (1, H, T, T) bf16 on device.
-        Built on host in fp32 (small: H * T * T elements) then transferred.
+
+        The diff matrix and causal mask are precomputed once per T and cached.
+        Per-step, only a broadcast multiply (diff * log_gamma) and exp are needed
+        — no host transfer. This eliminates the 26ms/iter host round-trip that
+        was 36% of total time in profiling.
         """
-        H = self.n_heads
-        pos = torch.arange(T, dtype=torch.float32)
-        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (T, T)
-        causal = (diff >= 0).float()
-        gamma_host = ttnn.to_torch(self.gamma).float()  # (H,) -- log(gamma)
-        log_D = diff.unsqueeze(0) * gamma_host.unsqueeze(1).unsqueeze(2)  # (H, T, T)
-        D = torch.exp(log_D) * causal.unsqueeze(0)  # (H, T, T)
-        D_bf16 = D.to(torch.bfloat16).unsqueeze(0)  # (1, H, T, T)
-        return ttnn.from_torch(D_bf16, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # Cache the diff matrix and causal mask on device per T
+        if self._decay_T != T or self._diff_tt is None:
+            H = self.n_heads
+            pos = torch.arange(T, dtype=torch.float32)
+            diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (T, T)
+            causal = (diff >= 0).to(torch.bfloat16)
+            # Store as (1, 1, T, T) for broadcasting with (1, H, T, T)
+            diff_tt = diff.unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
+            causal_tt = causal.unsqueeze(0).unsqueeze(0)
+            self._diff_tt = ttnn.from_torch(diff_tt, dtype=ttnn.bfloat16,
+                                             layout=ttnn.TILE_LAYOUT, device=device)
+            self._causal_tt = ttnn.from_torch(causal_tt, dtype=ttnn.bfloat16,
+                                               layout=ttnn.TILE_LAYOUT, device=device)
+            self._decay_T = T
+
+        # log_D = diff * log_gamma  — broadcast (1,1,T,T) * (1,H,1,1) -> (1,H,T,T)
+        # gamma is (H,) stored as log(gamma); reshape to (1, H, 1, 1)
+        log_gamma_4d = ttnn.reshape(self.gamma, [1, self.n_heads, 1, 1])
+        # Convert to bf16 for the multiply (gamma is fp32, diff is bf16)
+        log_gamma_bf16 = ttnn.typecast(log_gamma_4d, ttnn.bfloat16)
+        log_D = ttnn.mul(self._diff_tt, log_gamma_bf16)  # (1, H, T, T)
+        D = ttnn.exp(log_D)  # (1, H, T, T)
+        D = ttnn.mul(D, self._causal_tt)  # zero out future positions
+        return D
 
     def forward(self, x):
         """x: (B, T, d_model) -> (B, T, d_model)"""
@@ -1267,10 +1291,8 @@ class TTRetentionLayer:
         grad_out_flat = ttnn.mul(grad_out_gated, gate)
 
         # sigmoid'(g) = sigmoid(g) * (1 - sigmoid(g)) = gate * (1 - gate)
-        gate_host = ttnn.to_torch(gate)
-        ones_host = torch.ones_like(gate_host)
-        ones_tt = ttnn.from_torch(ones_host, dtype=ttnn.bfloat16,
-                                   layout=ttnn.TILE_LAYOUT, device=device)
+        # Use ttnn.ones_like to avoid host round-trip for creating ones tensor
+        ones_tt = ttnn.ones_like(gate)
         sig_prime = ttnn.mul(gate, ttnn.sub(ones_tt, gate))  # (B, T, D)
         grad_g = ttnn.mul(grad_out_gated, c["out_flat"])
         grad_g = ttnn.mul(grad_g, sig_prime)  # (B, T, D)
@@ -1299,13 +1321,17 @@ class TTRetentionLayer:
         # D[h,t,s] = exp(diff[t,s] * log_gamma[h]) for s <= t
         # dD/d(log_gamma[h]) = D[h,t,s] * diff[t,s]
         # grad_log_gamma[h] = sum_{b,t,s} grad_D_decay[b,h,t,s] * D[h,t,s] * diff[t,s]
-        # Computed on host (H scalars, small transfer)
-        grad_D_host = ttnn.to_torch(grad_D_decay).float()  # (B, H, T, T)
-        D_host = ttnn.to_torch(D_decay).float()             # (1, H, T, T)
-        pos = torch.arange(T, dtype=torch.float32)
-        diff = pos.unsqueeze(1) - pos.unsqueeze(0)           # (T, T)
-        grad_log_gamma = (grad_D_host * D_host * diff.unsqueeze(0).unsqueeze(0)).sum(dim=(0, 2, 3))
-        grad_gamma = to_device(grad_log_gamma.to(torch.float32), device, dtype=ttnn.float32)
+        # Computed fully on device to avoid the 33ms/iter host transfer that was
+        # 47% of total time in profiling. Uses the cached diff_tt from forward.
+        # weighted = grad_D_decay * D_decay * diff  -> (B, H, T, T)
+        weighted = ttnn.mul(grad_D_decay, D_decay)      # (B, H, T, T)
+        weighted = ttnn.mul(weighted, self._diff_tt)     # broadcast (1,1,T,T)
+        # Sum over batch (dim 0) and positions (dims 2, 3) -> (H,)
+        grad_log_gamma = ttnn.sum(weighted, dim=0)       # (H, T, T)
+        grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H, T)
+        grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H,)
+        # Store as fp32 to match gamma's dtype
+        grad_gamma = ttnn.typecast(grad_log_gamma, ttnn.float32)
 
         # --- Backward through scores_raw = (Q @ K^T) * scale ---
         grad_scores_scaled = ttnn.mul(grad_scores_raw, c["scale_tt"])
