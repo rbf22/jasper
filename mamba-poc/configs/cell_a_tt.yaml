@@ -19,7 +19,7 @@ recurrent_core: false
 # Training — matches Cell B/C learning rate
 lr: 2.0e-4
 max_steps: 10000
-tokens_per_batch: 250000
+tokens_per_batch: 50000
 seq_len: 128
 warmup_steps: 200
 weight_decay: 0.1

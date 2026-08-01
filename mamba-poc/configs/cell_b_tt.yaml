@@ -39,7 +39,7 @@ lr_groups:
   ws_write_gate: 10.0
   ws_: 0.25
 max_steps: 10000
-tokens_per_batch: 250000
+tokens_per_batch: 50000
 seq_len: 128
 warmup_steps: 200
 weight_decay: 0.1
