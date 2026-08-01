@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Automated eval loop — monitors checkpoints and runs eval_ttnn.py on each new one.
 
-For each cell (B, C, D, and later A, E):
-  - Scans run_X/checkpoints/ for new checkpoint files
+For each cell (A, B, C):
+  - Scans checkpoints/ for new checkpoint files
   - Runs eval_ttnn.py on the specified device
-  - Saves JSON results to run_X/eval_results/
+  - Saves JSON results to eval_results/
   - Tracks plateau: if Task 1 accuracy hasn't improved by >=1% over 3 consecutive
     evals, marks the cell as plateaued
   - Prints a summary table after each eval
@@ -16,7 +16,7 @@ Usage:
     python eval_loop.py --device 0 --once
 
     # Custom cells and eval size
-    python eval_loop.py --device 0 --cells B C D --n-per-task 5
+    python eval_loop.py --device 0 --cells A B C --n-per-task 5
 """
 
 import os
@@ -45,7 +45,7 @@ PLATEAU_THRESHOLD = 0.01  # 1% improvement required to count as "improved"
 
 def find_checkpoints(cell, base_dir="."):
     """Find all checkpoint files for a cell, sorted by step number."""
-    pattern = os.path.join(base_dir, f"run_{cell}", "checkpoints", f"cell_{cell}_step*.pt")
+    pattern = os.path.join(base_dir, "checkpoints", f"cell_{cell}_step*.pt")
     files = glob.glob(pattern)
     # Extract step number and sort
     def step_of(path):
@@ -60,7 +60,7 @@ def already_evaluated(cell, checkpoint_path, base_dir="."):
     if not step_match:
         return True  # skip unparseable
     step = step_match.group(1)
-    json_path = os.path.join(base_dir, f"run_{cell}", "eval_results", f"step_{step}.json")
+    json_path = os.path.join(base_dir, "eval_results", f"cell_{cell}_step_{step}.json")
     return os.path.exists(json_path)
 
 
@@ -74,14 +74,11 @@ def run_eval(cell, checkpoint_path, device, base_dir, n_per_task, depths, timeou
     step_match = re.search(r"step(\d+)\.pt$", checkpoint_path)
     step = step_match.group(1) if step_match else "unknown"
 
-    json_path = os.path.join(base_dir, f"run_{cell}", "eval_results", f"step_{step}.json")
+    json_path = os.path.join(base_dir, "eval_results", f"cell_{cell}_step_{step}.json")
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
 
-    # Use the cell's own tt_cache to avoid recompiling kernels
-    tt_cache = os.path.join(base_dir, f"run_{cell}", "tt_cache")
-
     cmd = [
-        "/home/ttuser/Documents/jasper/.tt-venv/bin/python",
+        "/home/rfenwick/Documents/jasper/.tt-venv/bin/python",
         "eval_ttnn.py",
         "--config", config,
         "--device", str(device),
@@ -94,7 +91,6 @@ def run_eval(cell, checkpoint_path, device, base_dir, n_per_task, depths, timeou
     ]
 
     env = os.environ.copy()
-    env["TT_METAL_CACHE"] = tt_cache
     env["TT_METAL_LOGGER_LEVEL"] = "ERROR"
 
     print(f"  Running: cell {cell} step {step} on device {device}...")
@@ -144,7 +140,7 @@ def run_eval(cell, checkpoint_path, device, base_dir, n_per_task, depths, timeou
 
 def load_eval_history(cell, base_dir="."):
     """Load all eval results for a cell, sorted by step."""
-    pattern = os.path.join(base_dir, f"run_{cell}", "eval_results", "step_*.json")
+    pattern = os.path.join(base_dir, "eval_results", f"cell_{cell}_step_*.json")
     files = glob.glob(pattern)
     results = []
     for f in files:
@@ -234,12 +230,12 @@ def print_summary(all_cells, base_dir="."):
 def main():
     parser = argparse.ArgumentParser(description="Automated eval loop for TT training")
     parser.add_argument("--device", type=int, default=0, help="Device to run evals on")
-    parser.add_argument("--cells", nargs="+", default=["B", "C", "D"], help="Cells to monitor")
+    parser.add_argument("--cells", nargs="+", default=["A", "B", "C"], help="Cells to monitor")
     parser.add_argument("--poll-interval", type=int, default=300, help="Seconds between polls")
     parser.add_argument("--n-per-task", type=int, default=5, help="Eval examples per task per depth")
     parser.add_argument("--depths", type=int, nargs="+", default=[2, 4, 6, 8])
     parser.add_argument("--once", action="store_true", help="Eval all existing checkpoints once, then exit")
-    parser.add_argument("--base-dir", default="/home/ttuser/Documents/jasper/mamba-poc")
+    parser.add_argument("--base-dir", default="/home/rfenwick/Documents/jasper/mamba-poc")
     parser.add_argument("--eval-timeout", type=int, default=900, help="Timeout per eval in seconds")
     args = parser.parse_args()
 
