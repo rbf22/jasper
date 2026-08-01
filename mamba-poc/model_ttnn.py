@@ -53,6 +53,14 @@ class ModelConfig:
     ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer
     gate_init: float = -2.0             # gate parameter init value (sigmoid(-2) ≈ 0.12)
     slot_decay_init: float = 1.0        # slot decay factor init (1.0 = no decay, <1.0 = forgetful)
+    slot_permutation: bool = False      # randomly permute slot indices each forward pass (breaks fixed routing)
+    gate_schedule_steps: int = 0        # >0: anneal gates from gate_init to 0 over this many steps
+    # --- Mamba-3 MIMO config ---
+    headdim: int = 64                   # SSM head dimension (d_inner // headdim = nheads)
+    d_state_m3: int = 64                # SSM state size for Mamba-3 (can differ from d_state)
+    mimo_rank: int = 4                  # MIMO rank R (parallel SSMs per head)
+    rope_fraction: float = 0.5          # fraction of d_state to apply RoPE to
+    ngroups: int = 1                    # number of BC heads (1 = shared B/C across all heads)
 
     @property
     def d_inner(self):
@@ -61,6 +69,19 @@ class ModelConfig:
     @property
     def d_head(self):
         return self.d_inner // self.n_heads
+
+    @property
+    def nheads_m3(self):
+        """Number of SSM heads for Mamba-3 (d_inner // headdim)."""
+        return self.d_inner // self.headdim
+
+    @property
+    def num_rope_angles(self):
+        """Number of RoPE angles for Mamba-3 complex SSM."""
+        split = int(self.d_state_m3 * self.rope_fraction)
+        if split % 2 != 0:
+            split -= 1
+        return split // 2
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +154,11 @@ class TTRMSNorm:
           grad_weight = sum(grad_out * x_normed, dim=(0,1))
 
         Args:
-            grad_out: (B, T, d) gradient w.r.t. output
-            x: (B, T, d) pre-norm input (cached from forward)
+            grad_out: (..., d) gradient w.r.t. output
+            x: (..., d) pre-norm input (cached from forward)
 
         Returns:
-            grad_x: (B, T, d) gradient w.r.t. input
+            grad_x: (..., d) gradient w.r.t. input
             grad_weight: (d,) gradient w.r.t. weight
         """
         device = self.device
@@ -145,45 +166,41 @@ class TTRMSNorm:
         eps = self.eps
 
         # Compute rms = sqrt(eps + mean(x^2)) along last dim
-        # ttnn.mean drops the last dim, so we reshape back to (B, T, 1)
-        x_sq = ttnn.mul(x, x)  # (B, T, d)
-        x_sq_mean = ttnn.mean(x_sq, dim=-1)  # (B, T)
-        rms_2d = ttnn.sqrt(ttnn.add(x_sq_mean, eps))  # (B, T)
-        rms = ttnn.reshape(rms_2d, [x_sq_mean.shape[0], x_sq_mean.shape[1], 1])  # (B, T, 1)
+        x_sq = ttnn.mul(x, x)
+        x_sq_mean = ttnn.mean(x_sq, dim=-1)  # (...,) — drops last dim
+        # Reshape to (..., 1) for broadcasting via mul
+        mean_shape = list(int(x_sq_mean.shape[i]) for i in range(len(x_sq_mean.shape))) + [1]
+        inv_rms = ttnn.rsqrt(ttnn.add(x_sq_mean, eps))  # (...,)
+        inv_rms_b = ttnn.reshape(inv_rms, mean_shape)  # (..., 1)
 
-        # Expand rms to (B, T, d) for element-wise ops (ttnn doesn't support (B,T,1) broadcast)
-        rms_exp = ttnn.expand(rms, x.shape)  # (B, T, d)
-        inv_rms = ttnn.rsqrt(ttnn.add(x_sq_mean, eps))  # (B, T)
-        inv_rms_exp = ttnn.expand(ttnn.reshape(inv_rms, [x_sq_mean.shape[0], x_sq_mean.shape[1], 1]), x.shape)
+        # x_normed = x * inv_rms (broadcast over last dim)
+        x_normed = ttnn.mul(x, inv_rms_b)
 
-        # x_normed = x / rms = x * inv_rms
-        x_normed = ttnn.mul(x, inv_rms_exp)  # (B, T, d)
-
-        # grad_out * weight (broadcast weight across B, T — (1,1,d) works)
-        w = ttnn.reshape(self.weight, [1, 1, d])  # (1, 1, d)
-        grad_out_w = ttnn.mul(grad_out, w)  # (B, T, d)
+        # grad_out * weight (broadcast weight across all leading dims)
+        w_shape = [1] * (len(grad_out.shape) - 1) + [d]
+        w = ttnn.reshape(self.weight, w_shape)
+        grad_out_w = ttnn.mul(grad_out, w)
 
         # grad_out_w / rms = grad_out_w * inv_rms
-        grad_out_w_rms = ttnn.mul(grad_out_w, inv_rms_exp)  # (B, T, d)
+        grad_out_w_rms = ttnn.mul(grad_out_w, inv_rms_b)
 
         # mean(grad_out_w * x_normed) along last dim
-        grad_out_w_xnorm = ttnn.mul(grad_out_w, x_normed)  # (B, T, d)
-        grad_out_w_xnorm_mean = ttnn.mean(grad_out_w_xnorm, dim=-1)  # (B, T)
-        grad_out_w_xnorm_mean_3d = ttnn.reshape(
-            grad_out_w_xnorm_mean,
-            [grad_out_w_xnorm_mean.shape[0], grad_out_w_xnorm_mean.shape[1], 1])  # (B, T, 1)
-        grad_out_w_xnorm_mean_exp = ttnn.expand(grad_out_w_xnorm_mean_3d, x.shape)  # (B, T, d)
+        grad_out_w_xnorm = ttnn.mul(grad_out_w, x_normed)
+        grad_out_w_xnorm_mean = ttnn.mean(grad_out_w_xnorm, dim=-1)  # (...,)
+        grad_out_w_xnorm_mean_b = ttnn.reshape(grad_out_w_xnorm_mean, mean_shape)  # (..., 1)
 
-        # x_normed * (grad_out_w_xnorm_mean / rms) = x_normed * grad_out_w_xnorm_mean * inv_rms
-        correction = ttnn.mul(x_normed, ttnn.mul(grad_out_w_xnorm_mean_exp, inv_rms_exp))  # (B, T, d)
+        # x_normed * (grad_out_w_xnorm_mean / rms)
+        correction = ttnn.mul(x_normed, ttnn.mul(grad_out_w_xnorm_mean_b, inv_rms_b))
 
         # grad_x = grad_out_w_rms - correction
         grad_x = ttnn.sub(grad_out_w_rms, correction)
 
-        # grad_weight = sum(grad_out * x_normed, dim=(0, 1))
-        grad_weight_full = ttnn.mul(grad_out, x_normed)  # (B, T, d)
-        grad_weight = ttnn.sum(grad_weight_full, dim=0)  # (T, d)
-        grad_weight = ttnn.sum(grad_weight, dim=0)  # (d,)
+        # grad_weight = sum(grad_out * x_normed, over all leading dims)
+        grad_weight_full = ttnn.mul(grad_out, x_normed)
+        # Sum over all dims except last
+        for _ in range(len(grad_weight_full.shape) - 1):
+            grad_weight_full = ttnn.sum(grad_weight_full, dim=0)
+        grad_weight = grad_weight_full
 
         return grad_x, grad_weight
 
@@ -794,8 +811,18 @@ class TTMamba2Layer:
                 setattr(self, k, v)
 
 
-# ---------------------------------------------------------------------------
-# Full Model (tt-nn native)
+# Mamba-3 MIMO layer is implemented in mamba3_layer.py
+# (import deferred to avoid circular import — use _get_mamba3_layer_class())
+_mamba3_layer_cls = None
+
+def _get_mamba3_layer_class():
+    global _mamba3_layer_cls
+    if _mamba3_layer_cls is None:
+        from mamba3_layer import TTMamba3Layer as cls
+        _mamba3_layer_cls = cls
+    return _mamba3_layer_cls
+
+
 # ---------------------------------------------------------------------------
 
 class TTAttentionLayer:
@@ -1048,6 +1075,288 @@ class TTAttentionLayer:
             self.out_proj_weight = params["out_proj_weight"]
 
 
+class TTRetentionLayer:
+    """Retention layer (RetNet-style) -- tt-nn native.
+
+    Decayed linear attention: D[t,s] = gamma^(t-s) for s <= t.
+    No softmax, no selective scan, no custom kernels -- pure matmuls.
+
+    Forward:
+      qkvg = linear(x, W_in)         # (B, T, 4D)
+      q, k, v, g = split(qkvg)
+      q, k = rope(q), rope(k)
+      A = (q @ k^T) * scale * D      # decayed linear attention, D is causal
+      O = A @ v                       # (B, H, T, d_h)
+      O = reshape(O)                  # (B, T, D)
+      O = O * sigmoid(g)              # element-wise output gate
+      out = linear(O, W_out)          # (B, T, D)
+
+    Backward: manual, all on device. Pure matmuls + element-wise ops.
+    """
+
+    def __init__(self, config: ModelConfig, device):
+        self.config = config
+        self.device = device
+        self.d_model = config.d_model
+        self.n_heads = config.n_heads
+        self.d_head = config.d_model // config.n_heads
+        self.scale = 1.0 / (self.d_head ** 0.5)
+
+        # QKV+gate projection: (d_model, 4*d_model)
+        qkv_w = torch.randn(self.d_model, 4 * self.d_model, dtype=torch.bfloat16) * 0.02
+        self.qkv_weight = to_device(qkv_w, device)
+
+        # Output projection: (d_model, d_model)
+        out_w = torch.randn(self.d_model, self.d_model, dtype=torch.bfloat16) * 0.02
+        self.out_proj_weight = to_device(out_w, device)
+
+        # Gamma: per-head decay scalar, stored as log(gamma) for stability.
+        # Init gamma ~0.95 (strong but not total decay): log(0.95) ~ -0.051
+        gamma_init = torch.full((self.n_heads,), -0.051, dtype=torch.float32)
+        gamma_init += torch.randn(self.n_heads, dtype=torch.float32) * 0.02
+        self.gamma = to_device(gamma_init, device, dtype=ttnn.float32)
+
+        # Precompute RoPE cos/sin tables (lazy, per T)
+        d_rope = self.d_head
+        freqs = 1.0 / (10000 ** (torch.arange(0, d_rope, 2).float() / d_rope))
+        self._rope_freqs = freqs
+        self._rope_cos = None
+        self._rope_sin = None
+        self._rope_T = 0
+
+        self._cache = {}
+
+    def _init_rope(self, T, device):
+        """Initialize RoPE cos/sin tables for sequence length T on device."""
+        if self._rope_T == T and self._rope_cos is not None:
+            return
+        positions = torch.arange(T, dtype=torch.float32)
+        angles = torch.outer(positions, self._rope_freqs)
+        cos = torch.cos(angles).to(torch.bfloat16)
+        sin = torch.sin(angles).to(torch.bfloat16)
+        cos_4d = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, d_head//2)
+        sin_4d = sin.unsqueeze(0).unsqueeze(0)
+        self._rope_cos = ttnn.from_torch(cos_4d, dtype=ttnn.bfloat16,
+                                          layout=ttnn.TILE_LAYOUT, device=device)
+        self._rope_sin = ttnn.from_torch(sin_4d, dtype=ttnn.bfloat16,
+                                          layout=ttnn.TILE_LAYOUT, device=device)
+        self._rope_T = T
+
+    def _apply_rope(self, x, B, H, T):
+        """Apply RoPE to x: (B, H, T, d_head) -> (B, H, T, d_head)."""
+        d_h = self.d_head
+        x1 = ttnn.slice(x, [0, 0, 0, 0], [B, H, T, d_h // 2])
+        x2 = ttnn.slice(x, [0, 0, 0, d_h // 2], [B, H, T, d_h])
+        x1_cos = ttnn.mul(x1, self._rope_cos)
+        x2_sin = ttnn.mul(x2, self._rope_sin)
+        x1_sin = ttnn.mul(x1, self._rope_sin)
+        x2_cos = ttnn.mul(x2, self._rope_cos)
+        rotated = ttnn.concat([ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)], dim=-1)
+        return rotated
+
+    def _apply_rope_backward(self, grad_rotated, B, H, T):
+        """Backward through RoPE (rotation: grad is the inverse rotation)."""
+        d_h = self.d_head
+        grad_r1 = ttnn.slice(grad_rotated, [0, 0, 0, 0], [B, H, T, d_h // 2])
+        grad_r2 = ttnn.slice(grad_rotated, [0, 0, 0, d_h // 2], [B, H, T, d_h])
+        grad_x1 = ttnn.add(ttnn.mul(grad_r1, self._rope_cos), ttnn.mul(grad_r2, self._rope_sin))
+        grad_x2 = ttnn.add(ttnn.mul(ttnn.neg(grad_r1), self._rope_sin), ttnn.mul(grad_r2, self._rope_cos))
+        return ttnn.concat([grad_x1, grad_x2], dim=-1)
+
+    def _get_decay_matrix(self, T, device):
+        """Precompute D[t,s] = gamma^(t-s) for s <= t, else 0.
+
+        Returns: (1, H, T, T) bf16 on device.
+        Built on host in fp32 (small: H * T * T elements) then transferred.
+        """
+        H = self.n_heads
+        pos = torch.arange(T, dtype=torch.float32)
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (T, T)
+        causal = (diff >= 0).float()
+        gamma_host = ttnn.to_torch(self.gamma).float()  # (H,) -- log(gamma)
+        log_D = diff.unsqueeze(0) * gamma_host.unsqueeze(1).unsqueeze(2)  # (H, T, T)
+        D = torch.exp(log_D) * causal.unsqueeze(0)  # (H, T, T)
+        D_bf16 = D.to(torch.bfloat16).unsqueeze(0)  # (1, H, T, T)
+        return ttnn.from_torch(D_bf16, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+    def forward(self, x):
+        """x: (B, T, d_model) -> (B, T, d_model)"""
+        B, T, D = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+        H, d_h = self.n_heads, self.d_head
+        device = self.device
+
+        self._init_rope(T, device)
+
+        # QKV+gate projection: (B, T, 4D)
+        qkvg = ttnn.linear(x, self.qkv_weight)
+
+        # Split: q, k, v, g each (B, T, D)
+        q = ttnn.slice(qkvg, [0, 0, 0], [B, T, D])
+        k = ttnn.slice(qkvg, [0, 0, D], [B, T, 2 * D])
+        v = ttnn.slice(qkvg, [0, 0, 2 * D], [B, T, 3 * D])
+        g = ttnn.slice(qkvg, [0, 0, 3 * D], [B, T, 4 * D])
+
+        # Reshape q, k, v to (B, H, T, d_head)
+        q_4d = ttnn.permute(ttnn.reshape(q, [B, T, H, d_h]), [0, 2, 1, 3])
+        k_4d = ttnn.permute(ttnn.reshape(k, [B, T, H, d_h]), [0, 2, 1, 3])
+        v_4d = ttnn.permute(ttnn.reshape(v, [B, T, H, d_h]), [0, 2, 1, 3])
+
+        # Apply RoPE to q and k
+        q_rope = self._apply_rope(q_4d, B, H, T)
+        k_rope = self._apply_rope(k_4d, B, H, T)
+
+        # Decay matrix: (1, H, T, T)
+        D_decay = self._get_decay_matrix(T, device)
+
+        # Scores: (B, H, T, T) = (Q @ K^T) * scale * D
+        scores_raw = ttnn.matmul(q_rope, ttnn.transpose(k_rope, -2, -1))
+        scale_tt = ttnn.from_torch(torch.tensor([self.scale], dtype=torch.bfloat16),
+                                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        scores_raw = ttnn.mul(scores_raw, scale_tt)
+        scores = ttnn.mul(scores_raw, D_decay)  # decay + causal in one
+
+        # Output: (B, H, T, d_head) = scores @ V
+        out_4d = ttnn.matmul(scores, v_4d)
+
+        # Reshape to (B, T, D): permute (B,H,T,d_h) -> (B,T,H,d_h) -> (B,T,D)
+        out_flat = ttnn.reshape(ttnn.permute(out_4d, [0, 2, 1, 3]), [B, T, D])
+
+        # Output gate: sigmoid(g) element-wise over (B, T, D)
+        gate = ttnn.sigmoid(g)  # (B, T, D)
+        out_gated = ttnn.mul(out_flat, gate)
+
+        # Output projection
+        out = ttnn.linear(out_gated, self.out_proj_weight)
+
+        # Cache for backward
+        self._cache = {
+            "x": x, "qkvg": qkvg, "q": q, "k": k, "v": v, "g": g,
+            "q_4d": q_4d, "k_4d": k_4d, "v_4d": v_4d,
+            "q_rope": q_rope, "k_rope": k_rope,
+            "scores_raw": scores_raw, "scores": scores,
+            "out_4d": out_4d, "out_flat": out_flat,
+            "gate": gate, "out_gated": out_gated,
+            "D_decay": D_decay, "scale_tt": scale_tt,
+        }
+
+        return out
+
+    def backward(self, grad_out):
+        """Backward pass -- all on device.
+
+        grad_out: (B, T, d_model)
+        Returns: (grad_x, grads_dict)
+        """
+        c = self._cache
+        B, T, D = int(c["x"].shape[0]), int(c["x"].shape[1]), int(c["x"].shape[2])
+        H, d_h = self.n_heads, self.d_head
+        device = self.device
+
+        # --- Backward through out_proj: out = linear(out_gated, out_proj_w) ---
+        grad_out_gated = ttnn.linear(grad_out, ttnn.transpose(self.out_proj_weight, 0, 1))  # (B, T, D)
+
+        # grad_out_proj_weight = out_gated^T @ grad_out
+        out_gated_2d = ttnn.reshape(c["out_gated"], [B * T, D])
+        grad_out_2d = ttnn.reshape(grad_out, [B * T, D])
+        grad_out_proj_weight = ttnn.matmul(ttnn.transpose(out_gated_2d, 0, 1), grad_out_2d)
+
+        # --- Backward through gate: out_gated = out_flat * sigmoid(g) ---
+        # grad_out_flat = grad_out_gated * gate
+        # grad_g = grad_out_gated * out_flat * sigmoid'(g)
+        gate = c["gate"]  # (B, T, D)
+        grad_out_flat = ttnn.mul(grad_out_gated, gate)
+
+        # sigmoid'(g) = sigmoid(g) * (1 - sigmoid(g)) = gate * (1 - gate)
+        gate_host = ttnn.to_torch(gate)
+        ones_host = torch.ones_like(gate_host)
+        ones_tt = ttnn.from_torch(ones_host, dtype=ttnn.bfloat16,
+                                   layout=ttnn.TILE_LAYOUT, device=device)
+        sig_prime = ttnn.mul(gate, ttnn.sub(ones_tt, gate))  # (B, T, D)
+        grad_g = ttnn.mul(grad_out_gated, c["out_flat"])
+        grad_g = ttnn.mul(grad_g, sig_prime)  # (B, T, D)
+
+        # --- Backward through reshape: out_flat = reshape(permute(out_4d)) ---
+        # out_4d (B, H, T, d_h) -> permute -> (B, T, H, d_h) -> reshape -> (B, T, D)
+        grad_out_4d = ttnn.permute(
+            ttnn.reshape(grad_out_flat, [B, T, H, d_h]),
+            [0, 2, 1, 3]
+        )  # (B, H, T, d_h)
+
+        # --- Backward through out_4d = scores @ v_4d ---
+        grad_scores = ttnn.matmul(grad_out_4d, ttnn.transpose(c["v_4d"], -2, -1))  # (B, H, T, T)
+        grad_v_4d = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_out_4d)  # (B, H, T, d_h)
+
+        # --- Backward through scores = scores_raw * D_decay ---
+        # grad_scores_raw = grad_scores * D_decay
+        # grad_D_decay = grad_scores * scores_raw
+        D_decay = c["D_decay"]
+        scores_raw = c["scores_raw"]
+
+        grad_scores_raw = ttnn.mul(grad_scores, D_decay)
+        grad_D_decay = ttnn.mul(grad_scores, scores_raw)  # (B, H, T, T)
+
+        # --- Backward through D_decay w.r.t. gamma (log_gamma) ---
+        # D[h,t,s] = exp(diff[t,s] * log_gamma[h]) for s <= t
+        # dD/d(log_gamma[h]) = D[h,t,s] * diff[t,s]
+        # grad_log_gamma[h] = sum_{b,t,s} grad_D_decay[b,h,t,s] * D[h,t,s] * diff[t,s]
+        # Computed on host (H scalars, small transfer)
+        grad_D_host = ttnn.to_torch(grad_D_decay).float()  # (B, H, T, T)
+        D_host = ttnn.to_torch(D_decay).float()             # (1, H, T, T)
+        pos = torch.arange(T, dtype=torch.float32)
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)           # (T, T)
+        grad_log_gamma = (grad_D_host * D_host * diff.unsqueeze(0).unsqueeze(0)).sum(dim=(0, 2, 3))
+        grad_gamma = to_device(grad_log_gamma.to(torch.float32), device, dtype=ttnn.float32)
+
+        # --- Backward through scores_raw = (Q @ K^T) * scale ---
+        grad_scores_scaled = ttnn.mul(grad_scores_raw, c["scale_tt"])
+
+        # grad_q_rope = grad_scores_scaled @ k_rope
+        grad_q_rope = ttnn.matmul(grad_scores_scaled, c["k_rope"])  # (B, H, T, d_h)
+        # grad_k_rope = grad_scores_scaled^T @ q_rope
+        grad_k_rope = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), c["q_rope"])
+
+        # --- Backward through RoPE ---
+        grad_q_4d = self._apply_rope_backward(grad_q_rope, B, H, T)
+        grad_k_4d = self._apply_rope_backward(grad_k_rope, B, H, T)
+
+        # --- Backward through reshape: (B, H, T, d_head) -> (B, T, D) ---
+        grad_q = ttnn.reshape(ttnn.permute(grad_q_4d, [0, 2, 1, 3]), [B, T, D])
+        grad_k = ttnn.reshape(ttnn.permute(grad_k_4d, [0, 2, 1, 3]), [B, T, D])
+        grad_v = ttnn.reshape(ttnn.permute(grad_v_4d, [0, 2, 1, 3]), [B, T, D])
+        # grad_g is already (B, T, D)
+
+        # --- Backward through QKV split: concat([q, k, v, g]) ---
+        grad_qkvg = ttnn.concat([grad_q, grad_k, grad_v, grad_g], dim=-1)  # (B, T, 4D)
+
+        # --- Backward through QKV linear: qkvg = linear(x, qkv_weight) ---
+        x_2d = ttnn.reshape(c["x"], [B * T, D])
+        grad_qkvg_2d = ttnn.reshape(grad_qkvg, [B * T, 4 * D])
+        grad_qkv_weight = ttnn.matmul(ttnn.transpose(x_2d, 0, 1), grad_qkvg_2d)
+
+        grad_x = ttnn.matmul(grad_qkvg_2d, ttnn.transpose(self.qkv_weight, 0, 1))
+        grad_x = ttnn.reshape(grad_x, [B, T, D])
+
+        grads = {
+            "qkv_weight": grad_qkv_weight,
+            "out_proj_weight": grad_out_proj_weight,
+            "gamma": grad_gamma,
+        }
+
+        return grad_x, grads
+
+    def get_params(self) -> Dict[str, "ttnn.Tensor"]:
+        return {"qkv_weight": self.qkv_weight, "out_proj_weight": self.out_proj_weight,
+                "gamma": self.gamma}
+
+    def set_params(self, params: Dict[str, "ttnn.Tensor"]):
+        if "qkv_weight" in params:
+            self.qkv_weight = params["qkv_weight"]
+        if "out_proj_weight" in params:
+            self.out_proj_weight = params["out_proj_weight"]
+        if "gamma" in params:
+            self.gamma = params["gamma"]
+
+
 class TTGatedResidualLayer:
     """Gated pre-norm residual wrapper: x + sigmoid(gate) * layer(norm(x)).
 
@@ -1236,8 +1545,19 @@ class TTWorkspaceModule:
         device = self.device
 
         # Initialize slots: (B, m, D)
+        # Slot permutation: when initializing from learned slot embeddings (slot_state is None),
+        # randomly permute the slot indices. This breaks the chicken-and-egg problem where
+        # identical slot keys at init force position-based routing. With permutation, the
+        # model cannot rely on a fixed position-to-slot mapping and must learn content-based
+        # addressing. The permutation is cached for the backward pass to un-permute gradients.
+        slot_perm = None
         if slot_state is None:
-            slots = ttnn.reshape(self.slots, [1, m, D])
+            slots_host = ttnn.to_torch(self.slots)  # (m, D)
+            if self.config.slot_permutation:
+                slot_perm = torch.randperm(m)
+                slots_host = slots_host[slot_perm]  # gather along slot dim
+            slots = to_device(slots_host, device)
+            slots = ttnn.reshape(slots, [1, m, D])
             slots = ttnn.expand(slots, [B, m, D])
         else:
             slots = slot_state
@@ -1295,6 +1615,7 @@ class TTWorkspaceModule:
             "write_gate_val": write_gate_val,
             "x_pre_norm": x_pre_norm, "scale_tt": scale_tt,
             "B": B, "T": T, "m": m,
+            "slot_perm": slot_perm,
         }
 
         # Accumulate for regularizers (entropy + diversity)
@@ -1448,6 +1769,17 @@ class TTWorkspaceModule:
         grad_x = ttnn.add(ttnn.add(grad_x_from_write, grad_x_from_wq), ttnn.add(grad_x_from_rk, grad_x_from_rv))
         grad_slots_in = ttnn.add(grad_slots_in_from_read, grad_slots_from_rq)
 
+        # Un-permute grad_slots_in if slot permutation was applied in forward.
+        # The forward did: slots_permuted = slots_original[perm]
+        # So: grad_slots_original[perm] = grad_slots_permuted
+        # Which means: grad_slots_original = grad_slots_permuted[inv_perm]
+        slot_perm = c.get("slot_perm", None)
+        if slot_perm is not None:
+            inv_perm = torch.argsort(slot_perm)
+            grad_slots_in_host = ttnn.to_torch(grad_slots_in)  # (B, m, D)
+            grad_slots_in_host = grad_slots_in_host[:, inv_perm, :]  # un-permute slot dim
+            grad_slots_in = to_device(grad_slots_in_host, device)
+
         # If slots_in was from learned slot embeddings (slot_state was None), accumulate grad into slots param
         # This is handled by the caller (model.backward) via grad_slots_in
 
@@ -1594,8 +1926,8 @@ class TTWorkspaceModule:
 class TTMambaWorkspaceModel:
     """Full model using tt-nn operations.
 
-    Supports Cell A (pure Mamba2), Cell B (Mamba2 + attention),
-    Cell C (Mamba2 + attention + workspace), and Cell D (+ recurrent core).
+    Supports Cell A (Mamba2 + attention, no workspace — control),
+    Cell B (Mamba2 + attention + workspace), and Cell C (+ recurrent core).
     """
 
     def __init__(self, config: ModelConfig, device):
@@ -1608,7 +1940,13 @@ class TTMambaWorkspaceModel:
         emb_w = torch.randn(config.vocab_size, config.d_model, dtype=torch.bfloat16) * 0.02
         self.token_emb_weight = to_device(emb_w, device)
 
-        # Build layers with gated residual wrappers
+        # Build layers with gated residual wrappers.
+        # Non-attention layers use TTRetentionLayer (RetNet-style decayed linear
+        # attention) instead of TTMamba3Layer. Retention maps to pure matmuls,
+        # avoiding the bandwidth-bound selective scan and custom kernels that
+        # caused 0.17% MFU on Blackhole. The J-space workspace and recurrent
+        # core attach identically -- they operate on hidden states regardless
+        # of the backbone that produced them.
         self.layers = []
         self.attention_positions = set(config.attention_positions) if config.use_attention else set()
         for i in range(config.n_layers):
@@ -1617,11 +1955,11 @@ class TTMambaWorkspaceModel:
                 wrapped = TTGatedResidualLayer(attn_layer, config.d_model, device)
                 self.layers.append(wrapped)
             else:
-                mamba_layer = TTMamba2Layer(config, device)
-                wrapped = TTGatedResidualLayer(mamba_layer, config.d_model, device)
+                ret_layer = TTRetentionLayer(config, device)
+                wrapped = TTGatedResidualLayer(ret_layer, config.d_model, device)
                 self.layers.append(wrapped)
 
-        # Workspace module (Cell C/D)
+        # Workspace module (Cell B/C)
         if config.use_workspace:
             self.workspace = TTWorkspaceModule(config, device)
         else:
@@ -1637,7 +1975,7 @@ class TTMambaWorkspaceModel:
     def forward(self, input_ids: torch.Tensor, k_value: int = None) -> "ttnn.Tensor":
         """
         input_ids: (B, T) PyTorch tensor of int indices
-        k_value: int or None — number of active recurrent core iterations (Cell D).
+        k_value: int or None — number of active recurrent core iterations (Cell C).
                  If None and recurrent_core, uses k_train_max (all active for simplicity).
         Returns: (B, T, vocab_size) tt-nn tensor of logits
         """
@@ -2211,6 +2549,34 @@ class TTMambaWorkspaceModel:
             self.workspace.normalize_slots()
             self.workspace.spectral_normalize_weights()
 
+    def apply_gate_schedule(self, step: int, gate_schedule_steps: int, gate_init_val: float):
+        """Force workspace gates open on a schedule.
+
+        Linearly anneals gate values from gate_init (e.g. -2, sigmoid=0.12) to
+        0 (sigmoid=0.5) over gate_schedule_steps. This ensures the workspace
+        contributes enough that the model must learn good routing — at 12% mixing
+        the backbone can route around the workspace, so the gates never open
+        naturally. Forcing them to 50% creates gradient signal that drives
+        content-addressed routing.
+
+        After the schedule ends (step >= gate_schedule_steps), the optimizer
+        controls the gates freely.
+
+        No-op if no workspace or gate_schedule_steps <= 0.
+        """
+        if self.workspace is None or gate_schedule_steps <= 0:
+            return
+        if step >= gate_schedule_steps:
+            return
+        # Linear anneal from gate_init to 0.0
+        target = gate_init_val + (0.0 - gate_init_val) * step / gate_schedule_steps
+        target_tt = ttnn.from_torch(
+            torch.tensor([target], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        )
+        self.workspace.read_gate = target_tt
+        self.workspace.write_gate = target_tt
+
     def save_checkpoint(self, path: str, optimizer_state: dict = None, step: int = 0):
         """Save model checkpoint to a PyTorch state dict file.
 
@@ -2226,6 +2592,11 @@ class TTMambaWorkspaceModel:
                 "n_heads": self.config.n_heads,
                 "n_layers": self.config.n_layers,
                 "vocab_size": self.config.vocab_size,
+                "headdim": self.config.headdim,
+                "d_state_m3": self.config.d_state_m3,
+                "mimo_rank": self.config.mimo_rank,
+                "rope_fraction": self.config.rope_fraction,
+                "ngroups": self.config.ngroups,
             },
             "model_state": {},
         }
@@ -2258,7 +2629,8 @@ class TTMambaWorkspaceModel:
         for name, host_tensor in model_state.items():
             if name == "token_emb_weight":
                 dtype = ttnn.bfloat16
-            elif "A_log" in name or name.endswith("_D"):
+            elif any(s in name for s in ("A_log", "_D", "dt_bias", "B_bias", "C_bias",
+                                          "MIMO_V", "MIMO_Z", "MIMO_O")):
                 dtype = ttnn.float32
             else:
                 dtype = ttnn.bfloat16
@@ -2294,14 +2666,14 @@ class TTMambaWorkspaceModel:
 # ---------------------------------------------------------------------------
 
 def get_cell_config(cell: str) -> ModelConfig:
+    """Return the ModelConfig for a given cell (A, B, or C).
+
+    Cell naming was renamed on 2026-07-31: old E→A, old C→B, old D→C.
+    The former pure-Mamba2 (old A) and Mamba2+attention (old B) cells were
+    deprecated and removed — see AGENTS.md.
+    """
     if cell == "A":
-        return ModelConfig(
-            n_layers=14,
-            use_attention=False,
-            use_workspace=False,
-            recurrent_core=False,
-        )
-    elif cell == "B":
+        # Control: Mamba2 + attention, no workspace
         return ModelConfig(
             n_layers=14,
             use_attention=True,
@@ -2309,7 +2681,8 @@ def get_cell_config(cell: str) -> ModelConfig:
             use_workspace=False,
             recurrent_core=False,
         )
-    elif cell == "C":
+    elif cell == "B":
+        # Hybrid + workspace (perceiver)
         return ModelConfig(
             n_layers=13,
             use_attention=True,
@@ -2318,7 +2691,8 @@ def get_cell_config(cell: str) -> ModelConfig:
             n_workspace_slots=16,
             recurrent_core=False,
         )
-    elif cell == "D":
+    elif cell == "C":
+        # Full architecture: hybrid + workspace + recurrent core
         return ModelConfig(
             n_layers=13,
             use_attention=True,
@@ -2330,15 +2704,6 @@ def get_cell_config(cell: str) -> ModelConfig:
             core_end=10,
             k_train_max=6,
             k_inference=6,
-        )
-    elif cell == "E":
-        # Control: B architecture (Mamba2 + attention) with C/D learning rate
-        return ModelConfig(
-            n_layers=14,
-            use_attention=True,
-            attention_positions=[5, 10],
-            use_workspace=False,
-            recurrent_core=False,
         )
     else:
         raise ValueError(f"Unknown cell: {cell}")

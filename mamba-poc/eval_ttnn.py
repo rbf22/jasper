@@ -65,6 +65,10 @@ def main():
 
     # Build model
     model_config = build_model_config(cfg)
+    # Disable slot permutation during eval for deterministic results.
+    # The permutation is a training-time augmentation; at eval we want
+    # consistent slot ordering to measure the model's learned routing.
+    model_config.slot_permutation = False
     model = TTMambaWorkspaceModel(model_config, device)
     print(f"Cell: {cell}, Params: {model.get_num_params() / 1e6:.2f}M")
 

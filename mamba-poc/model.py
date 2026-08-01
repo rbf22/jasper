@@ -1,11 +1,14 @@
 """
 Model implementation for the Mamba + Workspace POC.
 
-Four parameter-matched cells at ~30M parameters:
-  Cell A: pure Mamba2 (14 layers)
-  Cell B: hybrid (12 Mamba2 + 2 attention at positions 5, 10)
-  Cell C: hybrid + workspace (11 Mamba2 + 2 attention + perceiver workspace)
-  Cell D: hybrid + workspace + recurrent core (layers 6-9 looped K times)
+Three parameter-matched cells at ~30M parameters:
+  Cell A: Mamba2 + attention, no workspace (control, 14 layers)
+  Cell B: hybrid + workspace (11 Mamba2 + 2 attention + perceiver workspace)
+  Cell C: hybrid + workspace + recurrent core (layers 6-9 looped K times)
+
+Cell naming was renamed on 2026-07-31: old E→A, old C→B, old D→C.
+The former pure-Mamba2 (old A) and Mamba2+attention (old B) cells were
+deprecated and removed — see AGENTS.md.
 
 Config flags: use_attention, use_workspace, recurrent_core, k_train_max
 """
@@ -33,11 +36,11 @@ class ModelConfig:
     expand: int = 4            # Mamba2 expand factor
     n_heads: int = 4           # heads for both Mamba2 SSD and attention
     # Cell flags
-    use_attention: bool = False      # Cell A=False, B/C/D=True
+    use_attention: bool = False      # Cell A/B/C=True
     attention_positions: List[int] = field(default_factory=lambda: [5, 10])
-    use_workspace: bool = False      # Cell A/B=False, C/D=True
+    use_workspace: bool = False      # Cell A=False, B/C=True
     n_workspace_slots: int = 16
-    recurrent_core: bool = False     # Cell D=True
+    recurrent_core: bool = False     # Cell C=True
     core_start: int = 6              # recurrent core layer range start
     core_end: int = 10               # recurrent core layer range end (exclusive)
     k_train_max: int = 6             # max K during training (sampled from {1..k_train_max})
@@ -607,15 +610,14 @@ def random_k_tensor(k_max: int, device: torch.device) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def get_cell_config(cell: str) -> ModelConfig:
-    """Return the ModelConfig for a given cell (A, B, C, or D)."""
+    """Return the ModelConfig for a given cell (A, B, or C).
+
+    Cell naming was renamed on 2026-07-31: old E→A, old C→B, old D→C.
+    The former pure-Mamba2 (old A) and Mamba2+attention (old B) cells were
+    deprecated and removed — see AGENTS.md.
+    """
     if cell == "A":
-        return ModelConfig(
-            n_layers=14,
-            use_attention=False,
-            use_workspace=False,
-            recurrent_core=False,
-        )
-    elif cell == "B":
+        # Control: Mamba2 + attention, no workspace
         return ModelConfig(
             n_layers=14,
             use_attention=True,
@@ -623,7 +625,8 @@ def get_cell_config(cell: str) -> ModelConfig:
             use_workspace=False,
             recurrent_core=False,
         )
-    elif cell == "C":
+    elif cell == "B":
+        # Hybrid + workspace (perceiver)
         return ModelConfig(
             n_layers=13,  # remove 1 Mamba layer to compensate for workspace params
             use_attention=True,
@@ -632,7 +635,8 @@ def get_cell_config(cell: str) -> ModelConfig:
             n_workspace_slots=16,
             recurrent_core=False,
         )
-    elif cell == "D":
+    elif cell == "C":
+        # Full architecture: hybrid + workspace + recurrent core
         return ModelConfig(
             n_layers=13,
             use_attention=True,
@@ -651,7 +655,7 @@ def get_cell_config(cell: str) -> ModelConfig:
 
 if __name__ == "__main__":
     # Quick param count check
-    for cell in ["A", "B", "C", "D"]:
+    for cell in ["A", "B", "C"]:
         config = get_cell_config(cell)
         model = MambaWorkspaceModel(config)
         n_params = model.get_num_params()

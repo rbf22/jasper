@@ -1,5 +1,10 @@
 """
-Vast.ai runner — launches Cell B and Cell D in parallel on dual GPUs,
+DEPRECATED — this runner was for the pytorch-on-GPU workflow (Vast.ai).
+The project has moved to tt-nn on Tenstorrent Blackhole. Use run_all_cells.sh
+or tt_runner.py instead. Cell references below updated to the new naming
+(old B→deprecated, old D→C) but config files are no longer present.
+
+Vast.ai runner — launches Cell A and Cell C in parallel on dual GPUs,
 or sequentially on a single GPU.
 
 Usage:
@@ -8,7 +13,7 @@ Usage:
     python vast_runner.py --wait             # wait for running jobs to finish
     python vast_runner.py --clean            # delete checkpoints and start fresh
     python vast_runner.py --save-outputs     # copy checkpoints + probes to output dir
-    python vast_runner.py --sequential       # run B then D on single GPU
+    python vast_runner.py --sequential       # run A then C on single GPU
 
 Setup on Vast.ai:
     git clone https://github.com/rbf22/jasper.git
@@ -29,10 +34,10 @@ import torch
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(REPO_DIR, "outputs"))
-LOG_B = os.path.join(REPO_DIR, "train_cellB.log")
-LOG_D = os.path.join(REPO_DIR, "train_cellD.log")
-CONFIG_B = os.path.join(REPO_DIR, "configs", "cell_b_vast.yaml")
-CONFIG_D = os.path.join(REPO_DIR, "configs", "cell_d_vast.yaml")
+LOG_A = os.path.join(REPO_DIR, "train_cellA.log")
+LOG_C = os.path.join(REPO_DIR, "train_cellC.log")
+CONFIG_A = os.path.join(REPO_DIR, "configs", "cell_a_tt.yaml")
+CONFIG_C = os.path.join(REPO_DIR, "configs", "cell_c_tt.yaml")
 
 
 def clean_checkpoints():
@@ -47,46 +52,46 @@ def clean_checkpoints():
 
 
 def launch_training_parallel(clean=False):
-    """Launch Cell B on GPU 0 and Cell D on GPU 1 in parallel."""
+    """Launch Cell A on GPU 0 and Cell C on GPU 1 in parallel."""
     if clean:
         clean_checkpoints()
 
-    env_b = os.environ.copy()
-    env_b["CUDA_VISIBLE_DEVICES"] = "0"
-    env_b["PYTHONUNBUFFERED"] = "1"
-    env_d = os.environ.copy()
-    env_d["CUDA_VISIBLE_DEVICES"] = "1"
-    env_d["PYTHONUNBUFFERED"] = "1"
+    env_a = os.environ.copy()
+    env_a["CUDA_VISIBLE_DEVICES"] = "0"
+    env_a["PYTHONUNBUFFERED"] = "1"
+    env_c = os.environ.copy()
+    env_c["CUDA_VISIBLE_DEVICES"] = "1"
+    env_c["PYTHONUNBUFFERED"] = "1"
 
-    log_b = open(LOG_B, "w", buffering=1)
-    log_d = open(LOG_D, "w", buffering=1)
+    log_a = open(LOG_A, "w", buffering=1)
+    log_c = open(LOG_C, "w", buffering=1)
 
-    print("Launching Cell B on GPU 0 and Cell D on GPU 1...")
-    proc_b = subprocess.Popen(
-        ["python", "-u", "train.py", "--config", CONFIG_B],
-        env=env_b, stdout=log_b, stderr=subprocess.STDOUT, cwd=REPO_DIR,
+    print("Launching Cell A on GPU 0 and Cell C on GPU 1...")
+    proc_a = subprocess.Popen(
+        ["python", "-u", "train.py", "--config", CONFIG_A],
+        env=env_a, stdout=log_a, stderr=subprocess.STDOUT, cwd=REPO_DIR,
     )
-    proc_d = subprocess.Popen(
-        ["python", "-u", "train.py", "--config", CONFIG_D],
-        env=env_d, stdout=log_d, stderr=subprocess.STDOUT, cwd=REPO_DIR,
+    proc_c = subprocess.Popen(
+        ["python", "-u", "train.py", "--config", CONFIG_C],
+        env=env_c, stdout=log_c, stderr=subprocess.STDOUT, cwd=REPO_DIR,
     )
 
-    print(f"Cell B PID: {proc_b.pid} (GPU 0)")
-    print(f"Cell D PID: {proc_d.pid} (GPU 1)")
+    print(f"Cell A PID: {proc_a.pid} (GPU 0)")
+    print(f"Cell C PID: {proc_c.pid} (GPU 1)")
     print("Training in background. Press Ctrl+C to stop (processes keep running).\n")
 
-    _wait_and_report(proc_b, proc_d, log_b, log_d)
+    _wait_and_report(proc_a, proc_c, log_a, log_c)
 
 
 def launch_training_sequential(clean=False):
-    """Run Cell B then Cell D on a single GPU."""
+    """Run Cell A then Cell C on a single GPU."""
     if clean:
         clean_checkpoints()
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    for name, config, logfile in [("Cell B", CONFIG_B, LOG_B), ("Cell D", CONFIG_D, LOG_D)]:
+    for name, config, logfile in [("Cell A", CONFIG_A, LOG_A), ("Cell C", CONFIG_C, LOG_C)]:
         print(f"\n{'='*60}")
         print(f"Training {name}...")
         print(f"{'='*60}\n")
@@ -116,14 +121,14 @@ def launch_training_sequential(clean=False):
     return 0
 
 
-def _wait_and_report(proc_b, proc_d, log_b, log_d):
+def _wait_and_report(proc_a, proc_c, log_a, log_c):
     """Wait for both processes and report status periodically."""
-    while proc_b.poll() is None or proc_d.poll() is None:
+    while proc_a.poll() is None or proc_c.poll() is None:
         time.sleep(300)  # 5 minutes
-        b_status = "RUNNING" if proc_b.poll() is None else f"DONE (exit {proc_b.returncode})"
-        d_status = "RUNNING" if proc_d.poll() is None else f"DONE (exit {proc_d.returncode})"
-        print(f"[{time.strftime('%H:%M:%S')}] Cell B: {b_status} | Cell D: {d_status}")
-        for name, logfile in [("B", LOG_B), ("D", LOG_D)]:
+        a_status = "RUNNING" if proc_a.poll() is None else f"DONE (exit {proc_a.returncode})"
+        c_status = "RUNNING" if proc_c.poll() is None else f"DONE (exit {proc_c.returncode})"
+        print(f"[{time.strftime('%H:%M:%S')}] Cell A: {a_status} | Cell C: {c_status}")
+        for name, logfile in [("A", LOG_A), ("C", LOG_C)]:
             if os.path.exists(logfile):
                 with open(logfile) as f:
                     lines = f.readlines()
@@ -131,16 +136,16 @@ def _wait_and_report(proc_b, proc_d, log_b, log_d):
                     for line in lines[-3:]:
                         print(f"  [{name}] {line.rstrip()}")
 
-    log_b.close()
-    log_d.close()
+    log_a.close()
+    log_c.close()
 
-    print(f"\nCell B exit code: {proc_b.returncode}")
-    print(f"Cell D exit code: {proc_d.returncode}")
-    if proc_b.returncode != 0:
-        print("Cell B FAILED — check train_cellB.log")
-    if proc_d.returncode != 0:
-        print("Cell D FAILED — check train_cellD.log")
-    if proc_b.returncode == 0 and proc_d.returncode == 0:
+    print(f"\nCell A exit code: {proc_a.returncode}")
+    print(f"Cell C exit code: {proc_c.returncode}")
+    if proc_a.returncode != 0:
+        print("Cell A FAILED — check train_cellA.log")
+    if proc_c.returncode != 0:
+        print("Cell C FAILED — check train_cellC.log")
+    if proc_a.returncode == 0 and proc_c.returncode == 0:
         print("Both training runs completed successfully!")
 
     save_outputs()
@@ -154,7 +159,7 @@ def status():
     for p in train_procs:
         print(f"  {p[:120]}")
 
-    for name, logfile in [("Cell B", LOG_B), ("Cell D", LOG_D)]:
+    for name, logfile in [("Cell A", LOG_A), ("Cell C", LOG_C)]:
         print(f"\n=== {name} ===")
         if os.path.exists(logfile):
             with open(logfile) as f:
@@ -201,7 +206,7 @@ def save_outputs():
             shutil.copy2(os.path.join(REPO_DIR, fname), os.path.join(OUTPUT_DIR, fname))
             print(f"Saved: {fname}")
 
-    for logfile in [LOG_B, LOG_D]:
+    for logfile in [LOG_A, LOG_C]:
         if os.path.exists(logfile):
             dst = os.path.join(OUTPUT_DIR, os.path.basename(logfile))
             shutil.copy2(logfile, dst)
@@ -216,7 +221,7 @@ def main():
     parser.add_argument("--wait", action="store_true", help="Wait for training to finish")
     parser.add_argument("--clean", action="store_true", help="Delete checkpoints before training")
     parser.add_argument("--save-outputs", action="store_true", help="Copy outputs to output dir")
-    parser.add_argument("--sequential", action="store_true", help="Run B then D on single GPU")
+    parser.add_argument("--sequential", action="store_true", help="Run A then C on single GPU")
     args = parser.parse_args()
 
     if args.status:

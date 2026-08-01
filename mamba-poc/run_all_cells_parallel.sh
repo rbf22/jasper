@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Train cells C, D, E in PARALLEL — one cell per Blackhole chip.
+# Train cells A, B, C in PARALLEL — one cell per Blackhole chip.
 #
 # Quietbox 2 has 4 Blackhole chips (device IDs 0-3).
-# This runs Cell E on chip 1, C on chip 2, D on chip 3.
+# This runs Cell A on chip 1, B on chip 2, C on chip 3.
 # Chip 0 is left free for diagnostics/eval.
 #
-# Cells A and B have been removed. A (pure Mamba2) plateaued at ~35% and
-# served only as a floor. B (Mamba2+attention, lr=6e-4) plateaued at 60%/0%
-# Task 1 — identical to E (same architecture, lr=2e-4) at 62%/5% Task 1,
-# confirming the Task 1 plateau is architectural, not LR-related.
+# Cell naming was renamed (old → new): E → A, C → B, D → C.
+# The former pure-Mamba2 / Mamba2+attention cells (old A and B) were retired.
 #
 # Usage:
 #   ./run_all_cells_parallel.sh              # fresh start, all 3 cells
@@ -49,15 +47,15 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Cell → device ID mapping (device 0 left free for eval/diagnostics)
 declare -A CELL_DEVICE
-CELL_DEVICE[E]=1
-CELL_DEVICE[C]=2
-CELL_DEVICE[D]=3
+CELL_DEVICE[A]=1
+CELL_DEVICE[B]=2
+CELL_DEVICE[C]=3
 
 # Cell → config
 declare -A CELL_CONFIG
-CELL_CONFIG[E]="configs/cell_e_tt.yaml"
+CELL_CONFIG[A]="configs/cell_a_tt.yaml"
+CELL_CONFIG[B]="configs/cell_b_tt.yaml"
 CELL_CONFIG[C]="configs/cell_c_tt.yaml"
-CELL_CONFIG[D]="configs/cell_d_tt.yaml"
 
 echo "============================================"
 echo "  Parallel Training — 3 cells on 3 chips"
@@ -67,7 +65,7 @@ echo "============================================"
 PIPELINE_START=$(date +%s)
 PIDS=()
 
-CELLS=(E C D)
+CELLS=(A B C)
 for CELL in "${CELLS[@]}"; do
     CONFIG="${CELL_CONFIG[$CELL]}"
     DEV_ID="${CELL_DEVICE[$CELL]}"

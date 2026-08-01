@@ -92,6 +92,11 @@ logger.remove()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model_ttnn import TTMambaWorkspaceModel, ModelConfig
+try:
+    from mamba3_layer import _print_m3_timings, _M3_PROFILE
+except ImportError:
+    _print_m3_timings = lambda n: None
+    _M3_PROFILE = False
 
 # Cache for identity matrix on device (avoids recreating every step)
 _identity_cache = {}  # (V, device_id) -> ttnn.Tensor
@@ -115,9 +120,6 @@ def build_model_config(cfg: dict) -> ModelConfig:
         d_model=cfg.get("d_model", 384),
         n_layers=cfg.get("n_layers", 14),
         vocab_size=cfg.get("vocab_size", 128),
-        d_state=cfg.get("d_state", 64),
-        d_conv=cfg.get("d_conv", 4),
-        expand=cfg.get("expand", 4),
         n_heads=cfg.get("n_heads", 4),
         use_attention=cfg.get("use_attention", False),
         attention_positions=cfg.get("attention_positions", [5, 10]),
@@ -134,6 +136,8 @@ def build_model_config(cfg: dict) -> ModelConfig:
         ws_diversity_weight=cfg.get("ws_diversity_weight", 0.0),
         gate_init=cfg.get("gate_init", -2.0),
         slot_decay_init=cfg.get("slot_decay_init", 1.0),
+        slot_permutation=cfg.get("slot_permutation", False),
+        gate_schedule_steps=cfg.get("gate_schedule_steps", 0),
     )
 
 
@@ -571,7 +575,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     model = TTMambaWorkspaceModel(model_config, device)
     n_params = model.get_num_params()
     print(f"Model: {model_config.n_layers} layers, d_model={model_config.d_model}, "
-          f"expand={model_config.expand}, n_heads={model_config.n_heads}", flush=True)
+          f"n_heads={model_config.n_heads}", flush=True)
     print(f"Params: {n_params:,} ({n_params/1e6:.2f}M)", flush=True)
     print(f"bf16 param memory: {n_params * 2 / 1e6:.1f} MB", flush=True)
 
@@ -619,6 +623,12 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     if profile:
         print(f"  Profiling: ENABLED", flush=True)
 
+    # Gate schedule config
+    gate_schedule_steps = cfg.get("gate_schedule_steps", 0)
+    gate_init_val = cfg.get("gate_init", -2.0)
+    if gate_schedule_steps > 0 and model_config.use_workspace:
+        print(f"  Gate schedule: anneal from {gate_init_val} to 0.0 over {gate_schedule_steps} steps", flush=True)
+
     print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10} {'Entropy':>10} {'Diversity':>10}", flush=True)
 
     profiler = Profiler()
@@ -631,6 +641,12 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         # Update LR (warmup)
         current_lr = get_lr(step, base_lr, warmup_steps)
         optimizer.set_lr(current_lr)
+
+        # Gate schedule: force gates open before forward pass
+        # This overrides the gate parameters so the workspace contributes
+        # enough to generate gradient signal for learning content-addressed routing.
+        # After gate_schedule_steps, the optimizer controls the gates freely.
+        model.apply_gate_schedule(step, gate_schedule_steps, gate_init_val)
 
         # Gradient accumulation
         accum_grads = {}  # host-side accumulated gradients
@@ -650,7 +666,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                     micro_batch, seq_len, vocab, depth_range=depth_range, rng=rng
                 )
 
-            # Forward — sample K for recurrent core (Cell D)
+            # Forward — sample K for recurrent core (Cell C)
             k_value = None
             if model_config.recurrent_core:
                 k_value = random.randint(1, model_config.k_train_max)
@@ -754,6 +770,10 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     if profile and profiler.counts:
         print(f"\n--- Final profile report ---", flush=True)
         print(profiler.report(), flush=True)
+
+    # Mamba-3 per-section timing
+    if _M3_PROFILE:
+        _print_m3_timings(model_config.n_layers)
 
     avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
     print(f"\nTotal time: {total_time:.1f}s", flush=True)

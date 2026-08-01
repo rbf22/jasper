@@ -36,8 +36,6 @@ CELL_CONFIGS = {
     "A": "configs/cell_a_tt.yaml",
     "B": "configs/cell_b_tt.yaml",
     "C": "configs/cell_c_tt.yaml",
-    "D": "configs/cell_d_tt.yaml",
-    "E": "configs/cell_e_tt.yaml",
 }
 
 # Plateau detection: no improvement >= threshold over N consecutive evals

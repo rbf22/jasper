@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Train cells C, D, E sequentially on Tenstorrent hardware.
+# Train cells A, B, C sequentially on Tenstorrent hardware.
 #
 # Usage:
 #   ./run_all_cells.sh              # train all cells, fresh start
@@ -23,7 +23,7 @@ mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
 # Defaults
 RESUME_FLAG=""
-CELLS="C D E"
+CELLS="A B C"
 STEPS_FLAG=""
 
 # Parse args

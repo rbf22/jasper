@@ -1,26 +1,28 @@
-# Cell C on Tenstorrent Quietbox 2 — hybrid + workspace (perceiver)
+# Cell C on Tenstorrent Quietbox 2 — full architecture (hybrid + workspace + recurrent core)
 # Blackhole bfloat16-native, single chip, no fp16 AMP / GradScaler needed
+# K_max padding: recurrent core always loops k_train_max=6 times (static for XLA),
+# iterations beyond sampled K are masked to identity via blend.
+#
+# Renamed from the old "Cell D" (2026-07-31, once the pytorch-Mamba2
+# cells A/B were deprecated and removed — see AGENTS.md).
 cell: C
 d_model: 384
 n_layers: 13
-expand: 4
-d_state: 64
 n_heads: 4
 use_attention: true
 attention_positions: [5, 10]
 use_workspace: true
 n_workspace_slots: 16
-recurrent_core: false
+recurrent_core: true
+core_start: 6
+core_end: 10
+k_train_max: 6
+k_inference: 6
 spectral_norm_bound: 5.0
-# Attention entropy/diversity regularizers: DISABLED.
-# Measured harmful. With weight 0.01 the C run reached answer-token loss 0.55
-# (best ever) but evaluated at 11.7% overall / 25% Task 2 — vs 33% / 85% for the
-# same architecture WITHOUT regularizers, and 62% / 80% for the no-workspace
-# control. Predictions mode-collapsed to a near-constant answer ("18"/"19").
-# Cause: entropy measures peakedness, not input-dependence. The cheapest
-# low-entropy solution is a FIXED routing that ignores the input, which is
-# exactly what the regularizer selected for. Do not re-enable without an
-# input-dependence metric (see diagnose_workspace.py).
+# Attention entropy/diversity regularizers: DISABLED — measured harmful.
+# See cell_b_tt.yaml for the full evidence. Summary: entropy rewards peakedness,
+# not input-dependence; the cheapest low-entropy solution is a fixed routing that
+# ignores the input, and the model mode-collapsed to a constant answer.
 ws_entropy_weight: 0.0
 ws_diversity_weight: 0.0
 gate_init: -2.0
@@ -32,7 +34,7 @@ lr: 2.0e-4
 # gradient explosion at warmup peak. Gates get 10x base LR (2e-3) so they
 # open fast enough to contribute within the training budget — without this,
 # sigmoid'(-5) ≈ 0.007 suppresses the gradient and the gates barely move.
-# Backbone stays at 2e-4 to match Cell E.
+# Backbone stays at 2e-4 to match Cell A.
 lr_groups:
   ws_read_gate: 10.0
   ws_write_gate: 10.0
@@ -55,6 +57,8 @@ use_gradient_checkpointing: false
 tt_compile: false
 
 # Larger micro-batch — QB2 has 249GB host RAM + ample device DRAM
+# Cell C uses more memory (workspace + recurrent core with K_max padding)
+# but Blackhole DRAM can handle it without gradient checkpointing
 micro_batch_size: 0
 
 # Wandb

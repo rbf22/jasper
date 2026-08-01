@@ -1,13 +1,13 @@
 """
-Tenstorrent Quietbox 2 runner — trains all four cells sequentially on a single Blackhole chip.
+Tenstorrent Quietbox 2 runner — trains all three cells sequentially on a single Blackhole chip.
 
 Usage:
     # Activate the TT venv first:
     source ../../.tt-venv/bin/activate
 
-    python tt_runner.py                    # train all 4 cells sequentially (A→B→C→D)
-    python tt_runner.py --cell D           # train only Cell D
-    python tt_runner.py --cell B D         # train Cell B then Cell D
+    python tt_runner.py                    # train all 3 cells sequentially (A→B→C)
+    python tt_runner.py --cell C           # train only Cell C
+    python tt_runner.py --cell B C         # train Cell B then Cell C
     python tt_runner.py --status           # check status of training runs
     python tt_runner.py --clean            # delete checkpoints and start fresh
     python tt_runner.py --smoke            # quick 50-step smoke test on Cell A
@@ -17,7 +17,7 @@ Environment:
     TT_METAL_CACHE      — optional, kernel cache directory (default: ~/.cache/tt_metal)
 
 The TT venv at ../../.tt-venv must be activated before running.
-All 4 cells train on a single Blackhole chip (data-parallel multi-chip is a future extension).
+All 3 cells train on a single Blackhole chip (data-parallel multi-chip is a future extension).
 """
 
 import os
@@ -37,7 +37,6 @@ CELL_CONFIGS = {
     "A": os.path.join(CONFIG_DIR, "cell_a_tt.yaml"),
     "B": os.path.join(CONFIG_DIR, "cell_b_tt.yaml"),
     "C": os.path.join(CONFIG_DIR, "cell_c_tt.yaml"),
-    "D": os.path.join(CONFIG_DIR, "cell_d_tt.yaml"),
 }
 
 
@@ -144,7 +143,7 @@ def status():
 def main():
     parser = argparse.ArgumentParser(description="Tenstorrent Quietbox 2 training runner")
     parser.add_argument("--cell", nargs="+", default=None,
-                        help="Cell(s) to train (A B C D). Default: all 4 sequentially")
+                        help="Cell(s) to train (A B C). Default: all 3 sequentially")
     parser.add_argument("--status", action="store_true", help="Show training status")
     parser.add_argument("--clean", action="store_true", help="Delete checkpoints and start fresh")
     parser.add_argument("--smoke", action="store_true", help="Quick 50-step smoke test")
@@ -159,10 +158,10 @@ def main():
         clean_checkpoints(cells)
         return
 
-    cells = args.cell or ["A", "B", "C", "D"]
+    cells = args.cell or ["A", "B", "C"]
     for cell in cells:
         if cell not in CELL_CONFIGS:
-            print(f"ERROR: Unknown cell '{cell}'. Must be one of: A B C D")
+            print(f"ERROR: Unknown cell '{cell}'. Must be one of: A B C")
             sys.exit(1)
 
     print(f"Tenstorrent Quietbox 2 — training cells: {', '.join(cells)}")

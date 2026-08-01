@@ -15,8 +15,8 @@ This tells us whether the workspace is:
   d) Changing behavior across iterations (recurrent core does something different each step)
 
 Usage:
-    python diagnose_workspace.py --config configs/cell_c_tt.yaml --device 0 \
-        --checkpoint run_C/checkpoints/cell_C_step100.pt
+    python diagnose_workspace.py --config configs/cell_b_tt.yaml --device 0 \
+        --checkpoint run_B/checkpoints/cell_B_step100.pt
 """
 
 import os
@@ -251,6 +251,8 @@ def main():
 
     # Build model
     model_config = build_model_config(cfg)
+    # Disable slot permutation during diagnostics for deterministic results.
+    model_config.slot_permutation = False
     model = TTMambaWorkspaceModel(model_config, device)
     print(f"Cell: {cell}, Params: {model.get_num_params() / 1e6:.2f}M")
 

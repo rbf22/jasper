@@ -1,8 +1,12 @@
 """
-Colab runner — trains Cell A and Cell C sequentially on a single T4 GPU.
+DEPRECATED — this runner was for the pytorch-on-GPU workflow (Colab).
+The project has moved to tt-nn on Tenstorrent Blackhole. Use run_all_cells.sh
+or tt_runner.py instead. Config files referenced below are no longer present.
 
-This is the companion to colab_runner.py (which handles B and D).
-Run both notebooks in separate Colab sessions to train all 4 cells in parallel.
+Colab runner — trains Cell A and Cell B sequentially on a single T4 GPU.
+
+This is the companion to colab_runner.py (which handles A and C).
+Run both notebooks in separate Colab sessions to train all 3 cells in parallel.
 
 Usage:
     python colab_runner_ac.py                    # train both cells sequentially
@@ -11,7 +15,7 @@ Usage:
     python colab_runner_ac.py --clean            # delete checkpoints and start fresh
     python colab_runner_ac.py --save-outputs     # copy checkpoints + probes to Google Drive
     python colab_runner_ac.py --cell A           # train only Cell A
-    python colab_runner_ac.py --cell C           # train only Cell C
+    python colab_runner_ac.py --cell B           # train only Cell B
 
 Setup on Colab:
     git clone https://github.com/rbf22/jasper.git
@@ -33,17 +37,17 @@ import torch
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(REPO_DIR, "outputs"))
 LOG_A = os.path.join(REPO_DIR, "train_cellA.log")
-LOG_C = os.path.join(REPO_DIR, "train_cellC.log")
-CONFIG_A = os.path.join(REPO_DIR, "configs", "cell_a_colab.yaml")
-CONFIG_C = os.path.join(REPO_DIR, "configs", "cell_c_colab.yaml")
+LOG_B = os.path.join(REPO_DIR, "train_cellB.log")
+CONFIG_A = os.path.join(REPO_DIR, "configs", "cell_a_tt.yaml")
+CONFIG_B = os.path.join(REPO_DIR, "configs", "cell_b_tt.yaml")
 
 # Google Drive mount point (Colab standard)
 GDRIVE_DIR = "/content/drive/MyDrive"
 
 
 def clean_checkpoints():
-    """Delete checkpoints for cells A and C — local AND Google Drive."""
-    cell_names = ["cellA", "cellC"]
+    """Delete checkpoints for cells A and B — local AND Google Drive."""
+    cell_names = ["cellA", "cellB"]
 
     ckpt_dir = os.path.join(REPO_DIR, "checkpoints")
     if os.path.isdir(ckpt_dir):
@@ -64,7 +68,7 @@ def clean_checkpoints():
 
 
 def launch_training_sequential(clean=False, cell_filter=None):
-    """Run Cell A then Cell C on a single GPU."""
+    """Run Cell A then Cell B on a single GPU."""
     if clean:
         clean_checkpoints()
 
@@ -74,8 +78,8 @@ def launch_training_sequential(clean=False, cell_filter=None):
     cells = []
     if cell_filter is None or cell_filter.upper() == "A":
         cells.append(("Cell A", CONFIG_A, LOG_A))
-    if cell_filter is None or cell_filter.upper() == "C":
-        cells.append(("Cell C", CONFIG_C, LOG_C))
+    if cell_filter is None or cell_filter.upper() == "B":
+        cells.append(("Cell B", CONFIG_B, LOG_B))
 
     for name, config, logfile in cells:
         print(f"\n{'='*60}")
@@ -115,7 +119,7 @@ def status():
     for p in train_procs:
         print(f"  {p[:120]}")
 
-    for name, logfile in [("Cell A", LOG_A), ("Cell C", LOG_C)]:
+    for name, logfile in [("Cell A", LOG_A), ("Cell B", LOG_B)]:
         print(f"\n=== {name} ===")
         if os.path.exists(logfile):
             with open(logfile) as f:
@@ -162,7 +166,7 @@ def save_outputs():
             shutil.copy2(os.path.join(REPO_DIR, fname), os.path.join(OUTPUT_DIR, fname))
             print(f"Saved: {fname}")
 
-    for logfile in [LOG_A, LOG_C]:
+    for logfile in [LOG_A, LOG_B]:
         if os.path.exists(logfile):
             dst = os.path.join(OUTPUT_DIR, os.path.basename(logfile))
             shutil.copy2(logfile, dst)
@@ -186,12 +190,12 @@ def save_outputs():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Colab sequential training runner (Cells A + C)")
+    parser = argparse.ArgumentParser(description="Colab sequential training runner (Cells A + B)")
     parser.add_argument("--status", action="store_true", help="Check status and recent logs")
     parser.add_argument("--wait", action="store_true", help="Wait for training to finish")
     parser.add_argument("--clean", action="store_true", help="Delete checkpoints before training")
     parser.add_argument("--save-outputs", action="store_true", help="Copy outputs to Google Drive")
-    parser.add_argument("--cell", type=str, default=None, help="Train only one cell (A or C)")
+    parser.add_argument("--cell", type=str, default=None, help="Train only one cell (A or B)")
     args = parser.parse_args()
 
     if args.status:
