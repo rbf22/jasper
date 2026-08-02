@@ -23,6 +23,11 @@ import ttnn
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
+# Custom kernel support (fused RoPE for retention layer)
+from ttnn._ttnn.program_descriptor import VectorUInt32
+
+_KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+
 
 # ---------------------------------------------------------------------------
 # Config (shared with model.py)
@@ -1094,7 +1099,7 @@ class TTRetentionLayer:
     Backward: manual, all on device. Pure matmuls + element-wise ops.
     """
 
-    def __init__(self, config: ModelConfig, device):
+    def __init__(self, config: ModelConfig, device, use_fused_rope=False):
         self.config = config
         self.device = device
         self.d_model = config.d_model
@@ -1122,12 +1127,18 @@ class TTRetentionLayer:
         self._rope_freqs = freqs
         self._rope_cos = None
         self._rope_sin = None
+        self._rope_cos_2d = None
+        self._rope_sin_2d = None
         self._rope_T = 0
 
         # Decay matrix cache (diff and causal mask, precomputed per T on device)
         self._diff_tt = None
         self._causal_tt = None
         self._decay_T = 0
+
+        # Fused RoPE custom kernel (untested — device 0 was down when written).
+        # Enable with use_fused_rope=True in constructor once verified.
+        self.use_fused_rope = use_fused_rope
 
         self._cache = {}
 
@@ -1137,7 +1148,7 @@ class TTRetentionLayer:
             return
         positions = torch.arange(T, dtype=torch.float32)
         angles = torch.outer(positions, self._rope_freqs)
-        cos = torch.cos(angles).to(torch.bfloat16)
+        cos = torch.cos(angles).to(torch.bfloat16)   # (T, d_head//2)
         sin = torch.sin(angles).to(torch.bfloat16)
         cos_4d = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, d_head//2)
         sin_4d = sin.unsqueeze(0).unsqueeze(0)
@@ -1145,28 +1156,171 @@ class TTRetentionLayer:
                                           layout=ttnn.TILE_LAYOUT, device=device)
         self._rope_sin = ttnn.from_torch(sin_4d, dtype=ttnn.bfloat16,
                                           layout=ttnn.TILE_LAYOUT, device=device)
+        # 2D versions for the fused kernel (T, d_half) — tile layout matches
+        # the reader's broadcast indexing.
+        self._rope_cos_2d = ttnn.from_torch(cos, dtype=ttnn.bfloat16,
+                                             layout=ttnn.TILE_LAYOUT, device=device)
+        self._rope_sin_2d = ttnn.from_torch(sin, dtype=ttnn.bfloat16,
+                                             layout=ttnn.TILE_LAYOUT, device=device)
         self._rope_T = T
 
     def _apply_rope(self, x, B, H, T):
-        """Apply RoPE to x: (B, H, T, d_head) -> (B, H, T, d_head)."""
+        """Apply RoPE to x: (B, H, T, d_head) -> (B, H, T, d_head).
+
+        Uses fused custom kernel when self.use_fused_rope is True (4 ops vs 9).
+        Falls back to ttnn ops otherwise.
+        """
         d_h = self.d_head
         x1 = ttnn.slice(x, [0, 0, 0, 0], [B, H, T, d_h // 2])
         x2 = ttnn.slice(x, [0, 0, 0, d_h // 2], [B, H, T, d_h])
-        x1_cos = ttnn.mul(x1, self._rope_cos)
-        x2_sin = ttnn.mul(x2, self._rope_sin)
-        x1_sin = ttnn.mul(x1, self._rope_sin)
-        x2_cos = ttnn.mul(x2, self._rope_cos)
-        rotated = ttnn.concat([ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)], dim=-1)
-        return rotated
+        if self.use_fused_rope:
+            rot1, rot2 = self._fused_rope_4d(
+                x1, x2, self._rope_cos_2d, self._rope_sin_2d,
+                B, H, T, d_h // 2, self.device)
+            return ttnn.concat([rot1, rot2], dim=-1)
+        else:
+            x1_cos = ttnn.mul(x1, self._rope_cos)
+            x2_sin = ttnn.mul(x2, self._rope_sin)
+            x1_sin = ttnn.mul(x1, self._rope_sin)
+            x2_cos = ttnn.mul(x2, self._rope_cos)
+            return ttnn.concat([ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)], dim=-1)
 
     def _apply_rope_backward(self, grad_rotated, B, H, T):
-        """Backward through RoPE (rotation: grad is the inverse rotation)."""
+        """Backward through RoPE — same rotation with sin negated."""
         d_h = self.d_head
         grad_r1 = ttnn.slice(grad_rotated, [0, 0, 0, 0], [B, H, T, d_h // 2])
         grad_r2 = ttnn.slice(grad_rotated, [0, 0, 0, d_h // 2], [B, H, T, d_h])
-        grad_x1 = ttnn.add(ttnn.mul(grad_r1, self._rope_cos), ttnn.mul(grad_r2, self._rope_sin))
-        grad_x2 = ttnn.add(ttnn.mul(ttnn.neg(grad_r1), self._rope_sin), ttnn.mul(grad_r2, self._rope_cos))
-        return ttnn.concat([grad_x1, grad_x2], dim=-1)
+        if self.use_fused_rope:
+            neg_sin_2d = ttnn.neg(self._rope_sin_2d)
+            grad_x1, grad_x2 = self._fused_rope_4d(
+                grad_r1, grad_r2, self._rope_cos_2d, neg_sin_2d,
+                B, H, T, d_h // 2, self.device)
+            return ttnn.concat([grad_x1, grad_x2], dim=-1)
+        else:
+            grad_x1 = ttnn.add(ttnn.mul(grad_r1, self._rope_cos), ttnn.mul(grad_r2, self._rope_sin))
+            grad_x2 = ttnn.add(ttnn.mul(ttnn.neg(grad_r1), self._rope_sin), ttnn.mul(grad_r2, self._rope_cos))
+            return ttnn.concat([grad_x1, grad_x2], dim=-1)
+
+    @staticmethod
+    def _fused_rope_4d(x1, x2, cos, sin, B, H, T, d_half, device):
+        """Fused RoPE rotation via custom kernel.
+
+        Runs the 2-output mul kernel twice:
+          Pass 1: out_a = x1*cos, out_b = x2*sin  → rot1 = out_a - out_b
+          Pass 2: out_a = x1*sin, out_b = x2*cos  → rot2 = out_a + out_b
+        Total: 2 kernel launches + 2 ttnn ops = 4 ops vs 9 original ttnn ops.
+
+        Args:
+            x1: (B, H, T, d_half) bf16 TILE — first half of input
+            x2: (B, H, T, d_half) bf16 TILE — second half
+            cos: (T, d_half) bf16 TILE — cos table (2D, broadcast over B, H)
+            sin: (T, d_half) bf16 TILE — sin table (2D, broadcast over B, H)
+        Returns:
+            rot1: (B, H, T, d_half) bf16 TILE = x1*cos - x2*sin
+            rot2: (B, H, T, d_half) bf16 TILE = x1*sin + x2*cos
+        """
+        # Pass 1: x1*cos, x2*sin
+        tc, ts = TTRetentionLayer._fused_mul_kernel(x1, x2, cos, sin, B, H, T, d_half, device)
+        ttnn.synchronize_device(device)
+        rot1_2d = ttnn.sub(tc, ts)
+        # Pass 2: x1*sin, x2*cos
+        ts2, tc2 = TTRetentionLayer._fused_mul_kernel(x1, x2, sin, cos, B, H, T, d_half, device)
+        ttnn.synchronize_device(device)
+        rot2_2d = ttnn.add(ts2, tc2)
+        # Reshape outputs back to 4D
+        rot1 = ttnn.reshape(rot1_2d, [B, H, T, d_half])
+        rot2 = ttnn.reshape(rot2_2d, [B, H, T, d_half])
+        return rot1, rot2
+
+    @staticmethod
+    def _fused_mul_kernel(x1, x2, cos, sin, B, H, T, d_half, device):
+        """Launch custom kernel: out0 = x1*cos, out1 = x2*sin (2 muls)."""
+        BH = B * H
+        x1_2d = ttnn.reshape(x1, [BH * T, d_half])
+        x2_2d = ttnn.reshape(x2, [BH * T, d_half])
+
+        tiled_cols = (d_half + 31) // 32
+        total_tiles = ((BH * T + 31) // 32) * tiled_cols
+
+        out0 = ttnn.empty([BH * T, d_half], dtype=ttnn.bfloat16,
+                          layout=ttnn.TILE_LAYOUT, device=device)
+        out1 = ttnn.empty([BH * T, d_half], dtype=ttnn.bfloat16,
+                          layout=ttnn.TILE_LAYOUT, device=device)
+
+        grid = device.compute_with_storage_grid_size()
+        num_cores_x, num_cores_y = grid.x, grid.y
+        num_cores_total = num_cores_x * num_cores_y
+        num_cores = min(total_tiles, num_cores_total)
+        bpc_base = total_tiles // num_cores
+        bpc_rem = total_tiles % num_cores
+
+        all_cores = ttnn.CoreRangeSet([
+            ttnn.CoreRange(ttnn.CoreCoord(0, 0),
+                          ttnn.CoreCoord(num_cores_x - 1, num_cores_y - 1))
+        ])
+
+        tile_bytes = 32 * 32 * 2  # bf16
+        cb_t0, cb_t1, cb_cos, cb_sin = 0, 1, 2, 3
+        cb_out0, cb_out1 = 16, 17
+
+        def _cb(idx, n):
+            return ttnn.CBDescriptor(
+                total_size=n * tile_bytes, core_ranges=all_cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(
+                    buffer_index=idx, data_format=ttnn.bfloat16, page_size=tile_bytes)])
+
+        cbs = [_cb(cb_t0, 2), _cb(cb_t1, 2), _cb(cb_cos, 2), _cb(cb_sin, 2),
+               _cb(cb_out0, 2), _cb(cb_out1, 2)]
+
+        reader_ct = []
+        for t in [x1_2d, x2_2d, cos, sin]:
+            reader_ct.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        writer_ct = []
+        for t in [out0, out1]:
+            writer_ct.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+
+        assert T % 32 == 0, f"_fused_mul_kernel requires T to be a multiple of 32, got T={T}"
+        T_tiles = T // 32
+
+        reader_rt, writer_rt, compute_rt = [], [], []
+        ts = 0
+        for i in range(num_cores_total):
+            cx, cy = i // num_cores_y, i % num_cores_y
+            coord = ttnn.CoreCoord(cx, cy)
+            ntpc = bpc_base + (1 if i < bpc_rem else 0) if i < num_cores else 0
+            reader_rt.append((coord, VectorUInt32([
+                x1_2d.buffer_address(), x2_2d.buffer_address(),
+                cos.buffer_address(), sin.buffer_address(),
+                ntpc, ts, T_tiles, tiled_cols])))
+            writer_rt.append((coord, VectorUInt32([
+                out0.buffer_address(), out1.buffer_address(),
+                ntpc, ts])))
+            compute_rt.append((coord, VectorUInt32([ntpc])))
+            ts += ntpc
+
+        reader = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/rope4d_reader.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32(reader_ct),
+            runtime_args=reader_rt, config=ttnn.ReaderConfigDescriptor())
+        writer = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/rope4d_writer.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32(writer_ct),
+            runtime_args=writer_rt, config=ttnn.WriterConfigDescriptor())
+        compute = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/rope4d_compute.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32([]),
+            runtime_args=compute_rt,
+            config=ttnn.ComputeConfigDescriptor(
+                math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=False))
+
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute],
+                                         semaphores=[], cbs=cbs)
+        ttnn.generic_op(io_tensors=[x1_2d, x2_2d, cos, sin, out0, out1],
+                        program_descriptor=program)
+        return out0, out1
 
     def _get_decay_matrix(self, T, device):
         """Compute D[t,s] = gamma^(t-s) for s <= t, else 0 — fully on device.
