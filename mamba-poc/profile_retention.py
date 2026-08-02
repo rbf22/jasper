@@ -155,24 +155,28 @@ def profile_retention(config, B, T, n_warmup, n_iters, device):
             v_4d = ttnn.permute(ttnn.reshape(v, [B, T, H, d_h]), [0, 2, 1, 3])
 
         with p.time("fwd: rope_q"):
-            q_rope = layer._apply_rope(q_4d, B, H, T)
+            rot1_q, rot2_q = layer._apply_rope_split(q_4d, B, H, T)
 
         with p.time("fwd: rope_k"):
-            k_rope = layer._apply_rope(k_4d, B, H, T)
+            rot1_k, rot2_k = layer._apply_rope_split(k_4d, B, H, T)
 
         with p.time("fwd: decay_matrix (device)"):
             D_decay = layer._get_decay_matrix(T, device)
 
-        with p.time("fwd: qk_matmul"):
-            scores_raw = ttnn.matmul(q_rope, ttnn.transpose(k_rope, -2, -1))
+        with p.time("fwd: qk_matmul (split)"):
+            qk = ttnn.add(
+                ttnn.matmul(rot1_q, ttnn.transpose(rot1_k, -2, -1)),
+                ttnn.matmul(rot2_q, ttnn.transpose(rot2_k, -2, -1))
+            )
 
-        with p.time("fwd: scale_mul"):
-            scale_tt = ttnn.from_torch(torch.tensor([layer.scale], dtype=torch.bfloat16),
-                                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-            scores_raw = ttnn.mul(scores_raw, scale_tt)
+        with p.time("fwd: scale_tt_create"):
+            scale_tt = layer._scale_tt
 
-        with p.time("fwd: decay_mul"):
-            scores = ttnn.mul(scores_raw, D_decay)
+        with p.time("fwd: fused_scale_decay"):
+            qk_2d = ttnn.reshape(qk, [B * H * T, T])
+            D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
+            scores_2d = layer._fused_scale_decay(qk_2d, D_decay_2d, layer.scale, B, H, T, device)
+            scores = ttnn.reshape(scores_2d, [B, H, T, T])
 
         with p.time("fwd: sv_matmul"):
             out_4d = ttnn.matmul(scores, v_4d)
@@ -196,12 +200,9 @@ def profile_retention(config, B, T, n_warmup, n_iters, device):
             grad_out_2d = ttnn.reshape(grad_out, [B * T, D])
             grad_out_proj_weight = ttnn.matmul(ttnn.transpose(out_gated_2d, 0, 1), grad_out_2d)
 
-        with p.time("bwd: gate_backward"):
-            grad_out_flat = ttnn.mul(grad_out_gated, gate)
-            ones_tt = ttnn.ones_like(gate)
-            sig_prime = ttnn.mul(gate, ttnn.sub(ones_tt, gate))
-            grad_g = ttnn.mul(grad_out_gated, out_flat)
-            grad_g = ttnn.mul(grad_g, sig_prime)
+        with p.time("bwd: gate_backward (fused)"):
+            grad_out_flat, grad_g = layer._fused_gate_backward(
+                grad_out_gated, gate, out_flat, B, T, D, device)
 
         with p.time("bwd: out_reshape_grad"):
             grad_out_4d = ttnn.permute(ttnn.reshape(grad_out_flat, [B, T, H, d_h]), [0, 2, 1, 3])
@@ -212,9 +213,16 @@ def profile_retention(config, B, T, n_warmup, n_iters, device):
         with p.time("bwd: v_grad_matmul"):
             grad_v_4d = ttnn.matmul(ttnn.transpose(scores, -2, -1), grad_out_4d)
 
-        with p.time("bwd: decay_grad_mul"):
-            grad_scores_raw = ttnn.mul(grad_scores, D_decay)
-            grad_D_decay = ttnn.mul(grad_scores, scores_raw)
+        with p.time("bwd: fused_scale_decay_grad"):
+            grad_scores_2d = ttnn.reshape(grad_scores, [B * H * T, T])
+            D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
+            grad_scores_scaled_2d = layer._fused_scale_decay(
+                grad_scores_2d, D_decay_2d, layer.scale, B, H, T, device)
+            grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+
+        with p.time("bwd: grad_D_decay (qk_scaled recompute)"):
+            qk_scaled = ttnn.mul(qk, scale_tt)
+            grad_D_decay = ttnn.mul(grad_scores, qk_scaled)
 
         with p.time("bwd: gamma_grad (device reduction)"):
             weighted = ttnn.mul(grad_D_decay, D_decay)
@@ -224,20 +232,19 @@ def profile_retention(config, B, T, n_warmup, n_iters, device):
             grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1)
             grad_gamma = ttnn.typecast(grad_log_gamma, ttnn.float32)
 
-        with p.time("bwd: scale_grad_mul"):
-            grad_scores_scaled = ttnn.mul(grad_scores_raw, scale_tt)
+        with p.time("bwd: q_grad_matmul (split)"):
+            grad_rot1_q = ttnn.matmul(grad_scores_scaled, rot1_k)
+            grad_rot2_q = ttnn.matmul(grad_scores_scaled, rot2_k)
 
-        with p.time("bwd: q_grad_matmul"):
-            grad_q_rope = ttnn.matmul(grad_scores_scaled, k_rope)
-
-        with p.time("bwd: k_grad_matmul"):
-            grad_k_rope = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), q_rope)
+        with p.time("bwd: k_grad_matmul (split)"):
+            grad_rot1_k = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), rot1_q)
+            grad_rot2_k = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), rot2_q)
 
         with p.time("bwd: rope_q_backward"):
-            grad_q_4d = layer._apply_rope_backward(grad_q_rope, B, H, T)
+            grad_q_4d = layer._apply_rope_backward_split(grad_rot1_q, grad_rot2_q, B, H, T)
 
         with p.time("bwd: rope_k_backward"):
-            grad_k_4d = layer._apply_rope_backward(grad_k_rope, B, H, T)
+            grad_k_4d = layer._apply_rope_backward_split(grad_rot1_k, grad_rot2_k, B, H, T)
 
         with p.time("bwd: reshape_grads"):
             grad_q = ttnn.reshape(ttnn.permute(grad_q_4d, [0, 2, 1, 3]), [B, T, D])

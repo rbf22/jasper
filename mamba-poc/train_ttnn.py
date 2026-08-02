@@ -50,20 +50,30 @@ def _find_mesh_graph_descriptor():
         import importlib.util
         from pathlib import Path
         spec = importlib.util.find_spec("ttnn")
-        if spec is None or not spec.submodule_search_locations:
-            return None
-        # ttnn's own copy
-        path = (
-            Path(next(iter(spec.submodule_search_locations)))
-            / "tt_metal" / "fabric" / "mesh_graph_descriptors"
-            / "p150_mesh_graph_descriptor.textproto"
-        )
-        if path.is_file():
-            return str(path)
-        # pjrt_plugin_tt copy
-        import sys
-        for p in sys.path:
-            candidate = Path(p) / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / "p150_mesh_graph_descriptor.textproto"
+        # Try p300 first (needed after board reset), then p150
+        candidates = [
+            "p300_mesh_graph_descriptor.textproto",
+            "p150_mesh_graph_descriptor.textproto",
+        ]
+        for name in candidates:
+            # ttnn package copy
+            if spec is not None and spec.submodule_search_locations:
+                path = (
+                    Path(next(iter(spec.submodule_search_locations)))
+                    / "tt_metal" / "fabric" / "mesh_graph_descriptors"
+                    / name
+                )
+                if path.is_file():
+                    return str(path)
+            # pjrt_plugin_tt copy
+            import sys
+            for p in sys.path:
+                candidate = Path(p) / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / name
+                if candidate.is_file():
+                    return str(candidate)
+            # venv site-packages directly
+            venv_path = Path("/home/rfenwick/Documents/jasper/.tt-venv/lib/python3.12/site-packages")
+            candidate = venv_path / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / name
             if candidate.is_file():
                 return str(candidate)
     except Exception:

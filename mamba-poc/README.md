@@ -12,22 +12,33 @@ See the [root README](../README.md) for the project overview and [desktop-mamba-
 |------|-------------|
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
 | `model.py` | The full model (`MambaWorkspaceModel`) with three cell configurations behind config flags. Contains the pure-PyTorch Mamba2 SSD layer, multi-head attention with RoPE, perceiver-style workspace module, and the recurrent core loop. |
-| `model_ttnn.py` | Tenstorrent-native model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. |
-| `train.py` | Training loop (PyTorch) with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection. |
+| `model_ttnn.py` | Tenstorrent-native model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes custom fused kernels for RoPE, scale+decay, and gate backward. |
+| `mamba3_layer.py` | Fixed Mamba-3 layer (replaces Mamba-2's selective scan with decayed linear attention). Used unconditionally for all non-attention layers. |
+| `retention_reference.py` | PyTorch reference implementation of the retention layer (decayed linear attention + RoPE). Used for parity testing. |
+| `train.py` | Training loop (PyTorch) with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection. (Deprecated — use `train_ttnn.py`.) |
 | `train_ttnn.py` | Tenstorrent-native training loop. Runs on Blackhole chips via `ttnn`, bfloat16-native computation. Used for the current Quietbox 2 experiments. |
 | `eval_ttnn.py` | Checkpoint evaluation script for Tenstorrent. Loads a `.pt` checkpoint, runs the model on generated eval examples, reports accuracy per task and per depth. Supports JSON output for automated tracking. |
 | `eval_loop.py` | Automated eval monitoring loop. Polls for new checkpoints every 5 minutes, runs `eval_ttnn.py` on each, saves JSON results, and detects plateaus (3 consecutive evals with <1% Task 1 improvement). |
 | `probe.py` | Analysis scripts for R2 (K sweep — test-time compute scaling), R3 (linear probes on workspace slots — decodability), and R4 (selective workspace ablation — J-space signature). |
+| `profile_retention.py` | Per-op profiler for the retention layer. Measures wall-clock time of each operation in forward and backward passes. |
+| `monitor_training.sh` | Background monitor script. Reports training status every 10 minutes to `logs/monitor.log`. |
+| `kernels/` | Custom tt-metal compute kernels: `rope4d_{reader,compute,writer}.cpp` (fused RoPE), `scale_decay_{reader,compute,writer}.cpp` (fused scale+decay), `gate_bwd_{reader,compute,writer}.cpp` (fused gate backward). |
+| `test_retention_parity.py` | Parity test: tt-nn forward + backward vs. PyTorch reference autograd. Run with `--tile-aligned` for tile-aligned shapes. |
+| `test_mamba3_parity.py` | Parity test for the Mamba-3 layer: float64 gradcheck + tt-nn forward/backward vs. reference. |
+| `test_fused_rope_single.py` | Standalone test for the fused RoPE kernel (forward + backward). |
+| `test_scale_decay.py` | Standalone test for the fused scale+decay kernel. |
+| `test_gate_bwd.py` | Standalone test for the fused gate backward kernel. |
 | `test_ws_backward_cpu.py` | CPU gradient check for the workspace backward pass. Verifies all gradients (input, weights, slots, gates) against PyTorch autograd to within float32 precision. |
 | `test_ws_backward.py` | Device-side gradient check (earlier attempt, superseded by the CPU version). |
 | `configs/cell_{a,b,c}_tt.yaml` | YAML configs for each model cell, including Tenstorrent-specific settings. Cell A is the no-workspace control; B adds workspace; C adds recurrent core. |
 | `run_all_cells_parallel.sh` | Launches all three cells in parallel on separate Blackhole chips (one cell per device). |
 | `tt_runner.py` | Sequential training runner for a single Blackhole chip. Supports `--cell`, `--status`, `--clean`, `--smoke` modes. |
-| `colab_notebook.ipynb` | Google Colab T4 notebook for running cells A and C (the go/no-go pair) on free GPU time. |
-| `colab_runner.py` | Sequential training runner for Colab (single T4 GPU). Trains Cell A then Cell C, saves outputs to Google Drive. (Deprecated — project moved to TT.) |
-| `vast_runner.py` | Parallel training runner for Vast.ai (dual GPU). Trains Cell A and C simultaneously on separate GPUs. (Deprecated — project moved to TT.) |
+| `colab_notebook.ipynb` | Google Colab T4 notebook for running cells A and C (the go/no-go pair) on free GPU time. (Deprecated — project moved to TT.) |
+| `colab_runner.py` | Sequential training runner for Colab (single T4 GPU). (Deprecated — project moved to TT.) |
+| `vast_runner.py` | Parallel training runner for Vast.ai (dual GPU). (Deprecated — project moved to TT.) |
 | `requirements.txt` | Python dependencies. |
-| `checkpoints/` | Saved during training (gitignored). One checkpoint per cell: `cell{X}_latest.pt`. |
+| `checkpoints/` | Saved during training (gitignored). `cell_{X}_step{N}.pt` per cell per checkpoint interval. |
+| `logs/` | Training logs (`cell_{a,b,c}.log`) and monitor log (`monitor.log`). |
 
 ---
 
@@ -281,24 +292,33 @@ python train.py --config configs/cell_c_tt.yaml
 
 **Tenstorrent (Quietbox 2):**
 ```bash
-# Each cell runs in an isolated run_X/ directory with its own kernel cache
-cd run_C  # or create with: mkdir -p run_C/checkpoints run_C/logs run_C/tt_cache
-# Symlinks to shared code:
-ln -s ../configs configs && ln -s ../data data && ln -s ../model_ttnn.py model_ttnn.py
-ln -s ../train_ttnn.py train_ttnn.py
+# The TT venv is at the repo root
+source /home/ttuser/Documents/jasper/.tt-venv/bin/activate
+# Uses ttnn with bfloat16-native computation on Blackhole chips
 
-# Launch on a specific device (0-3 for 4 Blackhole chips)
-TT_METAL_CACHE=$(pwd)/tt_cache TT_VISIBLE_DEVICES=3 \
-python -u train_ttnn.py --config configs/cell_c_tt.yaml --device 3 \
-    --checkpoint_dir checkpoints --steps 30000
+# Launch all three cells in parallel (one per device, safe to log out):
+mkdir -p logs checkpoints
+TT_VISIBLE_DEVICES=0 nohup python train_ttnn.py \
+    --config configs/cell_a_tt.yaml --device 0 --checkpoint_dir checkpoints \
+    > logs/cell_a.log 2>&1 &
+TT_VISIBLE_DEVICES=1 nohup python train_ttnn.py \
+    --config configs/cell_b_tt.yaml --device 0 --checkpoint_dir checkpoints \
+    > logs/cell_b.log 2>&1 &
+TT_VISIBLE_DEVICES=2 nohup python train_ttnn.py \
+    --config configs/cell_c_tt.yaml --device 0 --checkpoint_dir checkpoints \
+    > logs/cell_c.log 2>&1 &
+
+# Start the background monitor (reports every 10 minutes):
+nohup ./monitor_training.sh > logs/monitor.log 2>&1 &
 ```
 
 Key behaviors:
 - **Fresh data every batch** — no dataset file, no overfitting risk
-- **Checkpoint every 25 steps** to `run_X/checkpoints/cell_X_stepN.pt`
-- **Auto-resume** from latest checkpoint if interrupted (set `resume: true` in config)
-- **Cosine LR schedule** with configurable warmup (200 steps for all cells)
+- **Checkpoint every 100 steps** to `checkpoints/cell_X_stepN.pt`
+- **Early stopping** with EMA-smoothed loss plateau detection (patience=1000, min_delta=1e-3)
+- **Linear warmup** then constant LR (200 warmup steps for all cells)
 - **Bfloat16-native** on Tenstorrent (no gradient checkpointing needed — ample device DRAM)
+- **Custom fused kernels** for RoPE, scale+decay, and gate backward (see AGENTS.md)
 
 ### 5. Automated evaluation
 
@@ -393,7 +413,9 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `depth_range` | [2, 8] | Training depth range (inclusive) |
 | `eval_interval` | 500 | Steps between evaluations |
 | `log_interval` | 50 | Steps between log prints |
-| `checkpoint_interval` | 900 | Seconds between checkpoints |
+| `checkpoint_interval` | 100 | Steps between checkpoints |
+| `plateau_patience` | 1000 | Early stopping: steps without improvement before stopping (10% of max_steps) |
+| `plateau_min_delta` | 1e-3 | Early stopping: minimum relative improvement to reset patience (0.1%) |
 | `seed` | 42 | Random seed for data generation |
 | `wandb` | false | Enable wandb logging |
 | `wandb_project` | `mamba-workspace-poc` | Wandb project name |
@@ -407,18 +429,24 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 
 ### Tenstorrent Quietbox 2 (current)
 
-Three Blackhole chips train cells in parallel (one per device, device 0 reserved for eval). Each cell runs in an isolated `run_X/` directory with its own kernel cache.
+Three Blackhole chips train cells in parallel (devices 0, 1, 2). All cells run from the repo root with `nohup` — safe to log out.
 
-| Phase | Cells | Duration | What |
-|-------|-------|----------|------|
-| Training | A (dev 1), B (dev 2), C (dev 3) | ~2–3 days | All three cells train to convergence |
-| Analysis | — | ~2 hours | R2 K-sweep, R3 probes, R4 ablation on best checkpoint |
+| Cell | Device | Time/step | Est. total (10000 steps) | Architecture |
+|------|--------|-----------|--------------------------|--------------|
+| A | 0 | ~4.1s | ~11.4 hours | Hybrid (no workspace, no recurrence) |
+| B | 1 | ~4.2s | ~11.7 hours | Hybrid + workspace |
+| C | 2 | ~11.3s | ~31.3 hours | Full (workspace + recurrent core, K_max=6) |
 
-Typical step times: ~65s for A/B (no recurrence), ~160s for C (recurrent core, K up to 6).
+Cell C is ~2.7x slower due to the recurrent core looping K_max=6 times per step.
 
-### Mac / NVIDIA / Colab (alternative)
+| Phase | Duration | What |
+|-------|----------|------|
+| Training | ~12 hours (A/B) to ~31 hours (C) | All three cells train to convergence or early stopping |
+| Analysis | ~2 hours | R2 K-sweep, R3 probes, R4 ablation on best checkpoint |
 
-On Mac (MPS, Track M): run only cells A and C, ~1–2 days per cell. On RunPod 4090 (Track N): all three cells, ~4–6 hours each. See [infra-setup-guide.md](../infra-setup-guide.md) for platform setup.
+### Mac / NVIDIA / Colab (deprecated)
+
+The project has moved to Tenstorrent hardware. The PyTorch path (`train.py`, `model.py`) still works on Mac/NVIDIA but is no longer the primary training path. See [infra-setup-guide.md](../infra-setup-guide.md) for legacy platform setup.
 
 ---
 
@@ -432,39 +460,34 @@ On Mac (MPS, Track M): run only cells A and C, ~1–2 days per cell. On RunPod 4
 
 ---
 
-## Current experimental status (as of July 2026)
+## Current experimental status (as of August 2026)
 
-Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native).
+Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). All three cells launched in parallel on August 2, 2026, with custom fused kernels (RoPE, scale+decay, gate backward) and the Mamba-3 retention layer.
 
-> **Note:** The results below use the current cell naming (A/B/C). The former pure-Mamba2 (old A) and Mamba2+attention at lr=6e-4 (old B) cells were deprecated and removed after they plateaued — old A at ~35% overall (0% Task 1), old B at 60% overall (0% Task 1). The remaining cells were renamed: old E→A, old C→B, old D→C.
+> **Note:** The results below use the current cell naming (A/B/C). The former pure-Mamba2 (old A) and Mamba2+attention at lr=6e-4 (old B) cells were deprecated and removed after they plateaued — old A at ~35% overall (0% Task 1), old B at 60% overall (0% Task 1). The remaining cells were renamed: old E→A, old C→B, old D→C. The Mamba-2 selective scan was replaced with a decayed linear attention (retention) layer — see `mamba3_layer.py` and `retention_reference.py`.
 
 ### Training progress
 
 | Cell | Device | Step | Loss | LR | Status |
 |------|--------|------|------|-----|--------|
-| A | 1 | ~2 | 4.92 | 2e-6 (warming up) | **Just launched** (no-workspace control) |
-| B | 2 | ~150 | 1.34 | 1.5e-4 (warming up) | Training |
-| C | 3 | ~47 | 3.01 | 4.7e-5 (warming up) | Training |
+| A | 0 | ~100 | 1.57 | 1e-4 (warming up) | Training (no-workspace control) |
+| B | 1 | ~100 | 1.56 | 1e-4 (warming up) | Training (workspace) |
+| C | 2 | ~50 | 2.27 | 5e-5 (warming up) | Training (full architecture) |
 
-### Evaluation results (automated via eval_loop.py)
+### Architecture changes since the original plan
 
-| Cell | Step | Overall | Task 1 (multi-hop) | Task 2 (state-track) | Task 3 (recall) |
-|------|------|---------|---------------------|----------------------|-----------------|
-| B | 100 | 23% | 0% | 60% | 10% |
+1. **Mamba-2 → Mamba-3 (retention)**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. See `mamba3_layer.py`.
 
-### Key observations
+2. **Custom fused kernels**: Three custom tt-metal kernels eliminate intermediate DRAM writes and reduce op dispatch overhead:
+   - **Fused RoPE**: Full rotation (rot1 = x1*cos - x2*sin, rot2 = x1*sin + x2*cos) in a single kernel pass. Uses split-RoPE optimization to avoid expensive sub-tile concat/slice when d_half=48 is not tile-aligned.
+   - **Fused scale + decay**: scores = qk * scale * D_decay in one pass (FPU mul + SFPU mul_unary).
+   - **Fused gate backward**: grad_out_flat and grad_g computed in a single kernel pass (3 FPU muls + 3 SFPU binary ops).
 
-1. **Cell B is learning fast** — loss at step 150 (1.34) is approaching the old hybrid baseline's plateau loss (~1.03), despite a 3× lower learning rate. The workspace appears to accelerate learning. First eval at step 100 showed 23% overall, 0% Task 1 (still early in warmup).
-
-2. **Cell C is progressing** — loss dropping from 4.91 to 3.01 in 47 steps. The recurrent core is learning but slow (~160s/step). First checkpoint at step 100 is ~2.3h away.
-
-3. **Cell A is the critical control** — same architecture as the old hybrid baseline, same LR as B/C (2e-4). If B beats A on Task 1, the workspace is doing real work. If A matches B, the old baseline's failure was a learning rate issue, not an architectural one.
-
-4. **Backward pass verified** — all workspace gradients match PyTorch autograd to <1e-4 relative error. The earlier gradient explosion in Cell B was a training dynamics issue (sharper loss landscape), not a backward pass bug. Fixed by lowering LR from 6e-4 to 2e-4.
+3. **Early stopping**: EMA-smoothed loss plateau detection with patience=1000 (10% of max_steps) and min_delta=1e-3 (0.1% relative improvement). Tuned for the effective batch size of 384 (micro_batch=8 × accum_steps=48).
 
 ### What we're watching for
 
-- **Cell B step 200+**: Will the workspace produce non-zero Task 1 accuracy? This is the first real test of the architecture.
-- **Cell A vs Cell B**: The clean workspace comparison (same LR, A has no workspace).
-- **Cell C step 100+**: First eval of the full architecture (workspace + recurrence).
+- **Cell A vs Cell B**: The clean workspace comparison (same LR=2e-4, A has no workspace). If B beats A on Task 1, the workspace is doing real work.
+- **Cell C convergence**: The full architecture (workspace + recurrence) is ~2.7x slower per step. Will it converge within the training budget?
 - **Cell C K-sweep (R2)**: Does increasing K at inference improve accuracy on hard problems?
+- **Selective ablation (R4)**: Does replacing workspace slots with their mean collapse Tasks 1–2 while leaving Task 3 intact?

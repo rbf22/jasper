@@ -48,8 +48,12 @@ z_loss_coef: 1.0e-4
 depth_range: [2, 8]
 eval_interval: 500
 log_interval: 50
-checkpoint_interval: 25
+checkpoint_interval: 100
 seed: 42
+
+# Early stopping: see cell_a_tt.yaml for rationale.
+plateau_patience: 1000
+plateau_min_delta: 1.0e-3
 
 # TT-specific: bf16 native, no gradient checkpointing (ample device DRAM)
 use_gradient_checkpointing: false

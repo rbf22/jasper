@@ -79,3 +79,55 @@ Days 1–2, cells A and B (Track M: cell B only). Day 2 checkpoint: confirm the 
 **Go** (fund the 300M language-scale ablation, ~$3–5K, from the main plan): R1 and R2 pass, and at least one of R3/R4 shows the workspace doing real causal work. **Pivot** (keep the hybrid, drop the workspace): R1 fails but B's efficiency story stands — the browser plan proceeds on Nemotron/M1-style hybrid distillation without the novel architecture. **Kill** (novel-architecture track only): D ≤ B everywhere — the sampled-attempts-plus-verifier plan on a standard model remains fully intact, and the week cost nothing but electricity.
 
 One caution for the writeup: synthetic-task wins at 30M have a real history of not transferring to language at scale — that's precisely why the gate between this experiment and real money is the 300M ablation, not a victory lap. This week buys you the right to spend $5K intelligently, not the conclusion itself.
+
+---
+
+## Status update — August 2026
+
+### Hardware: moved to Tenstorrent Blackhole
+
+The experiment moved from NVIDIA/Apple Silicon (Track N/M) to a Tenstorrent Quietbox 2 with 4× Blackhole chips. Training runs in bfloat16 natively via `ttnn` — no fp16 AMP or GradScaler needed. The PyTorch path (`model.py`, `train.py`) still exists but is deprecated; all current runs use `model_ttnn.py` and `train_ttnn.py`.
+
+### Cell grid: simplified to three cells
+
+The original four-cell grid (A=pure Mamba2, B=hybrid, C=hybrid+workspace, D=hybrid+workspace+recurrent) was simplified after the pure-Mamba2 cells (old A, old B) were deprecated and removed. The remaining cells were renamed:
+
+| Original | Current | Architecture |
+|----------|---------|--------------|
+| old E | **A** | Hybrid (Mamba-3 + attention), no workspace — the control |
+| old C | **B** | Hybrid + workspace — does workspace help without recurrence? |
+| old D | **C** | Full architecture (workspace + recurrent core) — the go/no-go cell |
+
+The comparison logic is now: **B vs A** isolates the workspace effect (same LR=2e-4); **C vs B** isolates the recurrent core; **C vs A** is the full R1 test.
+
+### Architecture: Mamba-2 → Mamba-3 (retention)
+
+The Mamba-2 selective scan SSM was replaced with a decayed linear attention layer (RetNet-style): D[t,s] = gamma^(t-s) for s ≤ t, with a learned per-head decay scalar gamma. This is simpler, faster on tt-nn (pure matmuls, no conv1d or selective scan), and avoids ttnn's causal conv1d limitations. The decay matrix and its backward reduction are computed fully on-device, eliminating a 26ms/iter host round-trip that was 36% of total time in early profiling.
+
+### Optimization: custom fused kernels
+
+Three custom tt-metal kernels were written to reduce op dispatch overhead and eliminate intermediate DRAM writes:
+
+1. **Fused RoPE** — full rotation (x1*cos - x2*sin, x1*sin + x2*cos) in a single kernel pass using 4 FPU muls + 2 SFPU binary ops. Uses a split-RoPE optimization that keeps rot1/rot2 separate through the forward pass, replacing expensive sub-tile concat/slice (d_half=48 is not tile-aligned) with cheap split matmuls. Measured 9.4% total speedup.
+
+2. **Fused scale + decay** — scores = qk * scale * D_decay in one pass (FPU mul + SFPU mul_unary). Replaces 2 ttnn.mul ops with 1 kernel.
+
+3. **Fused gate backward** — grad_out_flat and grad_g computed in a single kernel pass (3 FPU muls + 3 SFPU binary ops). Replaces 6 ttnn ops with 1 kernel.
+
+The layer is now at 2.9ms/fwd+bwd for d_model=384, n_heads=4, T=128, B=8. The remaining bottleneck is `generic_op` dispatch overhead (~0.15-0.20ms per call), not kernel computation — further optimization would require ttnn tracing/graph mode or a larger model where compute dominates dispatch.
+
+### Training: current run (August 2, 2026)
+
+All three cells launched in parallel on devices 0, 1, 2 with `nohup` (safe to log out). Effective batch size is 384 (micro_batch=8 × accum_steps=48). Early stopping uses EMA-smoothed loss plateau detection (patience=1000, min_delta=1e-3).
+
+| Cell | Device | Time/step | Est. total | Status |
+|------|--------|-----------|------------|--------|
+| A | 0 | ~4.1s | ~11.4 hours | Training |
+| B | 1 | ~4.2s | ~11.7 hours | Training |
+| C | 2 | ~11.3s | ~31.3 hours | Training |
+
+Cell C is ~2.7x slower due to the recurrent core (K_max=6 iterations per step). A background monitor (`monitor_training.sh`) reports status every 10 minutes.
+
+### What hasn't changed
+
+The four pre-registered results (R1–R4) are unchanged. The decision rule is unchanged. The tasks are unchanged. The core question — does an engineered workspace causally carry intermediate reasoning state — is the same. What changed is the hardware, the SSM implementation, and the addition of custom kernels to make training feasible on the available hardware within the time budget.

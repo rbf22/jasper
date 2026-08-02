@@ -35,13 +35,23 @@ def main():
     # Set TT_VISIBLE_DEVICES before importing ttnn-heavy modules
     os.environ["TT_VISIBLE_DEVICES"] = str(args.device)
 
-    # Find mesh graph descriptor for P300 chips
+    # Find mesh graph descriptor for P300 chips (try p300 first, then p150)
     import sys as _sys
     from pathlib import Path as _Path
-    for p in _sys.path:
-        candidate = _Path(p) / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / "p150_mesh_graph_descriptor.textproto"
-        if candidate.is_file():
-            os.environ.setdefault("TT_MESH_GRAPH_DESC_PATH", str(candidate))
+    _mgd_names = ["p300_mesh_graph_descriptor.textproto", "p150_mesh_graph_descriptor.textproto"]
+    _venv_path = _Path("/home/rfenwick/Documents/jasper/.tt-venv/lib/python3.12/site-packages")
+    for _name in _mgd_names:
+        for p in _sys.path:
+            candidate = _Path(p) / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / _name
+            if candidate.is_file():
+                os.environ.setdefault("TT_MESH_GRAPH_DESC_PATH", str(candidate))
+                break
+        else:
+            candidate = _venv_path / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / _name
+            if candidate.is_file():
+                os.environ.setdefault("TT_MESH_GRAPH_DESC_PATH", str(candidate))
+                break
+        if "TT_MESH_GRAPH_DESC_PATH" in os.environ:
             break
     os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
 

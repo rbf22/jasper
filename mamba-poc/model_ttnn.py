@@ -1106,6 +1106,10 @@ class TTRetentionLayer:
         self.n_heads = config.n_heads
         self.d_head = config.d_model // config.n_heads
         self.scale = 1.0 / (self.d_head ** 0.5)
+        # Cache scale as a device tensor (avoids per-forward torch→device transfer)
+        self._scale_tt = ttnn.from_torch(
+            torch.tensor([self.scale], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         # QKV+gate projection: (d_model, 4*d_model)
         qkv_w = torch.randn(self.d_model, 4 * self.d_model, dtype=torch.bfloat16) * 0.02
@@ -1162,6 +1166,10 @@ class TTRetentionLayer:
                                              layout=ttnn.TILE_LAYOUT, device=device)
         self._rope_sin_2d = ttnn.from_torch(sin, dtype=ttnn.bfloat16,
                                              layout=ttnn.TILE_LAYOUT, device=device)
+        # Pre-compute negated sin for backward RoPE (avoid per-call ttnn.neg)
+        neg_sin = (-sin).to(torch.bfloat16)
+        self._rope_neg_sin_2d = ttnn.from_torch(neg_sin, dtype=ttnn.bfloat16,
+                                                 layout=ttnn.TILE_LAYOUT, device=device)
         self._rope_T = T
 
     def _apply_rope(self, x, B, H, T):
@@ -1170,30 +1178,47 @@ class TTRetentionLayer:
         Uses fused custom kernel when self.use_fused_rope is True (4 ops vs 9).
         Falls back to ttnn ops otherwise.
         """
+        rot1, rot2 = self._apply_rope_split(x, B, H, T)
+        return ttnn.concat([rot1, rot2], dim=-1)
+
+    def _apply_rope_split(self, x, B, H, T):
+        """Apply RoPE and return (rot1, rot2) separately — no concat.
+
+        Enables the caller to skip the concat and use split matmuls instead,
+        eliminating expensive sub-tile concat/slice ops when d_half is not
+        tile-aligned.
+        """
         d_h = self.d_head
         x1 = ttnn.slice(x, [0, 0, 0, 0], [B, H, T, d_h // 2])
         x2 = ttnn.slice(x, [0, 0, 0, d_h // 2], [B, H, T, d_h])
         if self.use_fused_rope:
-            rot1, rot2 = self._fused_rope_4d(
+            return self._fused_rope_4d(
                 x1, x2, self._rope_cos_2d, self._rope_sin_2d,
                 B, H, T, d_h // 2, self.device)
-            return ttnn.concat([rot1, rot2], dim=-1)
         else:
             x1_cos = ttnn.mul(x1, self._rope_cos)
             x2_sin = ttnn.mul(x2, self._rope_sin)
             x1_sin = ttnn.mul(x1, self._rope_sin)
             x2_cos = ttnn.mul(x2, self._rope_cos)
-            return ttnn.concat([ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)], dim=-1)
+            return ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)
 
     def _apply_rope_backward(self, grad_rotated, B, H, T):
         """Backward through RoPE — same rotation with sin negated."""
         d_h = self.d_head
         grad_r1 = ttnn.slice(grad_rotated, [0, 0, 0, 0], [B, H, T, d_h // 2])
         grad_r2 = ttnn.slice(grad_rotated, [0, 0, 0, d_h // 2], [B, H, T, d_h])
+        return self._apply_rope_backward_split(grad_r1, grad_r2, B, H, T)
+
+    def _apply_rope_backward_split(self, grad_r1, grad_r2, B, H, T):
+        """Backward through RoPE from already-split grads — no slice needed.
+
+        grad_r1, grad_r2: (B, H, T, d_half) each — grads w.r.t. rot1, rot2
+        Returns: (B, H, T, d_head) = concat([grad_x1, grad_x2])
+        """
+        d_h = self.d_head
         if self.use_fused_rope:
-            neg_sin_2d = ttnn.neg(self._rope_sin_2d)
             grad_x1, grad_x2 = self._fused_rope_4d(
-                grad_r1, grad_r2, self._rope_cos_2d, neg_sin_2d,
+                grad_r1, grad_r2, self._rope_cos_2d, self._rope_neg_sin_2d,
                 B, H, T, d_h // 2, self.device)
             return ttnn.concat([grad_x1, grad_x2], dim=-1)
         else:
@@ -1203,12 +1228,12 @@ class TTRetentionLayer:
 
     @staticmethod
     def _fused_rope_4d(x1, x2, cos, sin, B, H, T, d_half, device):
-        """Fused RoPE rotation via custom kernel.
+        """Full fused RoPE rotation via single custom kernel pass.
 
-        Runs the 2-output mul kernel twice:
-          Pass 1: out_a = x1*cos, out_b = x2*sin  → rot1 = out_a - out_b
-          Pass 2: out_a = x1*sin, out_b = x2*cos  → rot2 = out_a + out_b
-        Total: 2 kernel launches + 2 ttnn ops = 4 ops vs 9 original ttnn ops.
+        Computes in one kernel launch:
+          rot1 = x1*cos - x2*sin
+          rot2 = x1*sin + x2*cos
+        The kernel does 4 FPU muls + 2 SFPU binary ops (sub, add) on dest regs.
 
         Args:
             x1: (B, H, T, d_half) bf16 TILE — first half of input
@@ -1219,22 +1244,18 @@ class TTRetentionLayer:
             rot1: (B, H, T, d_half) bf16 TILE = x1*cos - x2*sin
             rot2: (B, H, T, d_half) bf16 TILE = x1*sin + x2*cos
         """
-        # Pass 1: x1*cos, x2*sin
-        tc, ts = TTRetentionLayer._fused_mul_kernel(x1, x2, cos, sin, B, H, T, d_half, device)
-        ttnn.synchronize_device(device)
-        rot1_2d = ttnn.sub(tc, ts)
-        # Pass 2: x1*sin, x2*cos
-        ts2, tc2 = TTRetentionLayer._fused_mul_kernel(x1, x2, sin, cos, B, H, T, d_half, device)
-        ttnn.synchronize_device(device)
-        rot2_2d = ttnn.add(ts2, tc2)
-        # Reshape outputs back to 4D
+        rot1_2d, rot2_2d = TTRetentionLayer._fused_rope_kernel(
+            x1, x2, cos, sin, B, H, T, d_half, device)
         rot1 = ttnn.reshape(rot1_2d, [B, H, T, d_half])
         rot2 = ttnn.reshape(rot2_2d, [B, H, T, d_half])
         return rot1, rot2
 
     @staticmethod
-    def _fused_mul_kernel(x1, x2, cos, sin, B, H, T, d_half, device):
-        """Launch custom kernel: out0 = x1*cos, out1 = x2*sin (2 muls)."""
+    def _fused_rope_kernel(x1, x2, cos, sin, B, H, T, d_half, device):
+        """Launch custom kernel: full RoPE in one pass.
+        out0 = x1*cos - x2*sin (rot1)
+        out1 = x1*sin + x2*cos (rot2)
+        """
         BH = B * H
         x1_2d = ttnn.reshape(x1, [BH * T, d_half])
         x2_2d = ttnn.reshape(x2, [BH * T, d_half])
@@ -1260,7 +1281,7 @@ class TTRetentionLayer:
         ])
 
         tile_bytes = 32 * 32 * 2  # bf16
-        cb_t0, cb_t1, cb_cos, cb_sin = 0, 1, 2, 3
+        cb_x1, cb_x2, cb_cos, cb_sin = 0, 1, 2, 3
         cb_out0, cb_out1 = 16, 17
 
         def _cb(idx, n):
@@ -1269,7 +1290,7 @@ class TTRetentionLayer:
                 format_descriptors=[ttnn.CBFormatDescriptor(
                     buffer_index=idx, data_format=ttnn.bfloat16, page_size=tile_bytes)])
 
-        cbs = [_cb(cb_t0, 2), _cb(cb_t1, 2), _cb(cb_cos, 2), _cb(cb_sin, 2),
+        cbs = [_cb(cb_x1, 2), _cb(cb_x2, 2), _cb(cb_cos, 2), _cb(cb_sin, 2),
                _cb(cb_out0, 2), _cb(cb_out1, 2)]
 
         reader_ct = []
@@ -1279,7 +1300,7 @@ class TTRetentionLayer:
         for t in [out0, out1]:
             writer_ct.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
 
-        assert T % 32 == 0, f"_fused_mul_kernel requires T to be a multiple of 32, got T={T}"
+        assert T % 32 == 0, f"_fused_rope_kernel requires T to be a multiple of 32, got T={T}"
         T_tiles = T // 32
 
         reader_rt, writer_rt, compute_rt = [], [], []
@@ -1321,6 +1342,200 @@ class TTRetentionLayer:
         ttnn.generic_op(io_tensors=[x1_2d, x2_2d, cos, sin, out0, out1],
                         program_descriptor=program)
         return out0, out1
+
+    @staticmethod
+    def _fused_scale_decay(scores_raw, D_decay, scale, B, H, T, device):
+        """Fused scale + decay: scores = scores_raw * scale * D_decay.
+
+        Replaces 2 ttnn ops (mul + mul) with 1 custom kernel.
+        D_decay is (1, H, T, T) broadcast over batch B.
+
+        Args:
+            scores_raw: (B, H, T, T) bf16 TILE — QK^T matmul result
+            D_decay: (1, H, T, T) bf16 TILE — decay matrix
+            scale: float scalar
+        Returns:
+            scores: (B, H, T, T) bf16 TILE
+        """
+        import struct
+        BH = B * H
+        # 2D tile layout: scores_raw is (BH*T, T), D_decay is (H*T, T)
+        tiled_cols = (T + 31) // 32
+        total_tiles = ((BH * T + 31) // 32) * tiled_cols
+        HT_tiles = (H * T + 31) // 32  # D_decay tile rows
+
+        # Encode scale as uint32 for SFPU mul_unary_tile
+        scale_bits = struct.unpack('I', struct.pack('f', float(scale)))[0]
+
+        out = ttnn.empty([BH * T, T], dtype=ttnn.bfloat16,
+                         layout=ttnn.TILE_LAYOUT, device=device)
+
+        grid = device.compute_with_storage_grid_size()
+        num_cores_x, num_cores_y = grid.x, grid.y
+        num_cores_total = num_cores_x * num_cores_y
+        num_cores = min(total_tiles, num_cores_total)
+        bpc_base = total_tiles // num_cores
+        bpc_rem = total_tiles % num_cores
+
+        all_cores = ttnn.CoreRangeSet([
+            ttnn.CoreRange(ttnn.CoreCoord(0, 0),
+                          ttnn.CoreCoord(num_cores_x - 1, num_cores_y - 1))
+        ])
+
+        tile_bytes = 32 * 32 * 2  # bf16
+        cb_scores, cb_D = 0, 1
+        cb_out = 16
+
+        def _cb(idx, n):
+            return ttnn.CBDescriptor(
+                total_size=n * tile_bytes, core_ranges=all_cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(
+                    buffer_index=idx, data_format=ttnn.bfloat16, page_size=tile_bytes)])
+
+        cbs = [_cb(cb_scores, 2), _cb(cb_D, 2), _cb(cb_out, 2)]
+
+        # Compile-time args
+        reader_ct = []
+        reader_ct.extend(ttnn.TensorAccessorArgs(scores_raw).get_compile_time_args())
+        reader_ct.extend(ttnn.TensorAccessorArgs(D_decay).get_compile_time_args())
+        writer_ct = list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+
+        # Runtime args per core
+        reader_rt, writer_rt, compute_rt = [], [], []
+        ts = 0
+        for i in range(num_cores_total):
+            cx, cy = i // num_cores_y, i % num_cores_y
+            coord = ttnn.CoreCoord(cx, cy)
+            ntpc = bpc_base + (1 if i < bpc_rem else 0) if i < num_cores else 0
+            reader_rt.append((coord, VectorUInt32([
+                scores_raw.buffer_address(), D_decay.buffer_address(),
+                ntpc, ts, tiled_cols, HT_tiles])))
+            writer_rt.append((coord, VectorUInt32([
+                out.buffer_address(), ntpc, ts])))
+            compute_rt.append((coord, VectorUInt32([ntpc, scale_bits])))
+            ts += ntpc
+
+        reader = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/scale_decay_reader.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32(reader_ct),
+            runtime_args=reader_rt, config=ttnn.ReaderConfigDescriptor())
+        writer = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/scale_decay_writer.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32(writer_ct),
+            runtime_args=writer_rt, config=ttnn.WriterConfigDescriptor())
+        compute = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/scale_decay_compute.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32([]),
+            runtime_args=compute_rt,
+            config=ttnn.ComputeConfigDescriptor(
+                math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=False))
+
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute],
+                                         semaphores=[], cbs=cbs)
+        ttnn.generic_op(io_tensors=[scores_raw, D_decay, out],
+                        program_descriptor=program)
+        return out
+
+    @staticmethod
+    def _fused_gate_backward(grad_out_gated, gate, out_flat, B, T, D, device):
+        """Fused gate backward: computes grad_out_flat and grad_g in one kernel.
+
+        grad_out_flat = grad_out_gated * gate
+        grad_g = grad_out_gated * out_flat * gate * (1 - gate)
+
+        All inputs/outputs are (B, T, D) bf16 TILE. Replaces 6 ttnn ops
+        (ones_like, sub, 4 muls) with 1 kernel launch.
+        """
+        BT = B * T
+        # All tensors are (B, T, D) → 2D as (BT, D) for tiling
+        gog_2d = ttnn.reshape(grad_out_gated, [BT, D])
+        gate_2d = ttnn.reshape(gate, [BT, D])
+        of_2d = ttnn.reshape(out_flat, [BT, D])
+
+        tiled_cols = (D + 31) // 32
+        total_tiles = ((BT + 31) // 32) * tiled_cols
+
+        out0 = ttnn.empty([BT, D], dtype=ttnn.bfloat16,
+                          layout=ttnn.TILE_LAYOUT, device=device)
+        out1 = ttnn.empty([BT, D], dtype=ttnn.bfloat16,
+                          layout=ttnn.TILE_LAYOUT, device=device)
+
+        grid = device.compute_with_storage_grid_size()
+        num_cores_x, num_cores_y = grid.x, grid.y
+        num_cores_total = num_cores_x * num_cores_y
+        num_cores = min(total_tiles, num_cores_total)
+        bpc_base = total_tiles // num_cores
+        bpc_rem = total_tiles % num_cores
+
+        all_cores = ttnn.CoreRangeSet([
+            ttnn.CoreRange(ttnn.CoreCoord(0, 0),
+                          ttnn.CoreCoord(num_cores_x - 1, num_cores_y - 1))
+        ])
+
+        tile_bytes = 32 * 32 * 2  # bf16
+        cb_gog, cb_gate, cb_of = 0, 1, 2
+        cb_out0, cb_out1 = 16, 17
+
+        def _cb(idx, n):
+            return ttnn.CBDescriptor(
+                total_size=n * tile_bytes, core_ranges=all_cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(
+                    buffer_index=idx, data_format=ttnn.bfloat16, page_size=tile_bytes)])
+
+        cbs = [_cb(cb_gog, 2), _cb(cb_gate, 2), _cb(cb_of, 2),
+               _cb(cb_out0, 2), _cb(cb_out1, 2)]
+
+        reader_ct = []
+        for t in [gog_2d, gate_2d, of_2d]:
+            reader_ct.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        writer_ct = []
+        for t in [out0, out1]:
+            writer_ct.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+
+        reader_rt, writer_rt, compute_rt = [], [], []
+        ts = 0
+        for i in range(num_cores_total):
+            cx, cy = i // num_cores_y, i % num_cores_y
+            coord = ttnn.CoreCoord(cx, cy)
+            ntpc = bpc_base + (1 if i < bpc_rem else 0) if i < num_cores else 0
+            reader_rt.append((coord, VectorUInt32([
+                gog_2d.buffer_address(), gate_2d.buffer_address(), of_2d.buffer_address(),
+                ntpc, ts])))
+            writer_rt.append((coord, VectorUInt32([
+                out0.buffer_address(), out1.buffer_address(),
+                ntpc, ts])))
+            compute_rt.append((coord, VectorUInt32([ntpc])))
+            ts += ntpc
+
+        reader = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/gate_bwd_reader.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32(reader_ct),
+            runtime_args=reader_rt, config=ttnn.ReaderConfigDescriptor())
+        writer = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/gate_bwd_writer.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32(writer_ct),
+            runtime_args=writer_rt, config=ttnn.WriterConfigDescriptor())
+        compute = ttnn.KernelDescriptor(
+            kernel_source=f"{_KERNEL_DIR}/gate_bwd_compute.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores, compile_time_args=VectorUInt32([]),
+            runtime_args=compute_rt,
+            config=ttnn.ComputeConfigDescriptor(
+                math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=False))
+
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute],
+                                         semaphores=[], cbs=cbs)
+        ttnn.generic_op(io_tensors=[gog_2d, gate_2d, of_2d, out0, out1],
+                        program_descriptor=program)
+        # Reshape back to (B, T, D)
+        grad_out_flat = ttnn.reshape(out0, [B, T, D])
+        grad_g = ttnn.reshape(out1, [B, T, D])
+        return grad_out_flat, grad_g
 
     def _get_decay_matrix(self, T, device):
         """Compute D[t,s] = gamma^(t-s) for s <= t, else 0 — fully on device.
@@ -1379,19 +1594,27 @@ class TTRetentionLayer:
         k_4d = ttnn.permute(ttnn.reshape(k, [B, T, H, d_h]), [0, 2, 1, 3])
         v_4d = ttnn.permute(ttnn.reshape(v, [B, T, H, d_h]), [0, 2, 1, 3])
 
-        # Apply RoPE to q and k
-        q_rope = self._apply_rope(q_4d, B, H, T)
-        k_rope = self._apply_rope(k_4d, B, H, T)
+        # Apply RoPE to q and k — keep rot1/rot2 separate to avoid expensive
+        # sub-tile concat (d_half=48 is not tile-aligned). Split QK matmul instead:
+        # qk = rot1_q @ rot1_k^T + rot2_q @ rot2_k^T
+        rot1_q, rot2_q = self._apply_rope_split(q_4d, B, H, T)
+        rot1_k, rot2_k = self._apply_rope_split(k_4d, B, H, T)
 
         # Decay matrix: (1, H, T, T)
         D_decay = self._get_decay_matrix(T, device)
 
         # Scores: (B, H, T, T) = (Q @ K^T) * scale * D
-        scores_raw = ttnn.matmul(q_rope, ttnn.transpose(k_rope, -2, -1))
-        scale_tt = ttnn.from_torch(torch.tensor([self.scale], dtype=torch.bfloat16),
-                                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        scores_raw = ttnn.mul(scores_raw, scale_tt)
-        scores = ttnn.mul(scores_raw, D_decay)  # decay + causal in one
+        # Split matmul: qk = q1@k1^T + q2@k2^T (avoids concat of rot1/rot2)
+        qk = ttnn.add(
+            ttnn.matmul(rot1_q, ttnn.transpose(rot1_k, -2, -1)),
+            ttnn.matmul(rot2_q, ttnn.transpose(rot2_k, -2, -1))
+        )
+        scale_tt = self._scale_tt
+        # Reshape to 2D for the fused kernel (it expects flat (BH*T, T) layout)
+        qk_2d = ttnn.reshape(qk, [B * H * T, T])
+        D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
+        scores_2d = self._fused_scale_decay(qk_2d, D_decay_2d, self.scale, B, H, T, device)
+        scores = ttnn.reshape(scores_2d, [B, H, T, T])
 
         # Output: (B, H, T, d_head) = scores @ V
         out_4d = ttnn.matmul(scores, v_4d)
@@ -1410,8 +1633,9 @@ class TTRetentionLayer:
         self._cache = {
             "x": x, "qkvg": qkvg, "q": q, "k": k, "v": v, "g": g,
             "q_4d": q_4d, "k_4d": k_4d, "v_4d": v_4d,
-            "q_rope": q_rope, "k_rope": k_rope,
-            "scores_raw": scores_raw, "scores": scores,
+            "rot1_q": rot1_q, "rot2_q": rot2_q,
+            "rot1_k": rot1_k, "rot2_k": rot2_k,
+            "qk": qk, "scores": scores,
             "out_4d": out_4d, "out_flat": out_flat,
             "gate": gate, "out_gated": out_gated,
             "D_decay": D_decay, "scale_tt": scale_tt,
@@ -1439,17 +1663,11 @@ class TTRetentionLayer:
         grad_out_proj_weight = ttnn.matmul(ttnn.transpose(out_gated_2d, 0, 1), grad_out_2d)
 
         # --- Backward through gate: out_gated = out_flat * sigmoid(g) ---
-        # grad_out_flat = grad_out_gated * gate
-        # grad_g = grad_out_gated * out_flat * sigmoid'(g)
+        # Fused kernel: grad_out_flat = grad_out_gated * gate
+        #               grad_g = grad_out_gated * out_flat * gate * (1 - gate)
         gate = c["gate"]  # (B, T, D)
-        grad_out_flat = ttnn.mul(grad_out_gated, gate)
-
-        # sigmoid'(g) = sigmoid(g) * (1 - sigmoid(g)) = gate * (1 - gate)
-        # Use ttnn.ones_like to avoid host round-trip for creating ones tensor
-        ones_tt = ttnn.ones_like(gate)
-        sig_prime = ttnn.mul(gate, ttnn.sub(ones_tt, gate))  # (B, T, D)
-        grad_g = ttnn.mul(grad_out_gated, c["out_flat"])
-        grad_g = ttnn.mul(grad_g, sig_prime)  # (B, T, D)
+        grad_out_flat, grad_g = self._fused_gate_backward(
+            grad_out_gated, gate, c["out_flat"], B, T, D, device)
 
         # --- Backward through reshape: out_flat = reshape(permute(out_4d)) ---
         # out_4d (B, H, T, d_h) -> permute -> (B, T, H, d_h) -> reshape -> (B, T, D)
@@ -1462,14 +1680,22 @@ class TTRetentionLayer:
         grad_scores = ttnn.matmul(grad_out_4d, ttnn.transpose(c["v_4d"], -2, -1))  # (B, H, T, T)
         grad_v_4d = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_out_4d)  # (B, H, T, d_h)
 
-        # --- Backward through scores = scores_raw * D_decay ---
-        # grad_scores_raw = grad_scores * D_decay
-        # grad_D_decay = grad_scores * scores_raw
+        # --- Backward through scores = qk * scale * D_decay (fused in forward) ---
+        # grad_qk = grad_scores * scale * D  (fused kernel — same as forward)
+        # grad_D  = grad_scores * (qk * scale)  (recompute qk*scale, then mul)
         D_decay = c["D_decay"]
-        scores_raw = c["scores_raw"]
+        qk = c["qk"]
 
-        grad_scores_raw = ttnn.mul(grad_scores, D_decay)
-        grad_D_decay = ttnn.mul(grad_scores, scores_raw)  # (B, H, T, T)
+        # Fused: grad_scores * scale * D in one pass = grad w.r.t. QK^T
+        grad_scores_2d = ttnn.reshape(grad_scores, [B * H * T, T])
+        D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
+        grad_scores_scaled_2d = self._fused_scale_decay(
+            grad_scores_2d, D_decay_2d, self.scale, B, H, T, device)
+        grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+
+        # grad_D_decay = grad_scores * (qk * scale)
+        qk_scaled = ttnn.mul(qk, c["scale_tt"])
+        grad_D_decay = ttnn.mul(grad_scores, qk_scaled)  # (B, H, T, T)
 
         # --- Backward through D_decay w.r.t. gamma (log_gamma) ---
         # D[h,t,s] = exp(diff[t,s] * log_gamma[h]) for s <= t
@@ -1487,17 +1713,16 @@ class TTRetentionLayer:
         # Store as fp32 to match gamma's dtype
         grad_gamma = ttnn.typecast(grad_log_gamma, ttnn.float32)
 
-        # --- Backward through scores_raw = (Q @ K^T) * scale ---
-        grad_scores_scaled = ttnn.mul(grad_scores_raw, c["scale_tt"])
+        # grad_q_rope = grad_scores_scaled @ k_rope (split: no concat needed)
+        # grad_k_rope = grad_scores_scaled^T @ q_rope (split: no concat needed)
+        grad_rot1_q = ttnn.matmul(grad_scores_scaled, c["rot1_k"])  # (B, H, T, d_half)
+        grad_rot2_q = ttnn.matmul(grad_scores_scaled, c["rot2_k"])
+        grad_rot1_k = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), c["rot1_q"])
+        grad_rot2_k = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), c["rot2_q"])
 
-        # grad_q_rope = grad_scores_scaled @ k_rope
-        grad_q_rope = ttnn.matmul(grad_scores_scaled, c["k_rope"])  # (B, H, T, d_h)
-        # grad_k_rope = grad_scores_scaled^T @ q_rope
-        grad_k_rope = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), c["q_rope"])
-
-        # --- Backward through RoPE ---
-        grad_q_4d = self._apply_rope_backward(grad_q_rope, B, H, T)
-        grad_k_4d = self._apply_rope_backward(grad_k_rope, B, H, T)
+        # --- Backward through RoPE (split: no slice needed) ---
+        grad_q_4d = self._apply_rope_backward_split(grad_rot1_q, grad_rot2_q, B, H, T)
+        grad_k_4d = self._apply_rope_backward_split(grad_rot1_k, grad_rot2_k, B, H, T)
 
         # --- Backward through reshape: (B, H, T, d_head) -> (B, T, D) ---
         grad_q = ttnn.reshape(ttnn.permute(grad_q_4d, [0, 2, 1, 3]), [B, T, D])

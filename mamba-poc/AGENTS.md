@@ -137,6 +137,60 @@ after a killed/canceled process, reset with:
 ~/.tenstorrent-venv/bin/tt-smi -r
 ```
 
+## Current training run (2026-08-02)
+
+All three cells launched in parallel on devices 0, 1, 2 via `nohup` (safe to
+log out). Logs in `logs/cell_{a,b,c}.log`, checkpoints in `checkpoints/`.
+
+```bash
+# Launch (from repo root):
+TT_VISIBLE_DEVICES=0 nohup .tt-venv/bin/python train_ttnn.py \
+    --config configs/cell_a_tt.yaml --device 0 --checkpoint_dir checkpoints \
+    > logs/cell_a.log 2>&1 &
+# Repeat for B (device 1) and C (device 2)
+```
+
+### Early stopping
+
+Configs set `plateau_patience: 1000` (10% of max_steps) and
+`plateau_min_delta: 1.0e-3` (0.1% relative improvement). The EMA (beta=0.99)
+smooths over ~100 steps × 48 micro-batches = ~4800 samples, making it very
+stable. The old defaults (patience=500, min_delta=1e-4) were below the EMA
+noise floor — noise could reset the patience counter and early stopping
+would never trigger. The new values ensure only genuine improvements reset
+the counter.
+
+`checkpoint_interval` was increased from 25 to 100 — saving every 25 steps
+with 48 accum steps caused frequent I/O pauses.
+
+### Monitoring
+
+`monitor_training.sh` runs every 10 minutes, writing to `logs/monitor.log`.
+Reports per cell: process status, recent training steps, latest checkpoint,
+and any errors detected.
+
+```bash
+# Start monitor:
+nohup ./monitor_training.sh > logs/monitor.log 2>&1 &
+
+# Check status:
+tail -50 logs/monitor.log
+
+# Check individual cells:
+tail -20 logs/cell_a.log
+ps aux | grep train_ttnn | grep -v grep
+```
+
+### Measured step times (d_model=384, n_heads=4, T=128, micro_batch=8, accum_steps=48)
+
+| Cell | Device | Time/step | Est. total (10000 steps) |
+|---|---|---|---|
+| A | 0 | ~4.1s | ~11.4 hours |
+| B | 1 | ~4.2s | ~11.7 hours |
+| C | 2 | ~11.3s | ~31.3 hours |
+
+Cell C is ~2.7x slower due to the recurrent core (K_max=6 iterations per step).
+
 ## Deprecated Mamba-2 checkpoints (removed)
 
 `checkpoints/*.pt` (pure-PyTorch Mamba-2 ablation cells, from `model.py`/
@@ -155,3 +209,105 @@ and `run_D_v1_degenerate/` directories deleted. Config files renamed:
 `cell_d.yaml`, `cell_c_colab.yaml`, `cell_d_colab.yaml`, `cell_d_vast.yaml`)
 deleted. GPU runners (`vast_runner.py`, `colab_runner.py`, `colab_runner_ac.py`)
 marked deprecated — project moved to tt-nn on Blackhole.
+
+## Custom fused kernels (TTRetentionLayer)
+
+`TTRetentionLayer` in `model_ttnn.py` uses custom tt-metal kernels via
+`ttnn.generic_op` to fuse element-wise operations and eliminate intermediate
+DRAM writes. Kernel source files are in `kernels/`.
+
+### Fused scale + decay (`_fused_scale_decay`)
+
+Computes `scores = qk * scale * D_decay` in one kernel pass (FPU `mul_tiles`
+for `qk * D`, then SFPU `mul_unary_tile` for `* scale`). Replaces 2 `ttnn.mul`
+ops with 1 kernel. Used in both forward and backward (backward computes
+`grad_qk = grad_scores * scale * D` using the same kernel).
+
+- Kernel files: `kernels/scale_decay_{reader,compute,writer}.cpp`
+- Test: `test_scale_decay.py` (standalone kernel test)
+- Parity: `test_retention_parity.py --tile-aligned` (forward + backward)
+- The kernel requires 2D inputs `(BH*T, T)` — 4D tensors from `ttnn.matmul`
+  must be reshaped to 2D before calling `_fused_scale_decay`, then reshaped
+  back. Passing 4D tensors directly triggers a `TT_FATAL` rank assertion
+  when B=1.
+- The compute kernel includes a dummy `mul_tiles` to register 0 as an FPU
+  warm-up (Blackhole FPU init issue — first computed output is garbage
+  without it). Real result goes to register 1.
+- Cache stores `qk` (QK^T before scale) instead of the old `scores_raw`
+  (QK^T * scale). Backward recomputes `qk * scale` for `grad_D_decay`.
+
+### Fused RoPE (`_fused_rope_kernel` / `_fused_rope_4d`)
+
+Computes the full RoPE rotation in a single kernel pass:
+  `rot1 = x1*cos - x2*sin`
+  `rot2 = x1*sin + x2*cos`
+using 4 FPU `mul_tiles` (to dest regs 1-4) + 2 SFPU binary ops
+(`sub_binary_tile`, `add_binary_tile`) on dest registers. Replaces the
+previous 2-pass approach (2 kernel launches + 2 `synchronize_device` + 1
+`ttnn.sub` + 1 `ttnn.add` = 6 ops) with 1 kernel launch = 1 op.
+
+- Kernel files: `kernels/rope4d_{reader,compute,writer}.cpp`
+- Test: `test_fused_rope_single.py` (standalone kernel test, fwd + bwd)
+- Parity: `test_retention_parity.py --tile-aligned` (forward + backward)
+- The compute kernel includes a dummy `mul_tiles` to register 0 as an FPU
+  warm-up (same Blackhole FPU init issue as scale_decay). Real results go
+  to registers 1-4, then SFPU ops write rot1→reg0, rot2→reg1.
+- `mul_tiles_init` is called per CB pair inside the acquire window for
+  safety (state_configure is a no-op on Blackhole but the math init matters).
+- The reader broadcasts cos/sin over B and H via `cos_tile_id = (row %
+  T_tiles) * tiles_per_row + col`. Requires `T % 32 == 0`.
+- Backward RoPE uses the same kernel with pre-computed `_rope_neg_sin_2d`
+  (cached in `_init_rope` to avoid per-call `ttnn.neg`).
+- The built-in `ttnn.experimental.rotary_embedding` was tested but requires
+  `d_head % 64 == 0` — fails for d_head=96 (d_model=384, n_heads=4).
+  The custom kernel has no such restriction.
+- `_apply_rope` still does 2 `ttnn.slice` + concat around the kernel call
+  because d_half=48 is not tile-aligned. These contribute ~0.07ms (slices)
+  and ~0.13ms (concat) per call vs ~0.15ms for the kernel itself.
+- **Split-RoPE optimization**: `_apply_rope_split` returns (rot1, rot2)
+  without concat, and `_apply_rope_backward_split` takes pre-split grads
+  without slicing. The forward uses `qk = rot1_q@rot1_k^T + rot2_q@rot2_k^T`
+  (2 matmuls + 1 add) instead of `matmul(concat(rot1_q,rot2_q), ...)` (1
+  matmul + 1 concat). The backward uses 4 split matmuls instead of 2
+  matmuls + 2 slices. This eliminates 2 concats (forward) and 4 slices
+  (backward), replacing them with cheap matmuls. Measured: 9.4% total
+  speedup (3.2ms → 2.9ms per fwd+bwd), RoPE itself 25% faster (1.6ms →
+  1.2ms). The `_apply_rope` / `_apply_rope_backward` methods (with
+  concat/slice) are kept for the non-fused fallback path.
+
+### Fused gate backward (`_fused_gate_backward`)
+
+Computes `grad_out_flat = grad_out_gated * gate` and
+`grad_g = grad_out_gated * out_flat * gate * (1 - gate)` in a single
+kernel pass. Uses 3 FPU `mul_tiles` (gog*gate, gog*out_flat, gate*gate)
++ 1 `copy_tile` + 3 SFPU binary ops (sub for gate-gate^2, mul for
+grad_g). Replaces 6 ttnn ops (ones_like, sub, 4 muls) with 1 kernel.
+
+- Kernel files: `kernels/gate_bwd_{reader,compute,writer}.cpp`
+- Parity: `test_retention_parity.py --tile-aligned` (forward + backward)
+- **No wall-clock improvement**: the `generic_op` dispatch overhead
+  (~0.20ms) is the same as 6 individual ttnn ops (~0.03ms each = 0.18ms).
+  The kernel computation is negligible vs dispatch. Kept because it
+  reduces op count and may help with larger models where dispatch
+  overhead is amortized.
+- `ttnn.from_torch` tensors don't work with `generic_op` — they need
+  a ttnn op (e.g. `ttnn.mul(x, ones_like(x))`) to be run first. This
+  is only an issue in standalone tests; in the model, all inputs to
+  custom kernels are outputs of ttnn ops.
+
+### Cached scale_tt
+
+`_scale_tt` is created once in `__init__` as a device tensor, replacing
+a per-forward `ttnn.from_torch(torch.tensor([scale]))` call. Saves
+~0.1ms per forward pass.
+
+### Optimization ceiling
+
+The layer is at 2.9ms/fwd+bwd for d_model=384, n_heads=4, T=128, B=8.
+The remaining bottleneck is `generic_op` dispatch overhead (~0.15-0.20ms
+per call), not kernel computation. RoPE (4 calls) = 1.2ms (41%),
+scale+decay (2 calls) = 0.4ms (14%), gate backward (1 call) = 0.2ms (7%).
+Further optimization requires either:
+- A single fused kernel for the entire layer (very complex, fragile)
+- ttnn tracing/graph mode to batch dispatches (if available)
+- A larger model where compute dominates dispatch overhead
