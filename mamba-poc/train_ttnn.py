@@ -50,10 +50,11 @@ def _find_mesh_graph_descriptor():
         import importlib.util
         from pathlib import Path
         spec = importlib.util.find_spec("ttnn")
-        # Try p300 first (needed after board reset), then p150
+        # Try p150 first (works for single-device and after board reset),
+        # then p300 (needed for multi-chip fabric topologies)
         candidates = [
-            "p300_mesh_graph_descriptor.textproto",
             "p150_mesh_graph_descriptor.textproto",
+            "p300_mesh_graph_descriptor.textproto",
         ]
         for name in candidates:
             # ttnn package copy
@@ -156,14 +157,22 @@ def build_model_config(cfg: dict) -> ModelConfig:
 # ---------------------------------------------------------------------------
 
 class TTAdamW:
-    """AdamW optimizer for tt-nn tensors — fully on device.
+    """AdamW optimizer for tt-nn tensors — fully on device, mixed precision.
 
-    Uses ttnn.moreh_adamw for bf16 params (the majority).
-    Uses manual fp32 elementwise ops for fp32 params (A_log, D) since
-    moreh_adamw only supports bf16/bf8_b.
+    Maintains fp32 master copies of all parameters.  Each step:
+      1. Read fp32 master (not the bf16 model param)
+      2. Compute AdamW update in fp32
+      3. Update fp32 master
+      4. Downcast master to bf16 and write into the model
 
-    All optimizer state (exp_avg, exp_avg_sq) is kept on device.
-    No host-device transfers during the optimizer step.
+    This is the standard mixed-precision training pattern.  Without it,
+    bf16 params at magnitude O(1) or larger (gates at -2.0, norm weights
+    at 1.0) are permanently frozen: the per-step update (~1e-4) is far
+    below the bf16 ULP (~8e-3 at 1.0, ~1.6e-2 at 2.0), so downcasting
+    after each step rounds the update to zero and it never accumulates.
+
+    All optimizer state (exp_avg, exp_avg_sq, master) is kept on device
+    in fp32.  No host-device transfers during the optimizer step.
 
     Supports per-parameter LR groups via lr_groups: a dict mapping
     param name prefixes to LR multipliers. For example:
@@ -181,30 +190,42 @@ class TTAdamW:
         self.step_count = 0
 
         # Per-parameter LR groups: prefix -> multiplier
+        # Matching: if the key starts with "prefix:" it matches name.startswith(key)
+        #           if the key starts with "suffix:" it matches name.endswith(key[7:])
+        #           otherwise it matches name.startswith(key) (backward compat)
         self.lr_groups = lr_groups or {}
         self.param_lr_mult = {}  # name -> multiplier (resolved at init)
         for name in params:
             mult = 1.0
-            for prefix, prefix_mult in self.lr_groups.items():
-                if name.startswith(prefix):
+            for key, prefix_mult in self.lr_groups.items():
+                if key.startswith("suffix:"):
+                    suffix = key[7:]
+                    if name.endswith(suffix):
+                        mult = prefix_mult
+                        break
+                elif name.startswith(key):
                     mult = prefix_mult
                     break
             self.param_lr_mult[name] = mult
 
         self.param_names = list(params.keys())
         self.device = None  # set from first param
-        self.param_dtype = {}   # name -> ttnn dtype
-        self.exp_avg = {}       # name -> device tensor (same dtype as param)
-        self.exp_avg_sq = {}    # name -> device tensor (same dtype as param)
+        self.param_dtype = {}   # name -> ttnn dtype (model storage dtype, may be bf16)
+        self.exp_avg = {}       # name -> device tensor (always fp32)
+        self.exp_avg_sq = {}    # name -> device tensor (always fp32)
+        self.master = {}        # name -> fp32 master copy on device
 
         for name, tt_tensor in params.items():
             if self.device is None:
                 self.device = tt_tensor.device()
-            dtype = tt_tensor.dtype
-            self.param_dtype[name] = dtype
+            self.param_dtype[name] = tt_tensor.dtype
             shape = tuple(tt_tensor.shape)
-            self.exp_avg[name] = ttnn.zeros(shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
-            self.exp_avg_sq[name] = ttnn.zeros(shape, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+            # Optimizer state always in fp32
+            self.exp_avg[name] = ttnn.zeros(shape, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+            self.exp_avg_sq[name] = ttnn.zeros(shape, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+            # fp32 master copy — upcast from model's dtype
+            self.master[name] = ttnn.typecast(tt_tensor, ttnn.float32) \
+                if tt_tensor.dtype != ttnn.float32 else tt_tensor
 
     def set_lr(self, lr: float):
         self.lr = lr
@@ -214,10 +235,10 @@ class TTAdamW:
         return self.lr * self.param_lr_mult.get(name, 1.0)
 
     def step(self, grads: dict, model: TTMambaWorkspaceModel):
-        """Apply one optimizer step — fully on device.
+        """Apply one optimizer step — fully on device, fp32 master weights.
 
         grads: dict of name -> tt-nn gradient tensor
-        model: the model (to update its parameters)
+        model: the model (to update its bf16 parameters)
         """
         self.step_count += 1
         device = self.device
@@ -227,56 +248,46 @@ class TTAdamW:
                 continue
 
             grad = grads[name]
-            dtype = self.param_dtype[name]
-            m = self.exp_avg[name]
-            v = self.exp_avg_sq[name]
+            storage_dtype = self.param_dtype[name]
+            m = self.exp_avg[name]     # fp32
+            v = self.exp_avg_sq[name]  # fp32
+            param = self.master[name]  # fp32 master
 
-            if dtype == ttnn.float32:
-                # Manual fp32 AdamW (moreh_adamw doesn't support fp32)
-                # Typecast grad to fp32 if needed
-                if grad.dtype != ttnn.float32:
-                    grad = ttnn.typecast(grad, ttnn.float32)
-                param = model.get_params()[name]  # current param on device
-                lr = self.get_param_lr(name)
-                b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
-                # m = b1*m + (1-b1)*g
-                m = ttnn.add(ttnn.mul(m, b1), ttnn.mul(grad, 1.0 - b1))
-                # v = b2*v + (1-b2)*g^2
-                g_sq = ttnn.mul(grad, grad)
-                v = ttnn.add(ttnn.mul(v, b2), ttnn.mul(g_sq, 1.0 - b2))
-                # bias correction
-                bc1 = 1.0 - b1 ** self.step_count
-                bc2 = 1.0 - b2 ** self.step_count
-                m_hat = ttnn.mul(m, 1.0 / bc1)
-                v_hat = ttnn.mul(v, 1.0 / bc2)
-                # param -= lr * m_hat / (sqrt(v_hat) + eps)
-                update = ttnn.div(m_hat, ttnn.add(ttnn.sqrt(v_hat), eps))
-                param = ttnn.sub(param, ttnn.mul(update, lr))
-                # weight decay
-                param = ttnn.mul(param, 1.0 - lr * wd)
-                # Store updated state
-                self.exp_avg[name] = m
-                self.exp_avg_sq[name] = v
+            # Upcast grad to fp32 if needed
+            if grad.dtype != ttnn.float32:
+                grad = ttnn.typecast(grad, ttnn.float32)
+
+            lr = self.get_param_lr(name)
+            b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
+
+            # m = b1*m + (1-b1)*g
+            m = ttnn.add(ttnn.mul(m, b1), ttnn.mul(grad, 1.0 - b1))
+            # v = b2*v + (1-b2)*g^2
+            g_sq = ttnn.mul(grad, grad)
+            v = ttnn.add(ttnn.mul(v, b2), ttnn.mul(g_sq, 1.0 - b2))
+            # bias correction
+            bc1 = 1.0 - b1 ** self.step_count
+            bc2 = 1.0 - b2 ** self.step_count
+            m_hat = ttnn.mul(m, 1.0 / bc1)
+            v_hat = ttnn.mul(v, 1.0 / bc2)
+            # param -= lr * m_hat / (sqrt(v_hat) + eps)
+            update = ttnn.div(m_hat, ttnn.add(ttnn.sqrt(v_hat), eps))
+            param = ttnn.sub(param, ttnn.mul(update, lr))
+            # weight decay
+            param = ttnn.mul(param, 1.0 - lr * wd)
+
+            # Store updated optimizer state (fp32)
+            self.exp_avg[name] = m
+            self.exp_avg_sq[name] = v
+            # Update fp32 master
+            self.master[name] = param
+
+            # Downcast master to model's storage dtype and write into model
+            if storage_dtype != ttnn.float32:
+                param_bf16 = ttnn.typecast(param, storage_dtype)
             else:
-                # bf16: use ttnn.moreh_adamw
-                # Typecast grad to bf16 if needed (e.g. fp32 grad for A_log)
-                if grad.dtype != ttnn.bfloat16:
-                    grad = ttnn.typecast(grad, ttnn.bfloat16)
-                param = model.get_params()[name]
-                lr = self.get_param_lr(name)
-                result = ttnn.moreh_adamw(
-                    param, grad, m, v,
-                    lr=lr, beta1=self.beta1, beta2=self.beta2,
-                    eps=self.eps, weight_decay=self.weight_decay,
-                    step=self.step_count,
-                )
-                # result = [param_out, exp_avg_out, exp_avg_sq_out, max_exp_avg_sq_out]
-                param = result[0]
-                self.exp_avg[name] = result[1]
-                self.exp_avg_sq[name] = result[2]
-
-            # Update model parameter in-place
-            self._set_model_param(model, name, param)
+                param_bf16 = param
+            self._set_model_param(model, name, param_bf16)
 
     def _set_model_param(self, model: TTMambaWorkspaceModel, name: str, param: "ttnn.Tensor"):
         """Update a model parameter from a device tensor (no transfer)."""
@@ -303,21 +314,54 @@ class TTAdamW:
             "lr": self.lr,
             "exp_avg": {k: ttnn.to_torch(v).clone() for k, v in self.exp_avg.items()},
             "exp_avg_sq": {k: ttnn.to_torch(v).clone() for k, v in self.exp_avg_sq.items()},
+            "master": {k: ttnn.to_torch(v).clone() for k, v in self.master.items()},
         }
 
+    def sync_master_from_model(self, model: TTMambaWorkspaceModel, names: set = None):
+        """Re-sync fp32 master copies from the model's current parameters.
+
+        Call this after any operation that modifies model parameters outside
+        the optimizer (e.g. slot normalization, spectral normalization, gate
+        schedule).  Without this, the master would diverge from the model and
+        the next optimizer step would overwrite the normalization.
+
+        Args:
+            names: if given, only sync these param names.  If None, sync all.
+                   Use a restricted set to avoid clobbering sub-ULP fp32
+                   accumulation on params that weren't modified externally.
+        """
+        model_params = model.get_params()
+        for name in self.param_names:
+            if name in model_params and (names is None or name in names):
+                p = model_params[name]
+                self.master[name] = ttnn.typecast(p, ttnn.float32) \
+                    if p.dtype != ttnn.float32 else p
+
     def load_state(self, state: dict, model: TTMambaWorkspaceModel):
-        """Load optimizer state from checkpoint (transfers to device)."""
+        """Load optimizer state from checkpoint (transfers to device, in fp32)."""
         self.step_count = state.get("step_count", 0)
         self.lr = state.get("lr", self.base_lr)
         for name in self.param_names:
             if name in state.get("exp_avg", {}):
                 host_m = state["exp_avg"][name]
                 self.exp_avg[name] = ttnn.from_torch(
-                    host_m, dtype=self.param_dtype[name], layout=ttnn.TILE_LAYOUT, device=self.device)
+                    host_m.float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
             if name in state.get("exp_avg_sq", {}):
                 host_v = state["exp_avg_sq"][name]
                 self.exp_avg_sq[name] = ttnn.from_torch(
-                    host_v, dtype=self.param_dtype[name], layout=ttnn.TILE_LAYOUT, device=self.device)
+                    host_v.float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+            if name in state.get("master", {}):
+                host_master = state["master"][name]
+                self.master[name] = ttnn.from_torch(
+                    host_master.float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+            elif name in state.get("exp_avg", {}):
+                # Backward compat: no master in old checkpoint — reconstruct
+                # from model params (upcast to fp32).  Loses sub-ULP accumulation
+                # but is the best we can do.
+                model_params = model.get_params()
+                if name in model_params:
+                    self.master[name] = ttnn.typecast(model_params[name], ttnn.float32) \
+                        if model_params[name].dtype != ttnn.float32 else model_params[name]
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +585,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     warmup_steps = cfg.get("warmup_steps", 200)
     weight_decay = cfg.get("weight_decay", 0.1)
     grad_clip = cfg.get("grad_clip", 1.0)
+    grad_norm_spike_threshold = cfg.get("grad_norm_spike_threshold", 500.0)
     depth_range = tuple(cfg.get("depth_range", [2, 8]))
     seed = cfg.get("seed", 42)
     eval_interval = cfg.get("eval_interval", 500)
@@ -628,7 +673,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     print(f"  seq_len={seq_len}, tokens_per_batch={tokens_per_batch}", flush=True)
     print(f"  effective_tokens/step={effective_tokens}", flush=True)
     print(f"  lr={base_lr}, warmup={warmup_steps}, weight_decay={weight_decay}, "
-          f"grad_clip={grad_clip}", flush=True)
+          f"grad_clip={grad_clip}, grad_spike={grad_norm_spike_threshold}", flush=True)
     print(f"  max_steps={max_steps}", flush=True)
     if profile:
         print(f"  Profiling: ENABLED", flush=True)
@@ -656,6 +701,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     profiler = Profiler()
     total_time = 0
     total_tokens = 0
+    skipped_steps = 0
 
     for step in range(start_step, max_steps):
         t_step_start = time.time()
@@ -669,6 +715,10 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         # enough to generate gradient signal for learning content-addressed routing.
         # After gate_schedule_steps, the optimizer controls the gates freely.
         model.apply_gate_schedule(step, gate_schedule_steps, gate_init_val)
+        # Sync master if gate schedule was applied (it modifies model params
+        # directly, and the optimizer reads from the fp32 master).
+        if gate_schedule_steps > 0 and step < gate_schedule_steps:
+            optimizer.sync_master_from_model(model)
 
         # Gradient accumulation
         accum_grads = {}  # host-side accumulated gradients
@@ -749,17 +799,58 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             else:
                 grad_norm = clip_grad_norm(tt_grads, grad_clip)
 
-        # Optimizer step
-        if profile:
-            with profiler.time_section("optimizer"):
-                optimizer.step(tt_grads, model)
+        # Skip-on-spike: if the pre-clip gradient norm exceeds a threshold,
+        # skip the optimizer step entirely.  This prevents gradient explosion
+        # from corrupting the model — when one parameter (e.g. retention gamma)
+        # dominates the gradient norm, clipping scales ALL gradients by 1/norm,
+        # starving every other parameter of update signal.  Skipping the step
+        # preserves the model state and lets the next batch's (hopefully smaller)
+        # gradient make progress.  The default threshold of 500 is high enough
+        # to tolerate Cell A's natural grad norm (~245-395 from token embeddings)
+        # while catching genuine explosions (Cell B/C reached 25,000+ and 10^14).
+        skip_step = grad_norm_spike_threshold > 0 and grad_norm > grad_norm_spike_threshold
+        if skip_step:
+            print(f"  *** SKIP step {step}: grad_norm {grad_norm:.1f} > "
+                  f"threshold {grad_norm_spike_threshold:.0f} — skipping optimizer step ***",
+                  flush=True)
+            skipped_steps += 1
         else:
-            optimizer.step(tt_grads, model)
+            # Optimizer step
+            if profile:
+                with profiler.time_section("optimizer"):
+                    optimizer.step(tt_grads, model)
+            else:
+                optimizer.step(tt_grads, model)
 
-        # Normalize workspace slot parameters after each optimizer step.
-        # This prevents unbounded slot growth which causes attention sharpening
-        # and gradient explosion. No-op for cells without a workspace.
-        model.normalize_workspace_slots()
+            # Normalize workspace slot parameters after each optimizer step.
+            # This prevents unbounded slot growth which causes attention sharpening
+            # and gradient explosion. No-op for cells without a workspace.
+            model.normalize_workspace_slots()
+            # Re-sync fp32 master copies for the params that normalization touched
+            # (slots + 8 workspace weight matrices).  Only sync these — syncing all
+            # params would clobber the sub-ULP fp32 accumulation on gates, decay,
+            # and norm weights, re-freezing them.
+            if model.workspace is not None:
+                _ws_norm_names = {"ws_slots"} | {
+                    f"ws_{p}" for p in (
+                        "read_q_weight", "read_k_weight", "read_v_weight", "read_out_weight",
+                        "write_q_weight", "write_k_weight", "write_v_weight", "write_out_weight",
+                    )
+                }
+                optimizer.sync_master_from_model(model, names=_ws_norm_names)
+
+            # Clamp retention layer log-gamma to <= -0.02 (gamma <= 0.98).
+            # When gamma > 1.0, the decay matrix D[t,s] = gamma^(t-s) becomes
+            # exponentially growing, causing gradient explosion.  Even gamma = 1.0
+            # is unstable — the O(T^2) gamma gradient dominates the clip.  The
+            # -0.02 clamp ensures D decays (D[127]=0.077), reducing the gradient
+            # ~10x.  This is a mathematical stability constraint, not regularization.
+            model.clamp_retention_gammas()
+            # Re-sync fp32 master for any gammas that were clamped
+            _gamma_names = {f"layer_{i}_gamma" for i in range(len(model.layers))
+                            if hasattr(model.layers[i].layer, 'gamma')}
+            if _gamma_names:
+                optimizer.sync_master_from_model(model, names=_gamma_names)
 
         t_step_end = time.time()
         step_time = t_step_end - t_step_start
@@ -821,6 +912,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     print(f"Avg step: {total_time/(max_steps-start_step):.2f}s", flush=True)
     print(f"Avg throughput: {avg_tokens_per_sec:.0f} tokens/sec", flush=True)
     print(f"Total tokens: {total_tokens:,}", flush=True)
+    if skipped_steps > 0:
+        print(f"Skipped steps (grad spike): {skipped_steps}", flush=True)
     ttnn.close_device(device)
     print("Training complete.", flush=True)
 

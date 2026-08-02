@@ -2954,6 +2954,39 @@ class TTMambaWorkspaceModel:
             self.workspace.normalize_slots()
             self.workspace.spectral_normalize_weights()
 
+    def clamp_retention_gammas(self, max_log_gamma: float = -0.02):
+        """Clamp retention layer log-gamma to <= max_log_gamma after each optimizer step.
+
+        The retention decay matrix is D[t,s] = gamma^(t-s).  When gamma > 1.0,
+        D becomes exponentially growing instead of decaying, causing attention
+        scores and gradients to explode.  This is a mathematical stability
+        constraint, not regularization: the retention layer is definitionally a
+        decay mechanism, and gamma > 1 turns it into an unstable amplifier.
+
+        Even gamma = 1.0 (log_gamma = 0) is unstable: D = 1 for all positions
+        means no decay, and the gamma gradient (a sum over T*T terms weighted
+        by diff[t,s]) becomes O(T^2) — ~128x larger than weight matrix gradients
+        (O(T) sums).  This gradient dominates the global clip, starving all
+        other parameters of update signal.
+
+        The default clamp at -0.02 (gamma <= 0.98) ensures D decays:
+          D[127] = 0.98^127 = 0.077  (vs 1.0 at gamma=1.0)
+        This attenuates the gamma gradient by ~10x, preventing domination.
+
+        gamma is stored as log(gamma) in fp32, so clamping at max_log_gamma
+        gives gamma <= exp(max_log_gamma).
+        """
+        for layer in self.layers:
+            inner = layer.layer
+            if hasattr(inner, 'gamma'):
+                # gamma is fp32 (n_heads,) on device; clamp log_gamma <= max_log_gamma
+                g_host = ttnn.to_torch(inner.gamma).float()  # (n_heads,)
+                clamped = g_host.clamp(max=max_log_gamma)
+                if not torch.equal(g_host, clamped):
+                    inner.gamma = ttnn.from_torch(
+                        clamped, dtype=ttnn.float32,
+                        layout=ttnn.TILE_LAYOUT, device=inner.gamma.device())
+
     def apply_gate_schedule(self, step: int, gate_schedule_steps: int, gate_init_val: float):
         """Force workspace gates open on a schedule.
 

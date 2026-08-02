@@ -38,6 +38,12 @@ lr_groups:
   ws_read_gate: 10.0
   ws_write_gate: 10.0
   ws_: 0.25
+  # Retention gamma gets 0.01x LR.  The gamma gradient is a sum over T*T
+  # terms (O(T^2) = 16K terms), while weight matrix gradients are O(T) sums.
+  # This ~128x gradient scale mismatch causes gamma to dominate the gradient
+  # clip, starving all other parameters.  The 0.01x LR compensates for this
+  # scale difference, allowing gamma to update at a comparable effective rate.
+  "suffix:_gamma": 0.01
 max_steps: 10000
 tokens_per_batch: 50000
 seq_len: 128
@@ -69,4 +75,4 @@ run_name: cellB-tt-seed1
 
 # Checkpointing — local only (no Google Drive on QB2)
 ckpt_dir: checkpoints
-resume: true
+resume: false

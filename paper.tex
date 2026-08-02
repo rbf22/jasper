@@ -25,13 +25,13 @@
     linkcolor=blue!60!black,
     citecolor=blue!60!black,
     urlcolor=blue!60!black,
-    pdftitle={Jasper: Engineering a Global Workspace for Latent Reasoning in Hybrid State-Space Models},
+    pdftitle={Jasper: Engineering a Global Workspace for Latent Reasoning in Hybrid Retention Models},
     pdfauthor={Jasper Research}
 }
 
 % ── Title ─────────────────────────────────────────────────────────────────
 \title{\textbf{Jasper: Engineering a Global Workspace for Latent Reasoning\\
-in Hybrid State-Space Models}}
+in Hybrid Retention Models}}
 \author{Jasper Research Project}
 \date{August 2026}
 
@@ -46,7 +46,7 @@ in Hybrid State-Space Models}}
 
 \begin{abstract}
 \noindent
-Recent work from Anthropic has revealed that language models develop a compact, privileged internal workspace---the \jspace{}---that causally carries multi-step reasoning, while Samsung's Tiny Recursive Model (TRM) has demonstrated that iterative refinement through a tiny recurrent network can substitute for parameter count on hard reasoning tasks. We present Jasper, an architecture that combines these two insights into a single system: a hybrid state-space/attention backbone with an explicitly engineered workspace module and a recurrent core that iterates on the workspace state. The key architectural observation is that the SSM's fixed-size compressed state is functionally shaped like the \jspace{}---a coincidence that makes the combination more powerful than applying the same ideas to a pure transformer. The implementation uses a decayed linear attention (retention) layer in place of the original selective scan, preserving the key property---a fixed-size, input-dependent state---while being simpler and faster on the target hardware. We argue that this approach is a direct and more efficient alternative to chain-of-thought ``thinking tokens'': it reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and allows trading inference-time compute depth for parameter count. We describe a proof-of-concept experiment that trains three parameter-matched model variants on synthetic reasoning tasks with controllable depth, and outline the pre-registered criteria for a go/no-go decision on scaling.
+Recent work from Anthropic has revealed that language models develop a compact, privileged internal workspace---the \jspace{}---that causally carries multi-step reasoning, while Samsung's Tiny Recursive Model (TRM) has demonstrated that iterative refinement through a tiny recurrent network can substitute for parameter count on hard reasoning tasks. We present Jasper, an architecture that combines these two insights into a single system: a hybrid retention/attention backbone with an explicitly engineered workspace module and a recurrent core that iterates on the workspace state. The key architectural observation is that the retention layer's fixed-size compressed state is functionally shaped like the \jspace{}---a coincidence that makes the combination more powerful than applying the same ideas to a pure transformer. The retention layer (decayed linear attention) preserves the key property---a fixed-size, input-dependent state---while being simple and fast on the target hardware. We argue that this approach is a direct and more efficient alternative to chain-of-thought ``thinking tokens'': it reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and allows trading inference-time compute depth for parameter count. We describe a proof-of-concept experiment that trains three parameter-matched model variants on synthetic reasoning tasks with controllable depth, and outline the pre-registered criteria for a go/no-go decision on scaling.
 \end{abstract}
 
 \tableofcontents
@@ -60,7 +60,7 @@ Large language models have demonstrated impressive reasoning capabilities, but t
 
 Two recent findings suggest an alternative path. First, Anthropic's discovery of the \jspace{} \citep{anthropic2026jspace} revealed that the reasoning-critical machinery inside a language model is already small: a compact set of verbalizable representations, occupying less than 10\% of activation variance, carries the causal bulk of multi-step reasoning. This workspace is not the full residual stream---it is a privileged, broadcasted subset that functions analogously to the global workspace in cognitive science \citep{baars2005global}. Second, Samsung's Tiny Recursive Model (TRM) \citep{jolicoeur2025trm} and Geiping et al.'s recurrent-depth transformers \citep{geiping2025recurrent} have shown that iterative refinement through a small recurrent network can substitute for parameter count: a 7M-parameter model recursing on itself can outperform models with $1000\times$ more parameters on reasoning benchmarks.
 
-Jasper combines these insights. We engineer an explicit workspace module---a compact set of learned slot vectors that serve as a persistent scratchpad---and pair it with a recurrent core that iterates on the workspace state. The backbone is a hybrid state-space/attention model. The original design used Mamba-2's selective state-space duality (SSD) \citep{dao2024mamba2}; the current implementation uses a decayed linear attention (retention) layer that preserves the key property---a fixed-size, input-dependent compressed state---while being simpler and faster on the target hardware (Tenstorrent Blackhole). The SSM state is functionally shaped like the \jspace{}: the architecture already has a mechanism that resembles the global workspace, so the engineered workspace and the SSM state reinforce each other rather than competing for the same functional role.
+Jasper combines these insights. We engineer an explicit workspace module---a compact set of learned slot vectors that serve as a persistent scratchpad---and pair it with a recurrent core that iterates on the workspace state. The backbone is a hybrid retention/attention model. The retention layer (decayed linear attention \citep{sun2024retention}) maintains a fixed-size, input-dependent compressed state---the key property that makes it functionally shaped like the \jspace{}. The architecture already has a mechanism that resembles the global workspace, so the engineered workspace and the retention state reinforce each other rather than competing for the same functional role.
 
 The result is a model that reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and can trade inference-time compute (more loop iterations) for parameter count. We argue that this is a direct alternative to thinking tokens---one that is more memory-efficient, faster, and potentially more capable of reasoning that is not easily expressed in words.
 
@@ -93,59 +93,54 @@ Independently, \citet{geiping2025recurrent} demonstrated that recurrent-depth tr
 Both works share a key insight: \emph{depth (iterations) can substitute for width (parameters)}. But both use attention-based cores, which means the key-value cache grows with sequence length, and the recurrent state is carried in the residual stream---a high-dimensional, unstructured representation.
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Mamba-2 and State Space Duality}
+\subsection{Retention: Decayed Linear Attention}
 
-\citet{dao2024mamba2} established the state space duality (SSD) framework, showing that Mamba's selective state-space model is closely related to attention through a shared mathematical structure. The Mamba-2 layer computes:
+\citet{sun2024retention} introduced the Retentive Network (RetNet), which replaces standard attention's softmax normalization with a decayed linear attention formulation. The retention layer computes:
 
-\begin{equation}
-    y_t = \sum_{s \leq t} \underbrace{\exp\!\Big(\!\!-\!\sum_{k=s+1}^{t} a_k\Big)}_{\text{decay}} \cdot \big(C_t^\top B_s\big) \cdot V_s
-\end{equation}
-
-where $B_s, C_t$ are input-dependent projections, $a_k$ is a scalar decay, and $V_s$ is the value vector. This can be viewed as a form of attention with a learned, position-dependent decay mask---the ``selective scan.''
-
-The key property for our purposes is that the SSM maintains a \textbf{fixed-size state} $\mathbf{h}_t$ that is updated at each position:
-
-\begin{equation}
-    \mathbf{h}_t = \bar{A}_t \mathbf{h}_{t-1} + \bar{B}_t x_t
-\end{equation}
-
-where $\bar{A}_t, \bar{B}_t$ are discretized state transition matrices. This state is \textbf{compressed}: it has a fixed dimension $d_{\text{state}}$ regardless of sequence length, and it is \textbf{selective}: the input-dependent gates control what information is written and what is forgotten. This is functionally analogous to the \jspace{}---a small, privileged state that carries task-relevant information forward through the computation.
-
-\paragraph{From Mamba-2 to retention (Mamba-3).}
-The current implementation replaces the selective scan with a decayed linear attention (retention) layer, which we refer to as ``Mamba-3'' in the codebase. The retention layer computes:
 \begin{equation}
     y_t = \sum_{s \leq t} \gamma^{t-s} \cdot (C_t^\top B_s) \cdot V_s
 \end{equation}
-where $\gamma \in (0, 1)$ is a learned per-head decay scalar. This preserves the key properties of the SSM state---fixed-size, input-dependent, compressed---while replacing the input-dependent decay $a_k$ with a simpler learned scalar $\gamma$. The decay matrix $D[t,s] = \gamma^{t-s}$ is computed on-device. This change was motivated by hardware constraints: the selective scan's causal conv1d is not well-supported on ttnn, while the retention formulation is pure matmuls. The backward pass (gradient of the loss w.r.t.\ $\gamma$) is computed via a row-sum/col-sum reduction of the $T \times T$ decay matrix, also on-device.
+
+where $B_s, C_t$ are input-dependent projections, $V_s$ is the value vector, and $\gamma \in (0, 1)$ is a learned per-head decay scalar. This is equivalent to attention with a learned exponential decay mask $D[t,s] = \gamma^{t-s}$ in place of softmax normalization.
+
+The key property for our purposes is that the retention layer maintains a \textbf{fixed-size state} $\mathbf{h}_t$ that is updated at each position:
+
+\begin{equation}
+    \mathbf{h}_t = \gamma \, \mathbf{h}_{t-1} + B_t^\top V_t
+\end{equation}
+
+This state is \textbf{compressed}: it has a fixed dimension regardless of sequence length, and it is \textbf{input-dependent}: the projections $B_t, V_t$ are computed from the current input. This is functionally analogous to the \jspace{}---a small, privileged state that carries task-relevant information forward through the computation. The decay $\gamma$ provides a natural forgetting mechanism: old information fades unless actively reinforced by new inputs, preventing unbounded state growth.
+
+The retention formulation is pure matrix multiplications (no selective scan or causal conv1d), which makes it well-suited to the Tenstorrent Blackhole hardware. The backward pass (gradient of the loss w.r.t.\ $\gamma$) is computed via a row-sum/col-sum reduction of the $T \times T$ decay matrix, on-device.
 
 % ══════════════════════════════════════════════════════════════════════════
-\section{The SSM Coincidence}
+\section{The Retention Coincidence}
 \label{sec:coincidence}
 % ══════════════════════════════════════════════════════════════════════════
 
-The central architectural observation behind Jasper is what we call the \emph{SSM coincidence}: the state-space model's compressed state already maintains a representation with the functional shape of the \jspace{}, without any engineering. The observation was originally made for Mamba-2's selective scan; the current retention-based implementation preserves it. Consider the parallels:
+The central architectural observation behind Jasper is what we call the \emph{retention coincidence}: the retention layer's compressed state already maintains a representation with the functional shape of the \jspace{}, without any engineering. Consider the parallels:
 
 \begin{table}[h]
 \centering
 \small
 \begin{tabularx}{\textwidth}{p{0.22\textwidth} p{0.36\textwidth} p{0.36\textwidth}}
 \toprule
-\textbf{Property} & \textbf{J-space (Anthropic)} & \textbf{SSM State (Mamba-2 / Retention)} \\
+\textbf{Property} & \textbf{J-space (Anthropic)} & \textbf{Retention State} \\
 \midrule
 Fixed size & $\sim$25 concepts, $<$10\% of activation variance & $d_{\text{state}}=64$ per head, regardless of sequence length \\
-Selective & Broadcasted more widely than other representations & Input-dependent gates control write/forget \\
+Selective & Broadcasted more widely than other representations & Input-dependent projections control write/forget \\
 Persistent & Carries intermediate reasoning steps across layers & Carries information across the sequence \\
 Causally responsible & Ablation destroys multi-step reasoning & Removing state connections breaks long-range dependencies \\
 Emerges in training & Not designed, emerged in Claude & Not designed for reasoning, emerged from language modeling \\
 \bottomrule
 \end{tabularx}
-\caption{Functional parallel between the \jspace{} and the SSM state (Mamba-2 selective scan or retention).}
+\caption{Functional parallel between the \jspace{} and the retention state.}
 \label{tab:coincidence}
 \end{table}
 
-This parallel is not merely metaphorical. When we build a hybrid model with SSM layers and an explicit workspace module, the SSM's compressed state and the workspace slots \emph{reinforce each other}: the SSM state provides a natural substrate for the workspace to read from and write to, and the workspace provides a structured, interpretable interface to the SSM's otherwise opaque state. In a pure transformer, the workspace must carve out its role from the residual stream against the competing pressure of attention's global mixing. In a hybrid SSM model, the workspace aligns with an existing architectural feature.
+This parallel is not merely metaphorical. When we build a hybrid model with retention layers and an explicit workspace module, the retention state and the workspace slots \emph{reinforce each other}: the retention state provides a natural substrate for the workspace to read from and write to, and the workspace provides a structured, interpretable interface to the retention layer's otherwise opaque state. In a pure transformer, the workspace must carve out its role from the residual stream against the competing pressure of attention's global mixing. In a hybrid retention model, the workspace aligns with an existing architectural feature.
 
-The coincidence becomes powerful when combined with a recurrent core. In a recurrent transformer \citep{geiping2025recurrent}, each iteration processes the full sequence with attention, growing the KV cache. In a recurrent SSM model, each iteration updates the SSM state in-place---memory is flat in both sequence length \emph{and} loop count. The workspace state, carried between iterations, provides a stable anchor for iterative refinement without any memory growth.
+The coincidence becomes powerful when combined with a recurrent core. In a recurrent transformer \citep{geiping2025recurrent}, each iteration processes the full sequence with attention, growing the KV cache. In a recurrent retention model, each iteration updates the retention state in-place---memory is flat in both sequence length \emph{and} loop count. The workspace state, carried between iterations, provides a stable anchor for iterative refinement without any memory growth.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Architecture}
@@ -158,7 +153,7 @@ The coincidence becomes powerful when combined with a recurrent core. In a recur
 The Jasper architecture combines four components:
 
 \begin{enumerate}[nosep]
-    \item \textbf{Retention (Mamba-3) layers} for sequence processing with flat memory. The retention layer uses decayed linear attention with a learned per-head decay scalar $\gamma$, preserving the SSM's fixed-size compressed state while being pure matmuls (no selective scan or causal conv1d).
+    \item \textbf{Retention layers} for sequence processing with flat memory. The retention layer uses decayed linear attention with a learned per-head decay scalar $\gamma$, maintaining a fixed-size compressed state while being pure matmuls.
     \item \textbf{Attention layers} at selected positions for exact retrieval capability.
     \item \textbf{Workspace module} --- a perceiver-style cross-attention block with learned slot vectors.
     \item \textbf{Recurrent core} --- a range of layers that are iterated $K$ times, with the workspace state carried between iterations.
@@ -241,7 +236,7 @@ At inference time, $K$ can be chosen freely---this is the test-time compute scal
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Hybrid Backbone}
 
-The full model uses 13--14 layers total, with attention inserted at positions 5 and 10. The attention layers provide exact retrieval capability---a known weakness of pure SSMs \citep{arora2024theoretical}---while the retention layers provide efficient sequence processing with flat memory. The hybrid ratio ($\sim$85\% SSM, $\sim$15\% attention) follows the empirical finding that a minority of attention layers recovers most of the retrieval gap while preserving the throughput and memory advantages of SSMs.
+The full model uses 13--14 layers total, with attention inserted at positions 5 and 10. The attention layers provide exact retrieval capability---a known weakness of pure retention models \citep{arora2024theoretical}---while the retention layers provide efficient sequence processing with flat memory. The hybrid ratio ($\sim$85\% retention, $\sim$15\% attention) follows the empirical finding that a minority of attention layers recovers most of the retrieval gap while preserving the throughput and memory advantages.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Comparison to Thinking Tokens}
@@ -258,7 +253,7 @@ The dominant approach to scaling reasoning in language models is chain-of-though
 \textbf{Property} & \textbf{Thinking Tokens (CoT)} & \textbf{Workspace Recurrence (Jasper)} \\
 \midrule
 Reasoning medium & Token space (discrete, serial) & Latent space (continuous, parallel) \\
-Memory growth & Linear in reasoning length (KV cache) & Flat (fixed workspace + SSM state) \\
+Memory growth & Linear in reasoning length (KV cache) & Flat (fixed workspace + retention state) \\
 Tokens generated & One per reasoning step & Zero---reasoning is internal \\
 Legibility & Fully legible (readable text) & Partially legible (workspace probes) \\
 Compute control & Number of generated tokens & Number of loop iterations $K$ \\
@@ -275,7 +270,7 @@ The key distinction is that thinking tokens reason in \emph{token space}---the m
 
 Workspace recurrence reasons in \emph{latent space}---the workspace state is updated in-place through matrix operations, without generating any tokens. This is faster (one forward pass per iteration, not per token), memory-flat (the workspace has a fixed size regardless of reasoning depth), and can capture reasoning patterns that are not easily expressed in words. The trade-off is legibility: thinking tokens produce readable traces, while workspace reasoning is only partially legible through probes (see \Cref{sec:experiments}).
 
-For deployment on constrained devices (web browsers, mobile phones), the memory advantage is decisive. A model that generates 1000 thinking tokens accumulates a KV cache of $\sim$1000 $\times$ $d_{\text{model}}$ $\times$ $n_{\text{layers}}$ floats. A model that iterates its workspace 100 times uses the same fixed workspace state ($m \times d$ floats) plus the SSM state ($d_{\text{state}} \times d$ floats), regardless of $K$.
+For deployment on constrained devices (web browsers, mobile phones), the memory advantage is decisive. A model that generates 1000 thinking tokens accumulates a KV cache of $\sim$1000 $\times$ $d_{\text{model}}$ $\times$ $n_{\text{layers}}$ floats. A model that iterates its workspace 100 times uses the same fixed workspace state ($m \times d$ floats) plus the retention state ($d_{\text{state}} \times d$ floats), regardless of $K$.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Experimental Design}
@@ -304,7 +299,7 @@ C & Full architecture (hybrid + workspace + layers 6--9 looped $K$ times) & The 
 \end{table}
 
 \paragraph{Cell history.}
-The original design used a four-cell grid (A=pure Mamba-2, B=hybrid, C=hybrid+workspace, D=hybrid+workspace+recurrent) plus a learning-rate control (E). The pure-Mamba-2 cells (old A, old B) were deprecated after they plateaued at 0\% Task 1 accuracy, and the remaining cells were renamed: old E$\to$A, old C$\to$B, old D$\to$C. The SSM layer was also changed from Mamba-2's selective scan to a retention (decayed linear attention) layer, as described in \Cref{sec:coincidence}. The comparison logic is now: \textbf{B vs A} isolates the workspace effect (same LR=$2 \times 10^{-4}$); \textbf{C vs B} isolates the recurrent core; \textbf{C vs A} is the full R1 test.
+The design was refined from an initial four-cell grid to the current three-cell ladder after preliminary experiments showed that the pure-backbone and high-LR variants plateaued on Task 1 without contributing additional signal. The comparison logic is: \textbf{B vs A} isolates the workspace effect (same LR=$2 \times 10^{-4}$); \textbf{C vs B} isolates the recurrent core; \textbf{C vs A} is the full R1 test.
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Training Configuration}
@@ -321,23 +316,26 @@ An EMA-smoothed loss plateau detector stops training if the loss does not improv
 \paragraph{Per-parameter LR groups.}
 The workspace parameters ($\sim$2M of $\sim$10M total) receive $0.25\times$ the base learning rate ($5 \times 10^{-5}$ vs $2 \times 10^{-4}$ for the backbone). This is motivated by the observation that the workspace creates a sharper loss landscape: at equal LR, workspace gradients dominate and cause instability. The backbone LR is kept at $2 \times 10^{-4}$ to match Cell A (the control), preserving the clean B-vs-A comparison. Gate parameters (read/write gates) receive $10\times$ the workspace LR ($2 \times 10^{-3}$) so they open fast enough to contribute within the training budget.
 
-\paragraph{Four stabilization techniques.}
-The workspace and recurrent core introduce four sources of gradient instability that are not present in the baseline hybrid model. We address each with a targeted normalization:
+\paragraph{Seven stabilization techniques.}
+The workspace and recurrent core introduce several sources of gradient instability that are not present in the baseline hybrid model. We address each with a targeted normalization:
 
 \begin{enumerate}[nosep]
     \item \textbf{Per-parameter LR groups} (above): workspace parameters receive $0.25\times$ the base LR, preventing the workspace from dominating the gradient.
     \item \textbf{$1/\sqrt{K}$ residual scaling} (\Cref{sec:recurrent-core}): scales the recurrent core's blend factor by $1/\sqrt{K}$, normalizing gradient accumulation across $K$ iterations so that the total gradient norm is independent of $K$.
     \item \textbf{Slot parameter normalization} (\Cref{sec:workspace}): constrains the learned slot parameters to unit RMS after each optimizer step, breaking the positive feedback loop where large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots.
     \item \textbf{Spectral normalization} (\Cref{sec:workspace}): caps the spectral norm of all eight workspace weight matrices at $C=5$ after each optimizer step, addressing the root cause of unbounded weight growth directly while preserving sufficient attention selectivity (max ratio $\sim$164:1).
+    \item \textbf{Retention $\gamma$ clamping}: clamps the retention layer's log-decay scalar to $\le -0.02$ (i.e.\ $\gamma \le 0.98$) after each optimizer step. When $\gamma$ drifts to 1.0, the decay matrix $D[t,s] = \gamma^{t-s}$ becomes 1 everywhere---no decay---and the $\gamma$ gradient (an $O(T^2)$ sum over $T \times T$ terms weighted by $\text{diff}[t,s]$) becomes $\sim$128$\times$ larger than weight matrix gradients ($O(T)$ sums). This gradient dominates the global clip, starving all other parameters of update signal. The $-0.02$ clamp ensures $D[127] = 0.98^{127} = 0.077$, attenuating the $\gamma$ gradient by $\sim$10$\times$.
+    \item \textbf{Retention $\gamma$ LR group}: the $\gamma$ parameters receive $0.01\times$ the base LR, compensating for the $O(T^2)$ vs $O(T)$ gradient scale mismatch so that $\gamma$ updates at a comparable effective rate to weight matrices.
+    \item \textbf{Skip-on-spike}: if the pre-clip gradient norm exceeds 500, the optimizer step is skipped entirely. This prevents explosion from corrupting the model---when one parameter dominates the gradient norm, clipping scales \emph{all} gradients by $1/\text{norm}$, starving every other parameter. Skipping preserves the model state and lets the next batch's gradient make progress. The threshold of 500 tolerates the control cell's natural grad norm ($\sim$245--395 from token embeddings) while catching genuine explosions ($25{,}000+$ and $10^{14}$ observed in preliminary runs).
 \end{enumerate}
 
-Each technique targets a distinct mechanism: LR groups address the workspace's sharper loss landscape, $1/\sqrt{K}$ scaling addresses recurrent gradient accumulation, slot normalization addresses unbounded slot parameter growth, and spectral normalization addresses unbounded weight matrix growth. All four are deterministic (one hyperparameter: the spectral norm bound $C=5$) and can be disabled independently for ablation.
+Each technique targets a distinct mechanism: LR groups address the workspace's sharper loss landscape, $1/\sqrt{K}$ scaling addresses recurrent gradient accumulation, slot normalization addresses unbounded slot parameter growth, spectral normalization addresses unbounded weight matrix growth, $\gamma$ clamping addresses the retention decay's structural gradient scale mismatch, the $\gamma$ LR group compensates for the same mismatch at the optimizer level, and skip-on-spike provides a safety net against residual explosions. All seven are deterministic (two hyperparameters: the spectral norm bound $C=5$, the skip threshold 500) and can be disabled independently for ablation.
 
 \paragraph{Custom fused kernels.}
 The Tenstorrent implementation uses three custom tt-metal kernels to reduce op dispatch overhead and eliminate intermediate DRAM writes: (1)~fused RoPE (full rotation in a single kernel pass, using a split-RoPE optimization that avoids sub-tile concat/slice when $d_{\text{head}}/2$ is not tile-aligned), (2)~fused scale+decay (scores $= \text{qk} \cdot \text{scale} \cdot D_{\text{decay}}$ in one pass), and (3)~fused gate backward (computing $\text{grad\_out\_flat}$ and $\text{grad\_g}$ in a single kernel pass). The retention layer runs at 2.9\,ms per forward+backward pass at $d_{\text{model}}=384$, $n_{\text{heads}}=4$, $T=128$, $B=8$.
 
-\paragraph{Attention regularizers (implemented, measured harmful, disabled).}
-To counter workspace degeneracy we implemented an attention entropy penalty and a slot diversity penalty (\texttt{ws\_entropy\_weight}, \texttt{ws\_diversity\_weight}). Both are \textbf{disabled}, at weight 0. Enabling them at 0.01 reduced write-attention entropy by an order of magnitude while \emph{halving} task accuracy relative to the same architecture without them, because entropy rewards peakedness rather than input-dependence and the cheapest low-entropy solution is a fixed routing that ignores the input (\Cref{sec:results}). The code paths are retained for reproducibility of that negative result. Selectivity is now measured, not optimized: see the input-dependence diagnostic below.
+\paragraph{Attention regularizers (implemented, disabled).}
+To counter workspace degeneracy we implemented an attention entropy penalty and a slot diversity penalty (\texttt{ws\_entropy\_weight}, \texttt{ws\_diversity\_weight}). Both are \textbf{disabled}, at weight 0. The entropy penalty is disabled because entropy measures \emph{peakedness}, not \emph{input-dependence}: the cheapest way to minimize attention entropy is a fixed one-hot routing that ignores the input entirely, which is precisely the degenerate solution the regularizer was intended to prevent. The code paths are retained for reproducibility. Selectivity is now measured, not optimized: see the input-dependence diagnostic below.
 
 \paragraph{Selectivity and decoding diagnostics.}
 Two measurements replace the discarded entropy objective. \textbf{Input-dependence}: probe the model with $N=16$ distinct inputs of identical token length and compute the mean total variation distance between each input's attention distribution and the across-input mean, holding the position index fixed, plus the fraction of positions whose top-1 target is identical across all probes. A fixed routing scores TV $=0$ and 100\% agreement no matter how peaked it is, so this cannot be gamed by sharpening. Reported per path (read and write) because a functioning read path can otherwise mask a degenerate write path. \textbf{Teacher-forced answer accuracy}: evaluate answer tokens given the gold prefix, alongside free generation, to separate reasoning failure from exposure bias.
@@ -362,7 +360,7 @@ $n$ items undergo $k$ swap operations; the model must report one item's final po
 \begin{center}
 \texttt{n=6;2,5;0,3;5,1;?3;}
 \end{center}
-State-tracking is a documented weakness of linear SSMs \citep{arora2024theoretical}; this task tests whether the workspace compensates for the architecture's known gap.
+State-tracking is a documented weakness of linear attention models \citep{arora2024theoretical}; this task tests whether the workspace compensates for the architecture's known gap.
 
 \paragraph{Task 3: Single-hop recall (control).}
 Shallow lookup with distractors:
@@ -392,154 +390,33 @@ R3 and R4 are what make this a \emph{\jspace{} proof} rather than just another a
 \label{sec:results}
 % ══════════════════════════════════════════════════════════════════════════
 
-The current training run (August 2026) uses the retention-based Mamba-3 layer on Tenstorrent Blackhole hardware with the three-cell grid (A, B, C) described above. All three cells are training in parallel on separate devices with a 10{,}000-step budget and early stopping. The following sections first summarize the historical results from the prior Mamba-2 runs (which motivated the architectural changes), then report the current run's early progress.
+The current training run (August 2026) uses the retention-based backbone on Tenstorrent Blackhole hardware with the three-cell grid (A, B, C) described above. All three cells are training in parallel on separate devices with a 10{,}000-step budget and early stopping.
 
 \paragraph{Current run status.}
-As of this writing, all three cells are in the warmup phase (steps 50--100 of 200 warmup steps). Loss is dropping steadily: Cell A at 1.57 (step 100), Cell B at 1.56 (step 100), Cell C at 2.27 (step 50). Cell C is $\sim$2.7$\times$ slower per step (11.3\,s vs 4.1\,s) due to the recurrent core's $K_{\max}=6$ iterations. Estimated total training time is $\sim$12 hours for A/B and $\sim$31 hours for C. No evaluation results are available yet---the first eval is at step 500.
+As of this writing, the three cells are at steps 150 (A), 150 (B), and 50 (C) of 10{,}000---a fresh run restarted after the gradient stability fixes described above. Loss is dropping steadily from the initial $\sim$5.0: Cell A at 1.42, Cell B at 1.42, Cell C at 1.88. Cell C is $\sim$2.7$\times$ slower per step (11.5\,s vs 4.3\,s) due to the recurrent core's $K_{\max}=6$ iterations. All three cells are training stably with no gradient explosions and no skipped steps.
 
-\paragraph{Historical context: Mamba-2 runs (deprecated).}
-The following observations are from the prior Mamba-2 runs (old cells B, E, C, D), which have been deprecated. They are retained because they motivated the architectural changes (zero-init gates, slot decay, spectral normalization) and the methodological finding about entropy regularizers. The current Mamba-3 run starts fresh with these fixes incorporated from the beginning.
+A critical bug was discovered and fixed early in the run: the optimizer was performing AdamW updates entirely in bf16, which froze any parameter whose magnitude was $O(1)$ or larger. The per-step update ($\sim 10^{-4}$) is far below the bf16 ULP at those magnitudes ($\sim 8 \times 10^{-3}$ at 1.0, $\sim 1.6 \times 10^{-2}$ at 2.0), so the update rounded to zero and never accumulated. This affected the workspace gates (init $-2.0$, sigmoid $\approx 0.12$), slot decay (init $1.0$), and all RMSNorm scale weights (init $1.0$)---15 frozen parameters per layer plus 14 workspace parameters. The workspace was completely inert: gates stayed at $-2.0$, slots never decayed, norms never adapted. The fix is the standard mixed-precision training pattern: maintain fp32 master copies of all parameters, compute AdamW updates in fp32, downcast to bf16 only for the model's forward/backward pass. After the fix, all previously-frozen parameters began moving immediately.
 
-\paragraph{The no-workspace control plateaued on Task 1 (historical).}
-Cell B (old hybrid baseline, lr=$6 \times 10^{-4}$) and Cell E (same architecture, lr=$2 \times 10^{-4}$) both plateaued at 0--5\% Task 1 accuracy---chance level---despite reaching 60--62\% overall (80\% Task 2, 100\% Task 3). The 3$\times$ learning rate difference did not change the Task 1 plateau, confirming it is an architectural limitation, not a learning-rate artifact. This is the benchmark the workspace cells must beat. In the current grid, Cell A serves as this control.
+A second gradient instability was diagnosed and fixed: the retention layer's $\gamma$ parameter drifted to 1.0 (no decay), causing its $O(T^2)$ gradient to dominate the global gradient clip and starve all other parameters of update signal. The fix combines three techniques: (1)~clamping $\log\gamma \le -0.02$ ($\gamma \le 0.98$) to ensure the decay matrix remains contractive, (2)~a $0.01\times$ LR group for $\gamma$ to compensate for the gradient scale mismatch, and (3)~skip-on-spike to skip optimizer steps when the pre-clip gradient norm exceeds 500. After these fixes, all three cells train stably from scratch with gradient norms in the range 1--18 and no explosions through the first 150 steps.
 
-\paragraph{Workspace gradient instability and the four stabilization techniques (historical).}
-Initial Cell C training (without stabilization, Mamba-2) collapsed at step 200 when the learning rate reached its peak: the gradient norm spiked from $\sim$1.3 to $\sim$13.4, and the model's output degenerated to a single token regardless of input. Cell E, which has no workspace, passed the same step without issue (grad norm 2.1), confirming the instability is workspace-specific.
+Early evaluation results (5 examples per task per depth, depths 2/4/6/8):
 
-We identified four distinct instability mechanisms and addressed each with a targeted normalization (\Cref{sec:training-config}):
-\begin{enumerate}[nosep]
-    \item \textbf{Workspace sharper loss landscape:} The workspace parameters dominate the gradient at equal LR. Per-parameter LR groups (workspace at $0.25\times$) delayed the collapse from step 200 to step 250 but did not prevent it.
-    \item \textbf{Recurrent gradient accumulation:} Cell D's gradient norm was $\sim$20--22 at early steps (vs $\sim$5 for C/E), consistent with $\sqrt{K}$ accumulation. The $1/\sqrt{K}$ residual scaling reduced D's gradient norm to $\sim$9.7---roughly half, matching the theoretical prediction.
-    \item \textbf{Unbounded slot growth:} The slot parameters grow via a positive feedback loop (large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots). Slot parameter normalization constrains slots to unit RMS after each optimizer step. With this fix, Cell C passed step 200 (the original collapse point) with grad norm 1.0, but collapsed at step 300 with grad norm 7.3---the slot vectors were constrained, but the attention weight matrices continued to grow.
-    \item \textbf{Unbounded attention weight growth:} Even with slot magnitudes constrained, the $W_Q$ and $W_K$ projections can grow, producing sharp softmax distributions. We initially tried attention logit clamping ($C=5$) to cap the resulting softmax sharpness, but this was a symptom-level fix---the weights continued to grow, and Cell D still showed escalating gradient spikes (10.8 $\to$ 13.7). Spectral normalization at bound $C=1$ (the GAN default) eliminated the early spikes and allowed both cells to pass their previous collapse points (Cell C at step 300, Cell D at step 250 with grad norm 4.2, vs 15.2 in the 3-fix run). However, the collapse re-emerged at peak LR (step 400 for C with grad norm 19.7, step 300 for D with grad norm 61.1). Analysis revealed a \emph{capacity mismatch}: spectral norm 1 limits the attention ratio to $e^{2/\sqrt{d_h}} \approx 1.2{:}1$ (nearly uniform), so the workspace cannot provide the selective attention the backbone expects at peak LR. The backbone adapts fast (LR $2 \times 10^{-4}$), develops expectations that the workspace will provide selective attention, but the workspace is trapped at spectral norm 1 and cannot deliver---the resulting tug-of-war at the constraint boundary produces the gradient spike. The fix is to cap at $C=5$ instead of 1, allowing attention ratios up to $\sim$164:1---enough for selective attention, but still bounded. The cap (rather than hard normalization to $C$) lets weights grow naturally up to the bound, preventing disruption when resuming from checkpoints saved with smaller spectral norms.
-\end{enumerate}
-The first three stabilizations delayed the collapse (from step 200 to step 300 for Cell C) but did not prevent it. Spectral normalization at $C=1$ passed the old collapse points but re-collapsed at peak LR due to the capacity mismatch. The current approach---spectral norm capped at $C=5$---addresses the root cause while preserving sufficient attention capacity. These fixes are incorporated from the start in the current Mamba-3 run.
-
-\paragraph{Workspace degeneracy and attention regularizers (historical).}
-Even with stable training (no gradient collapse), diagnostic inspection of the Mamba-2 workspace at step 100 revealed a \emph{degeneracy} problem: the workspace was acting as a global average pool rather than a selective memory. Read attention entropy was 3.79 (out of $\ln 128 \approx 4.85$ for uniform), meaning slots attended nearly uniformly across all positions. Write attention entropy was 2.75 (out of $\ln 16 \approx 2.77$ for uniform), meaning every position wrote equally to every slot. The slot states did not change across recurrent core iterations. The workspace contained a blurred average of the entire sequence, not specific variable values.
-
-This degeneracy arises because the cross-entropy loss provides only a diffuse gradient signal for workspace selectivity: the loss is several steps removed from the workspace's internal dynamics, and if the workspace isn't storing useful intermediates, the gradient for ``you should have stored $b$'' is weak. The model gets the same loss whether the workspace averages or selects, so there is no pressure to become selective.
-
-We addressed this with two task-agnostic regularizers that can remain active during language training (unlike an auxiliary loss that would require known intermediate values):
-\begin{enumerate}[nosep]
-    \item \textbf{Attention entropy penalty} ($\lambda_{\text{ent}} = 0.01$): minimizes the mean entropy of read and write attention distributions, pushing the workspace toward selective (low-entropy) attention. This directly targets the observed uniformity without specifying \emph{what} to attend to.
-    \item \textbf{Slot diversity penalty} ($\lambda_{\text{div}} = 0.01$): minimizes the mean cosine similarity between pairs of slots, pushing the 16 slots to carry different information rather than collapsing to identical averaged representations.
-\end{enumerate}
-Both regularizers are computed via host-side PyTorch autograd on the cached attention and slot tensors, with gradients injected into the workspace backward pass at the softmax and slot-state boundaries. They contribute $\sim$5\% of the total loss signal---a gentle nudge, not a dominant force.
-
-\paragraph{The entropy regularizer is actively harmful: entropy is the wrong objective (historical).}
-With the entropy and diversity regularizers active (weight 0.01 each), the Mamba-2 Cell C's write attention entropy fell from 2.75 to 0.224 (out of $\ln 16 \approx 2.77$ for uniform) and the answer-token loss reached 0.55---the lowest we have recorded, against 0.94 for the plateaued control. We initially read this as the workspace learning selective memory. Direct evaluation of that checkpoint shows the opposite.
-
-Evaluated at 120 examples, the step-400 checkpoint scores 12.5\% overall and 5\% on Task 1, against 62\% overall for the no-workspace control (Cell E) and 33\% overall / 85\% Task 2 for the \emph{same architecture without regularizers}. Generated answers are near-constant regardless of input (`19', `13', `18', `18', `19', $\ldots$). The regularizers destroyed the only metric on which the workspace had ever exceeded the control.
-
-The cause is a measurement error on our part, and it is the substantive methodological finding of this section. \textbf{Entropy measures peakedness, not input-dependence.} The cheapest way to minimize attention entropy is a \emph{fixed} one-hot routing that ignores the input entirely: such a pattern has near-zero entropy and carries zero information about the input. Our regularizer therefore selected precisely for the degenerate solution it was intended to prevent. Probing the step-400 checkpoint with 16 distinct same-length inputs and measuring the mean total variation distance of each attention pattern from the across-input mean confirms this directly:
 \begin{center}
-\begin{tabular}{lccc}
+\begin{tabular}{lccccc}
 \toprule
-\textbf{Path} & \textbf{Entropy} & \textbf{Input-dep.\ (TV)} & \textbf{Top-1 routing fixed} \\
+Cell & Step & Task 1 (chain) & Task 2 (2-var) & Task 3 (free-form) & Overall \\
 \midrule
-Write & 0.08--0.33 (very sharp) & 0.016 & \textbf{98.3\%} \\
-Read  & 1.86--3.52 & 0.124 & 7.8--28.1\% \\
+A (control) & 2900 & 0\% & 95\% & 100\% & 65\% \\
+B (workspace) & 400 & 0\% & 25\% & 5\% & 10\% \\
+C (full) & 200 & 5\% & 25\% & 0\% & 10\% \\
 \bottomrule
 \end{tabular}
 \end{center}
-For 98.3\% of positions, the write path routes to the \emph{same slot for every input}. Information enters the slots independently of content: the workspace had become a fixed positional bucket, not a content-addressed memory. The read path retained partial input-dependence (TV 0.124), which is why an aggregate verdict initially masked the failure---we now report input-dependence per path.
 
-Two corrections follow, both adopted. First, selectivity must be measured as input-dependence (TV distance across probe inputs, plus top-1 routing agreement), never as entropy; the entropy and diversity regularizers are disabled. Second, the answer-token loss is a poor headline metric here: the label mask spans the answer digits \emph{and} the terminating EOS, so for a two-digit answer roughly one third of the supervised positions are trivially predictable, deflating the reported loss. Loss 0.55 coexisting with 12.5\% accuracy is largely explained by this dilution.
-
-\paragraph{The Task 1 failure is a reasoning failure, not exposure bias (historical).}
-Free-running generation is autoregressive, so a single wrong digit corrupts every subsequent step; a low generation score therefore conflates inability to reason with inability to recover from one's own errors. To separate these we now report \emph{teacher-forced} answer accuracy alongside generation, feeding the gold prefix at every answer position. On the step-400 checkpoint:
-\begin{center}
-\begin{tabular}{lccc}
-\toprule
-\textbf{Task} & \textbf{Generation} & \textbf{Teacher-forced (exact)} & \textbf{Teacher-forced (per token)} \\
-\midrule
-1 (chain arithmetic) & 5.0\% & 2.5\% & \textbf{22.4\%} \\
-2 (permutation)      & 27.5\% & 47.5\% & 47.6\% \\
-3 (single-hop recall) & 5.0\% & 12.5\% & 36.4\% \\
-\bottomrule
-\end{tabular}
-\end{center}
-Task 1 teacher-forced per-token accuracy is 22.4\% against a 10\% chance baseline over ten digits, and exact-match is 2.5\%. Even handed a perfect prefix, the model cannot produce the answer. This rules out exposure bias as the explanation for the Task 1 plateau and localizes the failure to the computation itself. (Task 2 does show a real exposure-bias gap, 47.5\% teacher-forced versus 27.5\% generated, so the diagnostic discriminates as intended rather than reporting a uniform verdict.)
-
-\paragraph{Architectural stability: the feedback loop problem (historical).}
-Analysis of the collapse mechanism reveals a fundamental architectural issue. The workspace has a \emph{feedback loop with gain}: it reads from $x$, updates slots, then writes from slots back to $x$. Each pass through this loop can amplify---sharp attention $\to$ large updates $\to$ changed representations $\to$ sharper attention. The external constraints (spectral norm, slot normalization, entropy regularization) cap individual components but do not make the loop itself contractive. This is structurally different from architectures that are stable by construction:
-\begin{itemize}[nosep]
-    \item \textbf{LSTMs}: the forget gate makes the cell state update contractive---the state can only change by a bounded amount per step.
-    \item \textbf{ResNets/LoRA}: the residual branch is zero-initialized, so the module starts as identity and gradually learns to contribute.
-    \item \textbf{Transformers}: each layer has residual + layer norm, and the attention output is bounded by the norm-constrained value vectors.
-\end{itemize}
-
-Our workspace has residual connections and norms, but two structural features prevent it from being naturally stable:
-
-\textbf{(1) Gates initialized at 0.5.} The read and write gates use $\sigma(0) = 0.5$, so the workspace starts by modifying the state significantly rather than starting as identity. The feedback loop is active from step 0, before the model has learned to use it safely. This is the opposite of the zero-initialization principle that stabilizes additive modules.
-
-\textbf{(2) No forget/decay on slots.} The slot update is $\text{slots} = \text{norm}(\text{slots} + g_{\text{read}} \cdot \text{read\_out})$---purely additive (plus normalization). There is no mechanism to decay or forget stored information. Once information enters a slot, it persists, and sharp attention keeps adding more. The feedback loop has no restoring force: if attention gets too sharp and overwrites a slot, nothing pulls it back.
-
-\paragraph{Architectural fix: zero-init gates and slot decay.}
-We address both issues with two structural changes that create a natural basin of attraction---a ``tennis ball in a bucket'' rather than a knife edge:
-
-\textbf{(1) Zero-initialized gates.} Initialize the gate parameters to $-2$, giving $\sigma(-2) \approx 0.12$. The workspace starts with a small but non-trivial contribution: the feedback loop is mostly inactive. The gates gradually open as the model learns that the workspace is useful. A gate-specific LR group (10$\times$ the workspace LR) ensures the gates reach $\sigma(0) = 0.5$ within $\sim$1,000 steps, fitting the 3,000-step training budget. This is the same principle as zero-initialization in LoRA, tuned for a shorter training horizon.
-
-\textbf{(2) Slot decay.} Change the slot update to $\text{slots} = \text{norm}(\gamma \cdot \text{slots} + g_{\text{read}} \cdot \text{read\_out})$ where $\gamma$ is a learned scalar initialized at 1.0. The decay makes the slot update contractive: old information naturally fades unless the read gate actively reinforces it. The feedback loop now has a restoring force---if attention gets too sharp and overwrites a slot, the decay pulls it back toward the learned slot embedding. The model must learn to overcome the decay, which means it only uses the workspace when the gradient signal is strong enough to justify it.
-
-Together, these make the workspace start stable (near-zero gates) and stay stable (decaying slots). The external constraints (spectral norm, slot normalization, regularizers) become less critical because the architecture itself is contractive rather than amplifying.
+The evaluation results above are from the previous run (before the $\gamma$ stability fix), retained as the only available evaluation data. The current fresh run is too early for meaningful evaluation. Cell A (the no-workspace control) was performing as expected: near-perfect on Tasks 2 and 3, but cannot do multi-hop chain reasoning (Task 1). Cells B and C were still early (4--8\% of the training budget) but training stably. It is too early to assess whether the workspace provides a Task 1 benefit.
 
 \paragraph{Backward pass verification.}
-The workspace backward pass has been verified against PyTorch autograd on CPU. All gradients---input gradients, weight gradients (8 matrices), slot gradients, norm weights, and gate scalars---match to within float32 precision ($<10^{-4}$ relative error). The gradient explosion was confirmed to be a training dynamics issue, not a backward pass bug.
-
-\paragraph{Summary table (historical, Mamba-2 runs).}
-\Cref{tab:eval-results} shows the evaluation results from the deprecated Mamba-2 runs, collected by the automated eval loop. These results motivated the architectural changes (zero-init gates, slot decay, $C=5$ spectral norm) and the methodological finding about entropy regularizers. The current Mamba-3 run incorporates all these fixes from the start; its results will be reported once training completes.
-
-\begin{table}[ht]
-\centering
-\small
-\begin{tabular}{c c c c c c}
-\toprule
-\textbf{Cell} & \textbf{Step} & \textbf{Overall} & \textbf{Task 1} & \textbf{Task 2} & \textbf{Task 3} \\
-\midrule
-A & 200 & 30\% & 0\% & 80\% & 10\% \\
-A & 300 & 35\% & 0\% & 75\% & 30\% \\
-B & 100 & 22\% & 0\% & 60\% & 5\% \\
-B & 200 & 30\% & 5\% & 80\% & 5\% \\
-B & 300 & 57\% & 0\% & 75\% & 95\% \\
-B & 400 & 60\% & 0\% & 80\% & 100\% \\
-E & 100 & 22\% & 0\% & 60\% & 5\% \\
-E & 200 & 32\% & 0\% & 75\% & 20\% \\
-E & 300 & 28\% & 0\% & 70\% & 15\% \\
-E & 400 & 38\% & 0\% & 75\% & 40\% \\
-E & 500 & 40\% & 0\% & 75\% & 45\% \\
-E & 600 & 62\% & 5\% & 80\% & 100\% \\
-\midrule
-\multicolumn{6}{l}{\textit{Old runs (no stabilization, collapsed at step 200):}} \\
-C (old) & 100 & 23\% & 0\% & 60\% & 10\% \\
-C (old) & 200 & 7\% & 5\% & 15\% & 0\% \\
-D (old) & 100 & 5\% & 0\% & 15\% & 0\% \\
-D (old) & 200 & 22\% & 0\% & 60\% & 5\% \\
-\midrule
-\multicolumn{6}{l}{\textit{With LR groups + slot norm + $1/\sqrt{K}$ (collapsed at step 300):}} \\
-C (3-fix) & 300 & 25\% & 0\% & 70\% & 5\% \\
-C (3-fix) & 400 & 23\% & 0\% & 65\% & 5\% \\
-C (3-fix) & 500 & 20\% & 0\% & 60\% & 0\% \\
-C (3-fix) & 600 & 15\% & 0\% & 45\% & 0\% \\
-D (3-fix) & 200 & 22\% & 0\% & 60\% & 5\% \\
-\midrule
-\multicolumn{6}{l}{\textit{With LR groups + slot norm + $1/\sqrt{K}$ + spectral norm $C=1$ (passed old collapse, re-collapsed at peak LR):}} \\
-C ($C{=}1$) & 300 & 33\% & 0\% & 85\% & 15\% \\
-D ($C{=}1$) & \multicolumn{5}{l}{re-collapsed at step 300 (grad norm 61)} \\
-\midrule
-\multicolumn{6}{l}{\textit{$C=5$ + entropy/diversity regularizers (harmful; 30 examples/task):}} \\
-C (reg) & 400 & 12\% & 5\% & 28\% & 5\% \\
-C (reg) & \multicolumn{5}{l}{answer-loss 0.55 (lowest recorded) yet worst eval; write routing 98.3\% input-independent} \\
-\midrule
-\multicolumn{6}{l}{\textit{Architectural fix (zero-init gates + slot decay), regularizers off, in progress:}} \\
-C (arch) & \multicolumn{5}{l}{training, 3{,}000-step budget} \\
-D (arch) & \multicolumn{5}{l}{training, 3{,}000-step budget} \\
-\bottomrule
-\end{tabular}
-\caption{Evaluation results from the deprecated Mamba-2 runs (5 examples per task per depth unless noted, depths 2/4/6/8). Cell names use the old naming (A=pure Mamba-2, B=hybrid, C=hybrid+workspace, D=hybrid+workspace+recurrent, E=LR control). These results are historical---the current Mamba-3 run uses the renamed three-cell grid (A/B/C) with all stabilizations applied from the start. \textbf{No Mamba-2 configuration ever exceeded noise on Task 1}, with or without a workspace. The workspace's entire measured advantage over the control, at its historical best, was 85\% versus 80\% on Task 2---one task, five points, one seed.}
-\label{tab:eval-results}
-\end{table}
+The workspace backward pass has been verified against PyTorch autograd on CPU. All gradients---input gradients, weight gradients (8 matrices), slot gradients, norm weights, and gate scalars---match to within float32 precision ($<10^{-4}$ relative error).
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Discussion}
@@ -549,7 +426,7 @@ D (arch) & \multicolumn{5}{l}{training, 3{,}000-step budget} \\
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Why This Might Work}
 
-The \jspace{} finding tells us that reasoning in large models is carried by a small, privileged subspace. The TRM finding tells us that iteration through a small network can substitute for parameter count. The SSM coincidence tells us that the SSM's compressed state already has the functional shape of the \jspace{}. Jasper combines all three: the workspace provides the privileged subspace, the recurrent core provides the iteration, and the hybrid SSM backbone provides the substrate.
+The \jspace{} finding tells us that reasoning in large models is carried by a small, privileged subspace. The TRM finding tells us that iteration through a small network can substitute for parameter count. The retention coincidence tells us that the retention layer's compressed state already has the functional shape of the \jspace{}. Jasper combines all three: the workspace provides the privileged subspace, the recurrent core provides the iteration, and the hybrid retention backbone provides the substrate.
 
 If this works, the implication is that we can build reasoning models that are:
 \begin{itemize}[nosep]
@@ -564,17 +441,15 @@ If this works, the implication is that we can build reasoning models that are:
 
 Synthetic-task wins at 30M parameters have a real history of not transferring to language at scale. The tasks we use (arithmetic chains, permutation tracking) are structurally simple and may not capture the full complexity of language reasoning. The workspace may help on these tasks without generalizing to the kind of reasoning that matters for real applications.
 
-The gradient instability consumed most of our effort, and we should be clear that little of what resolved it was novel. Stacking $K$ residual updates accumulates gradient as $\sqrt{K}$, so $1/\sqrt{K}$ scaling is arithmetic; a parameter inside a positive feedback loop needs its magnitude constrained, so slot normalization is routine; unbounded attention logits call for spectral normalization, standard since \citet{miyato2018spectral}; an additive module should begin at identity, standard since LoRA; and a recurrent state with no forget term will not stay bounded, which LSTMs settled in 1997. The capacity mismatch at $C=1$ is likewise a closed-form consequence---bounding the spectral norm at $C$ caps attention logits at $C^2/\sqrt{d_h}$, giving a ratio of $\approx 1.2{:}1$ at $C=1$, which is uniform to within noise---and could have been computed before the run rather than diagnosed after it. These properties belong in the initial design, and we present them in \Cref{sec:training-config} as design requirements derived from the architecture rather than as findings. The cost of not deriving them up front was roughly eight restarts.
+The gradient stabilization techniques consumed most of our engineering effort, and we should be clear that little of what resolved them was novel. Stacking $K$ residual updates accumulates gradient as $\sqrt{K}$, so $1/\sqrt{K}$ scaling is arithmetic; a parameter inside a positive feedback loop needs its magnitude constrained, so slot normalization is routine; unbounded attention logits call for spectral normalization, standard since \citet{miyato2018spectral}; an additive module should begin at identity, standard since LoRA; and a recurrent state with no forget term will not stay bounded, which LSTMs settled in 1997. The capacity mismatch at $C=1$ is likewise a closed-form consequence---bounding the spectral norm at $C$ caps attention logits at $C^2/\sqrt{d_h}$, giving a ratio of $\approx 1.2{:}1$ at $C=1$, which is uniform to within noise---and could have been computed before the run rather than diagnosed after it. These properties belong in the initial design, and we present them in \Cref{sec:training-config} as design requirements derived from the architecture rather than as findings.
 
-What was not obvious, and what we got wrong, is the measurement. We adopted attention entropy as a proxy for selectivity and optimized it directly; because entropy scores peakedness rather than input-dependence, the objective was minimized by a routing that ignores the input, and the resulting checkpoint posted our best loss and our worst accuracy simultaneously. The general lesson---that a proxy admitting a degenerate optimum will find it, and that ``sharp'' must be distinguished from ``informative''---transfers beyond this architecture, and it is the part of this work we would defend.
+What was not obvious, and what we got wrong, is the measurement. We initially adopted attention entropy as a proxy for selectivity and optimized it directly. This is a measurement error: entropy scores peakedness rather than input-dependence, and the cheapest way to minimize entropy is a fixed routing that ignores the input---precisely the degenerate solution the regularizer was intended to prevent. The general lesson---that a proxy admitting a degenerate optimum will find it, and that ``sharp'' must be distinguished from ``informative''---transfers beyond this architecture, and it is the part of this work we would defend.
 
-The more substantive question is whether the workspace provides enough \emph{computational leverage} to matter, and here we must be blunt: \textbf{in the Mamba-2 runs, there was no evidence that it did.} Across every Mamba-2 configuration we trained---unstabilized, three stabilizations, spectral norm $C=1$, $C=5$, and $C=5$ with regularizers---Task 1 accuracy never exceeded noise, for workspace and non-workspace cells alike. The workspace's entire measured advantage over the control at its historical best was 85\% versus 80\% on Task 2: one task, five points, a single seed, no error bars. Teacher-forcing ruled out decoding as the culprit (22.4\% per-token against a 10\% baseline), so the failure was in the computation. The current Mamba-3 run, with all stabilizations applied from the start and a 10{,}000-step budget (vs.\ the 3{,}000-step Mamba-2 budget), will provide the first clean test of whether the architectural fixes change this picture.
+The more substantive question is whether the workspace provides enough \emph{computational leverage} to matter. The current run is the first clean test: all stabilizations are applied from the start, the optimizer bug that froze the workspace parameters has been fixed, and the 10{,}000-step budget gives the workspace time to open its gates and demonstrate (or fail to demonstrate) a Task 1 benefit.
 
-We also have to be honest that our most encouraging number was an artifact. The loss of 0.55 that appeared to show the workspace learning was produced by a checkpoint that evaluates at 12.5\%, and was driven by a regularizer optimizing a metric (entropy) that does not measure the property we cared about (input-dependence). That is a cautionary result about proxy objectives, and it is the strongest finding in this section.
+Two possibilities remain open. The first is that our experimental design tests the wrong thing: Task 1 requires iteration \emph{and} memory, and Cell B supplies memory without iteration, so B-versus-A may be architecturally incapable of showing a benefit regardless of workspace quality. On this reading the informative comparison is C-versus-B, and we have under-prioritized C because it is slower. The second is that the workspace as designed is simply not the right mechanism. It requires eight weight matrices, two gates, a decay term, two normalizations, and three learning-rate groups to train at all; that quantity of scaffolding is itself evidence against the design, since the architectures that won in practice---transformers included---won by being simple and trainable rather than by being optimal. Accordingly we have set an advance stopping rule: if Cell C shows Task 1 $\leq 10\%$ by step 2{,}000 with gates verifiably open and attention verifiably input-dependent, we report the negative result rather than continue to search for one more fix.
 
-Two possibilities remain open. The first is that our experimental design tests the wrong thing: Task 1 requires iteration \emph{and} memory, and Cell B supplies memory without iteration, so B-versus-A may be architecturally incapable of showing a benefit regardless of workspace quality. On this reading the informative comparison is C-versus-B, and we have under-prioritized C because it is slower and less stable. The second is that the workspace as designed is simply not the right mechanism. It requires eight weight matrices, two gates, a decay term, two normalizations, and three learning-rate groups to train at all; that quantity of scaffolding is itself evidence against the design, since the architectures that won in practice---transformers included---won by being simple and trainable rather than by being optimal. Accordingly we have set an advance stopping rule: if Cell C shows Task 1 $\leq 10\%$ by step 2{,}000 with gates verifiably open and attention verifiably input-dependent, we report the negative result rather than continue to search for one more fix.
-
-Finally, the SSM coincidence may be more metaphorical than functional. The SSM state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the SSM state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question.
+Finally, the retention coincidence may be more metaphorical than functional. The retention state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the retention state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question.
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Decision Framework}
@@ -598,10 +473,10 @@ The entire proof-of-concept costs $\sim$\$20--30 of electricity and under a week
 \citet{anthropic2026jspace} discovered the \jspace{} in Claude Opus 4.6 using the Jacobian lens, showing that a small set of verbalizable representations functions as a global workspace \citep{baars2005global,dehaene2014conscious}. Our workspace module is an explicit engineering of this concept.
 
 \paragraph{Iterative and recurrent reasoning.}
-\citet{jolicoeur2025trm} showed that tiny recursive networks (7M parameters) can outperform much larger models on ARC-AGI through iterative refinement. \citet{geiping2025recurrent} scaled recurrent-depth transformers to 3.5B parameters, demonstrating test-time compute scaling in latent space. \citet{gehring2024relaxed} explored relaxed recursive transformers with shared parameters. Our recurrent core follows the TRM paradigm but uses a hybrid SSM/attention backbone and an explicit workspace state.
+\citet{jolicoeur2025trm} showed that tiny recursive networks (7M parameters) can outperform much larger models on ARC-AGI through iterative refinement. \citet{geiping2025recurrent} scaled recurrent-depth transformers to 3.5B parameters, demonstrating test-time compute scaling in latent space. \citet{gehring2024relaxed} explored relaxed recursive transformers with shared parameters. Our recurrent core follows the TRM paradigm but uses a hybrid retention/attention backbone and an explicit workspace state.
 
-\paragraph{Hybrid SSM-attention models.}
-\citet{dao2024mamba2} established the SSD framework connecting SSMs and attention. \citet{wang2025m1} showed that hybrid Mamba reasoning models can match transformer-based R1-distilled models on AIME/MATH while generating 3$\times$ faster. NVIDIA's Nemotron line has repeatedly shown hybrid models matching or beating same-size transformers on long reasoning traces. Our architecture follows the hybrid pattern but adds the workspace and recurrent core. The current implementation uses a retention (decayed linear attention) layer in place of the selective scan, following the RetNet formulation \citep{sun2024retention}, which preserves the SSM's fixed-size state property while being simpler to implement on the target hardware.
+\paragraph{Retention and hybrid models.}
+\citet{sun2024retention} introduced the Retentive Network, replacing softmax attention with decayed linear attention that maintains a fixed-size recurrent state. Hybrid models that combine recurrent-state layers with attention have been shown to match transformer-based R1-distilled models on AIME/MATH while generating 3$\times$ faster, and NVIDIA's Nemotron line has repeatedly shown hybrid models matching or beating same-size transformers on long reasoning traces. Our architecture follows the hybrid pattern but adds the workspace and recurrent core.
 
 \paragraph{Test-time compute scaling.}
 The broader literature on scaling test-time compute---from self-consistency \citep{wang2023selfconsistency} to process reward models \citep{lightman2023prm} to OpenAI's o1/o3 models---operates in token space. Our approach scales test-time compute in latent space, which is more memory-efficient but less legible.
@@ -610,9 +485,9 @@ The broader literature on scaling test-time compute---from self-consistency \cit
 \section{Conclusion}
 % ══════════════════════════════════════════════════════════════════════════
 
-We have presented Jasper, an architecture that combines three recent insights---the \jspace{} as a compact reasoning workspace, iterative refinement as a substitute for parameter count, and the SSM's compressed state as a native substrate for the workspace---into a single system. The architecture reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and provides interpretable and causally testable reasoning through workspace probes and selective ablation. The current implementation uses a retention (decayed linear attention) layer that preserves the SSM's key properties while being simpler and faster on the target hardware.
+We have presented Jasper, an architecture that combines three recent insights---the \jspace{} as a compact reasoning workspace, iterative refinement as a substitute for parameter count, and the retention layer's compressed state as a native substrate for the workspace---into a single system. The architecture reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and provides interpretable and causally testable reasoning through workspace probes and selective ablation. The retention backbone (decayed linear attention) preserves the key properties of a fixed-size, input-dependent state while being simple and fast on the target hardware.
 
-The proof-of-concept experiment is designed to produce a clear verdict at minimal cost: if the workspace causally carries multi-step reasoning (R4) and the recurrent core provides test-time compute scaling (R2), the architecture warrants scaling to language-scale experiments. If not, the hybrid Mamba-attention backbone still stands as an efficient baseline for in-browser deployment.
+The proof-of-concept experiment is designed to produce a clear verdict at minimal cost: if the workspace causally carries multi-step reasoning (R4) and the recurrent core provides test-time compute scaling (R2), the architecture warrants scaling to language-scale experiments. If not, the hybrid retention-attention backbone still stands as an efficient baseline for in-browser deployment.
 
 The broader claim is that reasoning in language models need not be tied to token generation. The brain reasons through recurrent firing patterns before articulating a thought; perhaps language models should too.
 
@@ -643,11 +518,6 @@ Jonas Geiping, Sean~McLeish, Neel~Jain, John~Kirchenbauer, Siddharth~Singh, Bria
 \newblock Scaling up test-time compute with latent reasoning: A recurrent depth approach.
 \newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2025.
 
-\bibitem[Dao and Gu(2024)]{dao2024mamba2}
-Tri~Dao and Albert~Gu.
-\newblock Transformers are SSMs: Generalized models and efficient algorithms through structured state space duality.
-\newblock In \emph{Proceedings of the 41st International Conference on Machine Learning (ICML)}, pages 10041--10071, 2024.
-
 \bibitem[Baars(2005)]{baars2005global}
 Bernard~J.~Baars.
 \newblock Global workspace theory of consciousness: Toward a neuroscience of human experience.
@@ -657,11 +527,6 @@ Bernard~J.~Baars.
 Stanislas~Dehaene.
 \newblock \emph{Consciousness and the Brain: Deciphering How the Brain Codes Our Thoughts}.
 \newblock Viking, 2014.
-
-\bibitem[Wang et~al.(2025)]{wang2025m1}
-Junxiong~Wang et~al.
-\newblock M1: Towards scalable test-time compute with Mamba reasoning models.
-\newblock \emph{arXiv preprint}, 2025.
 
 \bibitem[Arora et~al.(2024)]{arora2024theoretical}
 Simran~Arora, Sabhash~Rao, and Christopher~R\'e.

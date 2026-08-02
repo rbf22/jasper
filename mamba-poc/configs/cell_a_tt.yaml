@@ -52,4 +52,4 @@ run_name: cellA-tt-seed1
 
 # Checkpointing — local only (no Google Drive on QB2)
 ckpt_dir: checkpoints
-resume: true
+resume: false
