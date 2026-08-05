@@ -97,16 +97,31 @@ TT_VISIBLE_DEVICES=1 python eval_text.py \
 
 The on-device `cross_entropy_loss` in `train_ttnn.py` uses a V×V identity
 matrix for one-hot encoding — fine for V=128 (32KB), impossible for V=50257
-(~5GB in bfloat16). Two approaches are used:
+(~5GB in bfloat16). Two alternatives are implemented in `train_text.py`:
 
-1. **Host-side loss** (`cross_entropy_loss_host`): Computes loss and gradient
-   in float32 on the host, transfers gradient back to device. ~200MB logits
-   transfer per micro-batch. Used as the fallback for V > 2048.
+1. **Host-side loss** (`cross_entropy_loss_host`, default): Computes loss and
+   gradient in float32 on the host, transfers gradient back to device. ~200MB
+   logits transfer per micro-batch. Faster for the current 30M model size
+   (CPU softmax over 50K elements is faster than device softmax due to
+   dispatch overhead on the large vocab dimension).
 
-2. **On-device scatter-based loss** (`cross_entropy_loss_scatter`): Uses
-   `ttnn.embedding` with a 1×V lookup table to gather target logits (avoiding
-   the V×V identity matrix), and `ttnn.embedding` with a V×1 one-hot table
-   for the gradient scatter. Both tables are cached. This keeps all
-   computation on device — no host transfer of the full logits tensor.
+2. **On-device scatter loss** (`cross_entropy_loss_scatter`): Uses
+   `ttnn.gather` to extract target probs and `ttnn.scatter_add` to build the
+   gradient — no V×V identity matrix, no host transfer of the full logits
+   tensor. Only a tiny (B×T×32 ≈ 65K element) transfer for the loss value.
+   Slower for the current model size (~2.4s/step vs ~1.4s/step) because the
+   on-device softmax over 50K elements has high dispatch overhead. Also
+   produces occasional `inf` grad norms in bfloat16 (8/200 steps in testing).
+   Will be the preferred method for larger models where the 200MB host
+   transfer becomes the bottleneck.
 
-The `compute_loss()` function dispatches based on vocab size and config.
+Select via CLI: `--loss_method host` (default) or `--loss_method scatter`.
+
+The `compute_loss()` function dispatches based on vocab size and method:
+- V ≤ 2048: on-device identity-matrix loss (from `train_ttnn.py`)
+- V > 2048 + `host`: host-side float32 loss
+- V > 2048 + `scatter`: on-device scatter-based loss
+
+The scatter loss is verified against the host-side loss in
+`test_scatter_loss.py` — loss values match within 0.3% relative error,
+gradients match within 1.6% mean relative error (bfloat16 noise floor).

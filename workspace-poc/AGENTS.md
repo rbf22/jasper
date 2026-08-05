@@ -677,15 +677,18 @@ workspace-mvp/
 
 The on-device `cross_entropy_loss` in `train_ttnn.py` uses a V×V identity
 matrix for one-hot encoding — fine for V=128 (32KB), impossible for V=50257
-(~5GB in bfloat16). `train_text.py` adds `cross_entropy_loss_host()` that
-computes loss and gradient in float32 on the host, then transfers the
-gradient back to device. The `compute_loss()` function dispatches based on
-vocab size (threshold: 2048).
+(~5GB in bfloat16). `train_text.py` provides two alternatives:
 
-This adds a ~200MB logits transfer per micro-batch (B=4, T=512, V=50257 in
-float32), acceptable for a POC. For production-scale text training, an
-on-device loss that avoids the identity matrix would be needed (e.g.,
-scatter-based one-hot or a fused softmax+gather kernel).
+1. **Host-side loss** (default): float32 on CPU, ~200MB logits transfer per
+   micro-batch. Faster for the current 30M model size.
+2. **On-device scatter loss**: Uses `ttnn.gather` + `ttnn.scatter_add` — no
+   V×V identity matrix, no host transfer of full logits. Slower for the
+   current model size (on-device softmax over 50K elements has high dispatch
+   overhead) but will be preferred for larger models. Verified against
+   host-side loss in `test_scatter_loss.py` (0.3% loss match, 1.6% gradient
+   match).
+
+Select via CLI: `--loss_method host` (default) or `--loss_method scatter`.
 
 ### Dataset choice rationale
 

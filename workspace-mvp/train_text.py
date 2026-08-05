@@ -289,7 +289,8 @@ def evaluate_perplexity(model, eval_batches, device, k_value=None):
 
 def train(config_path: str, steps_override=None, micro_batch_override=None,
           accum_steps_override=None, profile=False,
-          checkpoint_dir_override=None, resume=None, device_id=0):
+          checkpoint_dir_override=None, resume=None, device_id=0,
+          loss_method="host"):
     """Train the model on text data using a YAML config."""
     setup_mesh_graph()
 
@@ -408,6 +409,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     print(f"  train_tokens={len(train_dataset):,}, valid_tokens={len(valid_dataset):,}",
           flush=True)
     print(f"  vocab_size={tokenizer.VOCAB_SIZE}", flush=True)
+    print(f"  loss_method={loss_method}", flush=True)
 
     print(f"\n{'Step':>6} {'Loss':>10} {'PPL':>8} {'LR':>10} {'Time':>8} "
           f"{'tokens/s':>10} {'GradNorm':>10} {'gz_gr':>8} {'gz_gw':>8}",
@@ -455,7 +457,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             logits = model.forward(input_ids, k_value=k_value)
 
             # Loss + gradient (host-side for large vocab)
-            loss_val, grad_logits = compute_loss(logits, labels, model_config.vocab_size)
+            use_scatter = (loss_method == "scatter")
+            loss_val, grad_logits = compute_loss(logits, labels, model_config.vocab_size, use_scatter=use_scatter)
             step_loss += loss_val
 
             # Backward
@@ -585,6 +588,11 @@ if __name__ == "__main__":
                         help="Path to checkpoint to resume from")
     parser.add_argument("--device", type=int, default=0,
                         help="Tenstorrent device ID")
+    parser.add_argument("--loss_method", type=str, default="host",
+                        choices=["host", "scatter"],
+                        help="Loss computation method for large vocab: "
+                             "'host' (float32 on CPU, faster for small models) "
+                             "or 'scatter' (on-device, for production scale)")
     args = parser.parse_args()
 
     train(
@@ -596,4 +604,5 @@ if __name__ == "__main__":
         checkpoint_dir_override=args.checkpoint_dir,
         resume=args.resume,
         device_id=args.device,
+        loss_method=args.loss_method,
     )
