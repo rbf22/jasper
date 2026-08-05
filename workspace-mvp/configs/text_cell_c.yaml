@@ -1,0 +1,84 @@
+# Text POC — Cell C with Attention Residual Core on TinyStories
+#
+# Same architecture as cell_c_attn_residual.yaml but adapted for text:
+# - vocab_size: 50257 (GPT-2 BPE instead of 128 char-level)
+# - seq_len: 512 (was 128 — text needs longer context)
+# - max_steps: 5000 (TinyStories is ~480M tokens, enough for convergence)
+# - eval_interval: 250 (more frequent perplexity eval)
+# - checkpoint_interval: 500
+# - train_data/valid_data: TinyStories paths
+#
+# The model architecture is unchanged — it's task-agnostic. Only the
+# data pipeline (text_data.py) and training script (train_text.py) differ.
+cell: text
+d_model: 384
+n_layers: 13
+n_heads: 4
+vocab_size: 50257
+use_attention: true
+attention_positions: [5, 10]
+use_workspace: true
+n_workspace_slots: 16
+recurrent_core: true
+attention_residual_core: true
+core_start: 6
+core_end: 10
+k_train_max: 6
+k_inference: 6
+spectral_norm_bound: 5.0
+backbone_spectral_norm_bound: 2.0
+freeze_gamma: true
+ws_entropy_weight: 0.0
+ws_diversity_weight: 0.0
+gate_init: 0.0
+slot_decay_init: 1.0
+
+# Training
+lr: 1.0e-4
+lr_groups:
+  ws_read_gate: 10.0
+  ws_write_gate: 10.0
+  ws_read_qk_scale: 1.0
+  ws_write_qk_scale: 1.0
+  ws_ar_query: 1.0
+  ws_ar_scale: 1.0
+  ws_: 0.25
+  "suffix:_gamma": 0.01
+max_steps: 5000
+tokens_per_batch: 50000
+seq_len: 512
+warmup_steps: 500
+weight_decay: 0.1
+grad_clip: 1.0
+ws_grad_clip: 0.5
+z_loss_coef: 1.0e-4
+eval_interval: 250
+log_interval: 50
+checkpoint_interval: 500
+seed: 42
+
+# Early stopping
+plateau_patience: 1000
+plateau_min_delta: 1.0e-3
+
+# Data
+train_data: data/tinystories_train.txt
+valid_data: data/tinystories_valid.txt
+max_train_tokens: null  # null = use all (~480M tokens)
+eval_batches: 10
+
+# TT-specific
+use_gradient_checkpointing: false
+tt_compile: false
+
+micro_batch_size: 0  # auto-compute
+accum_steps: 0       # auto-compute
+
+# Wandb
+wandb: false
+wandb_project: mamba-workspace-text
+run_name: text-cell-c-ar
+
+# Checkpointing
+ckpt_dir: checkpoints
+resume: false

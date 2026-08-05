@@ -7,32 +7,45 @@ __pycache__/
 
 # TT-metal generated files (kernel cache, watcher, inspector)
 generated/
-mamba-poc/generated/
+workspace-poc/generated/
+workspace-mvp/generated/
 
 # Per-cell isolated run directories (workdirs, caches, checkpoints, logs)
-mamba-poc/run_A/
-mamba-poc/run_B/
-mamba-poc/run_C/
-mamba-poc/run_D/
-mamba-poc/run_E/
+workspace-poc/run_A/
+workspace-poc/run_B/
+workspace-poc/run_C/
+workspace-poc/run_D/
+workspace-poc/run_E/
 
-# Checkpoints and logs
-mamba-poc/checkpoints/
-mamba-poc/logs/
+# Checkpoints, backups, and logs
+workspace-poc/checkpoints/
+workspace-poc/backups/
+workspace-poc/logs/
+workspace-mvp/checkpoints/
+workspace-mvp/logs/
+
+# Text training data (TinyStories, ~5GB)
+workspace-mvp/data/
+
+# Symlinks to venv
+workspace-mvp/venv
+workspace-mvp/.tt-venv
 
 # TT-metal kernel cache
-mamba-poc/tt_cache/
-mamba-poc/lib64
+workspace-poc/tt_cache/
+workspace-poc/lib64
 
 # Eval loop runtime
-mamba-poc/eval_loop.pid
-mamba-poc/eval_loop_*.log
+workspace-poc/eval_loop.pid
+workspace-poc/eval_loop_*.log
 
 # Temporary bug report
-mamba-poc/TT_BUG_REPORT.md
+workspace-poc/TT_BUG_REPORT.md
 
 # LaTeX build artifacts
 *.aux
 *.log
 *.out
 *.toc
+*.bbl
+*.blg

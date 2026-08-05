@@ -95,8 +95,8 @@ The original four-cell grid (A=pure Mamba2, B=hybrid, C=hybrid+workspace, D=hybr
 | Original | Current | Architecture |
 |----------|---------|--------------|
 | old E | **A** | Hybrid (Mamba-3 + attention), no workspace — the control |
-| old C | **B** | Hybrid + workspace — does workspace help without recurrence? |
-| old D | **C** | Full architecture (workspace + recurrent core) — the go/no-go cell |
+| old C | **B** | Hybrid + workspace (QK-Norm + ReZero gates) — does workspace help without recurrence? |
+| old D | **C** | Full architecture (workspace + recurrent core, K=6) — the go/no-go cell |
 
 The comparison logic is now: **B vs A** isolates the workspace effect (same LR=2e-4); **C vs B** isolates the recurrent core; **C vs A** is the full R1 test.
 
@@ -116,7 +116,7 @@ Three custom tt-metal kernels were written to reduce op dispatch overhead and el
 
 The layer is now at 2.9ms/fwd+bwd for d_model=384, n_heads=4, T=128, B=8. The remaining bottleneck is `generic_op` dispatch overhead (~0.15-0.20ms per call), not kernel computation — further optimization would require ttnn tracing/graph mode or a larger model where compute dominates dispatch.
 
-### Training: current run (August 2, 2026)
+### Training: architecture v2 run (August 2, 2026)
 
 All three cells launched in parallel on devices 0, 1, 2 with `nohup` (safe to log out). Effective batch size is 384 (micro_batch=8 × accum_steps=48). Early stopping uses EMA-smoothed loss plateau detection (patience=1000, min_delta=1e-3).
 
@@ -128,6 +128,48 @@ All three cells launched in parallel on devices 0, 1, 2 with `nohup` (safe to lo
 
 Cell C is ~2.7x slower due to the recurrent core (K_max=6 iterations per step). A background monitor (`monitor_training.sh`) reports status every 10 minutes.
 
+### Architecture v2: gradient stability fix (August 2, 2026)
+
+Four previous training runs diverged when workspace gates opened to ~0.20–0.25.
+Checkpoint analysis identified the root cause as **entropy collapse** in the
+workspace cross-attention (QK^T condition numbers of 40,000–112,000). Three
+architectural changes address this structurally:
+
+1. **QK Normalization** — L2-normalize Q and K before attention scores, with
+   learnable scale. Bounds logits by construction, preventing entropy collapse.
+   (Henry et al., 2020 — standard in OLMo 2, Gemma 3, Qwen 3)
+
+2. **ReZero gates** — Replace sigmoid gates (init=-2, sigmoid≈0.12) with scalar
+   gates init=0 (true identity). No sigmoid saturation. Workspace starts as
+   no-op, grows linearly. (Bachlechner et al., 2020)
+
+3. **Component-wise gradient clipping** — Workspace params clipped at 0.5,
+   backbone at 1.0, independently. Prevents workspace gradient spikes from
+   dominating. (Yang et al., 2022)
+
+Additional stabilizers from earlier runs remain in place: backbone spectral
+norm cap (2.0), gamma freezing, slot decay. K restored to 6 after slot-state
+gradient scaling fix (see below). See the code guide README.md and AGENTS.md
+for full details.
+
+### Slot-state gradient scaling (August 3, 2026)
+
+The 1/sqrt(K) blend scaling normalizes the residual stream (x) gradient
+across K iterations, but the slot state chain bypassed it. In the core
+backward, `grad_slots_in` from each iteration's workspace backward chained
+directly to the previous iteration without scaling, causing the workspace's
+gradient amplification to compound exponentially across K iterations.
+
+Two scaling attempts:
+
+1. **1/sqrt(K) scaling**: per-iteration gain `A/K + 1 - 1/sqrt(K)`. Requires
+   A ≤ sqrt(K) for stability. K=3 diverged at step ~1150, K=6 at step ~750.
+
+2. **1/K scaling** (current): per-iteration gain `A/K² + 1 - 1/sqrt(K)`,
+   much more robust. The x residual blend stays at 1/sqrt(K) (correct for
+   additive accumulation); only the multiplicative slot chain uses 1/K.
+   K restored to 6.
+
 ### What hasn't changed
 
-The four pre-registered results (R1–R4) are unchanged. The decision rule is unchanged. The tasks are unchanged. The core question — does an engineered workspace causally carry intermediate reasoning state — is the same. What changed is the hardware, the SSM implementation, and the addition of custom kernels to make training feasible on the available hardware within the time budget.
+The four pre-registered results (R1–R4) are unchanged. The decision rule is unchanged. The tasks are unchanged. The core question — does an engineered workspace causally carry intermediate reasoning state — is the same. What changed is the hardware, the SSM implementation, the addition of custom kernels, and the architecture v2 gradient stability fix.

@@ -49,23 +49,30 @@ class ModelConfig:
     recurrent_core: bool = False
     core_start: int = 6
     core_end: int = 10
-    k_train_max: int = 6
-    k_inference: int = 6
+    k_train_max: int = 6                # max K during training (restored to 6 after slot gradient fix)
+    k_inference: int = 6                # K at inference (sweep this for R2)
+    attention_residual_core: bool = False  # use Attention Residuals (Kimi K3) instead of fixed blend for recurrent core
     dropout: float = 0.0
     use_gradient_checkpointing: bool = True
     spectral_norm_bound: float = 5.0
-    ws_entropy_weight: float = 0.0       # weight for attention entropy regularizer
-    ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer
-    gate_init: float = -2.0             # gate parameter init value (sigmoid(-2) ≈ 0.12)
+    backbone_spectral_norm_bound: float = 2.0  # cap on qkv/out_proj spectral norms
+    freeze_gamma: bool = True            # freeze retention gamma (don't train it) — eliminates O(T²) gradient instability
+    ws_entropy_weight: float = 0.0       # weight for attention entropy regularizer (DISABLED — measured harmful)
+    ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer (DISABLED — measured harmful)
+    gate_init: float = 0.0              # ReZero gate init (0.0 = true identity, no sigmoid). Previously -2.0 for sigmoid gates.
     slot_decay_init: float = 1.0        # slot decay factor init (1.0 = no decay, <1.0 = forgetful)
     slot_permutation: bool = False      # randomly permute slot indices each forward pass (breaks fixed routing)
-    gate_schedule_steps: int = 0        # >0: anneal gates from gate_init to 0 over this many steps
+    gate_schedule_steps: int = 0        # >0: anneal gates from gate_init to 0 over this many steps (no-op with ReZero)
     # --- Mamba-3 MIMO config ---
     headdim: int = 64                   # SSM head dimension (d_inner // headdim = nheads)
     d_state_m3: int = 64                # SSM state size for Mamba-3 (can differ from d_state)
     mimo_rank: int = 4                  # MIMO rank R (parallel SSMs per head)
     rope_fraction: float = 0.5          # fraction of d_state to apply RoPE to
     ngroups: int = 1                    # number of BC heads (1 = shared B/C across all heads)
+    # --- Kimi K3 architectural updates ---
+    short_conv: bool = False            # depthwise causal conv1d (kernel=3) before QKV in retention
+    short_conv_kernel: int = 3          # conv kernel size (3 = standard in KDA/Mamba2)
+    per_channel_decay: bool = False     # per-channel gamma: (n_heads, d_head) instead of (n_heads,)
 
     @property
     def d_inner(self):
@@ -1121,9 +1128,27 @@ class TTRetentionLayer:
 
         # Gamma: per-head decay scalar, stored as log(gamma) for stability.
         # Init gamma ~0.95 (strong but not total decay): log(0.95) ~ -0.051
-        gamma_init = torch.full((self.n_heads,), -0.051, dtype=torch.float32)
-        gamma_init += torch.randn(self.n_heads, dtype=torch.float32) * 0.02
+        # When per_channel_decay=True, gamma is (n_heads, d_head) — per-channel.
+        if config.per_channel_decay:
+            gamma_init = torch.full((self.n_heads, self.d_head), -0.051, dtype=torch.float32)
+            gamma_init += torch.randn(self.n_heads, self.d_head, dtype=torch.float32) * 0.02
+        else:
+            gamma_init = torch.full((self.n_heads,), -0.051, dtype=torch.float32)
+            gamma_init += torch.randn(self.n_heads, dtype=torch.float32) * 0.02
         self.gamma = to_device(gamma_init, device, dtype=ttnn.float32)
+        self.per_channel_decay = config.per_channel_decay
+
+        # Short convolution: depthwise causal conv1d (kernel=3) before QKV.
+        # Identity init (w[:,0]=1, w[:,1]=w[:,2]=0) — starts as no-op,
+        # learns local token mixing through gradient descent.
+        # Based on Kimi K3's KDA which applies short conv to Q/K/V before
+        # linear attention (kimi-k3-relevance-notes.md §3).
+        self.short_conv = config.short_conv
+        self.conv_kernel = config.short_conv_kernel
+        if self.short_conv:
+            conv_w = torch.zeros(self.d_model, self.conv_kernel, dtype=torch.bfloat16)
+            conv_w[:, 0] = 1.0  # identity init
+            self.conv_weight = to_device(conv_w, device)
 
         # Precompute RoPE cos/sin tables (lazy, per T)
         d_rope = self.d_head
@@ -1139,6 +1164,10 @@ class TTRetentionLayer:
         self._diff_tt = None
         self._causal_tt = None
         self._decay_T = 0
+        # Per-channel decay position scaling cache (exp(±pos * log_gamma))
+        self._pos_exp_neg = None  # exp(-pos * log_gamma) for V scaling
+        self._pos_exp_pos = None   # exp(pos * log_gamma) for output scaling
+        self._pc_decay_T = 0
 
         # Fused RoPE custom kernel (untested — device 0 was down when written).
         # Enable with use_fused_rope=True in constructor once verified.
@@ -1171,6 +1200,131 @@ class TTRetentionLayer:
         self._rope_neg_sin_2d = ttnn.from_torch(neg_sin, dtype=ttnn.bfloat16,
                                                  layout=ttnn.TILE_LAYOUT, device=device)
         self._rope_T = T
+
+    def _apply_short_conv(self, x, B, T, D):
+        """Depthwise causal conv1d (kernel=3) applied to x before QKV.
+
+        out[t] = w0*x[t] + w1*x[t-1] + w2*x[t-2]  (zero-padded left)
+
+        Implemented as shifts + element-wise muls (avoids ttnn.conv1d
+        compilation overhead for a 3-tap kernel).
+
+        x: (B, T, D) bf16 TILE on device
+        Returns: (B, T, D) convolved, plus caches shifts for backward.
+        """
+        device = self.device
+        K = self.conv_kernel
+        w = self.conv_weight  # (D, K) TILE
+
+        # Split weights into per-tap vectors: (1, 1, D) for broadcasting
+        w_taps = []
+        for k in range(K):
+            w_k = ttnn.reshape(ttnn.slice(w, [0, k], [D, k + 1]), [1, 1, D])
+            w_taps.append(w_k)
+
+        # Build shifted versions of x (zero-padded left for causality)
+        x_shifts = [x]  # x[t] (no shift)
+        for k in range(1, K):
+            zeros_k = ttnn.zeros([B, k, D], dtype=ttnn.bfloat16,
+                                 layout=ttnn.TILE_LAYOUT, device=device)
+            x_prev = ttnn.concat([zeros_k, ttnn.slice(x, [0, 0, 0], [B, T - k, D])], dim=1)
+            x_shifts.append(x_prev)
+
+        # Weighted sum: out = sum_k w_k * x_shift_k
+        out = None
+        for k in range(K):
+            term = ttnn.mul(x_shifts[k], w_taps[k])
+            if out is None:
+                out = term
+            else:
+                out = ttnn.add(out, term)
+
+        # Cache for backward
+        self._conv_cache = {"x_shifts": x_shifts, "w_taps": w_taps, "B": B, "T": T, "D": D}
+        return out
+
+    def _short_conv_backward(self, grad_out):
+        """Backward through the short conv.
+
+        grad_out: (B, T, D) — gradient w.r.t. conv output
+        Returns: (grad_x, grad_conv_weight)
+          grad_x: (B, T, D) — gradient w.r.t. pre-conv input
+          grad_conv_weight: (D, K) — gradient w.r.t. conv weights
+        """
+        c = self._conv_cache
+        x_shifts = c["x_shifts"]
+        B, T, D = c["B"], c["T"], c["D"]
+        K = self.conv_kernel
+        device = self.device
+
+        # grad_x[t] = w0*grad_out[t] + w1*grad_out[t+1] + w2*grad_out[t+2]
+        # (reverse shift: grad_out shifted left, zero-padded right)
+        grad_x_shifts = [grad_out]  # grad_out[t]
+        for k in range(1, K):
+            zeros_k = ttnn.zeros([B, k, D], dtype=ttnn.bfloat16,
+                                 layout=ttnn.TILE_LAYOUT, device=device)
+            # Shift left: drop first k, pad right with zeros
+            g_shifted = ttnn.concat([ttnn.slice(grad_out, [0, k, 0], [B, T, D]), zeros_k], dim=1)
+            grad_x_shifts.append(g_shifted)
+
+        w_taps = c["w_taps"]
+        grad_x = None
+        for k in range(K):
+            term = ttnn.mul(grad_x_shifts[k], w_taps[k])
+            if grad_x is None:
+                grad_x = term
+            else:
+                grad_x = ttnn.add(grad_x, term)
+
+        # grad_w_k = sum_{b,t} grad_out[b,t,d] * x_shift_k[b,t,d] → (D,)
+        grad_conv_weight = None
+        for k in range(K):
+            gw = ttnn.mul(grad_out, x_shifts[k])  # (B, T, D)
+            gw = ttnn.sum(gw, dim=0)  # (T, D)
+            gw = ttnn.sum(gw, dim=0)  # (D,)
+            gw = ttnn.reshape(gw, [D, 1])
+            if grad_conv_weight is None:
+                grad_conv_weight = gw
+            else:
+                grad_conv_weight = ttnn.concat([grad_conv_weight, gw], dim=-1)
+
+        return grad_x, grad_conv_weight
+
+    def _get_pc_decay_scales(self, T, device):
+        """Compute per-channel decay position scalings.
+
+        For per-channel decay, D[h,d,t,s] = gamma[h,d]^(t-s).
+        Using the exp decomposition:
+          out[t,d] = exp(t*lg) * sum_s scores[t,s] * exp(-s*lg) * v[s,d]
+
+        Returns:
+          pos_exp_neg: (1, H, T, d_head) = exp(-pos * log_gamma)  — scales V
+          pos_exp_pos: (1, H, T, d_head) = exp(pos * log_gamma)   — scales output
+        """
+        if self._pc_decay_T == T and self._pos_exp_neg is not None:
+            return self._pos_exp_neg, self._pos_exp_pos
+
+        H, d_h = self.n_heads, self.d_head
+        pos = torch.arange(T, dtype=torch.float32)  # (T,)
+
+        # log_gamma: (H, d_head) fp32 on device
+        log_gamma_host = ttnn.to_torch(self.gamma).float()  # (H, d_head)
+
+        # exp(-pos * log_gamma): (H, T, d_head)
+        # pos: (T, 1, 1), log_gamma: (1, H, d_head) → broadcast (T, H, d_head)
+        exp_neg = torch.exp(-pos.unsqueeze(1).unsqueeze(2) * log_gamma_host.unsqueeze(0))
+        exp_pos = torch.exp(pos.unsqueeze(1).unsqueeze(2) * log_gamma_host.unsqueeze(0))
+
+        # Reshape to (1, H, T, d_head) for broadcasting over batch
+        exp_neg = exp_neg.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)  # (1, H, T, d_head)
+        exp_pos = exp_pos.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+
+        self._pos_exp_neg = ttnn.from_torch(exp_neg, dtype=ttnn.bfloat16,
+                                             layout=ttnn.TILE_LAYOUT, device=device)
+        self._pos_exp_pos = ttnn.from_torch(exp_pos, dtype=ttnn.bfloat16,
+                                             layout=ttnn.TILE_LAYOUT, device=device)
+        self._pc_decay_T = T
+        return self._pos_exp_neg, self._pos_exp_pos
 
     def _apply_rope(self, x, B, H, T):
         """Apply RoPE to x: (B, H, T, d_head) -> (B, H, T, d_head).
@@ -1580,8 +1734,13 @@ class TTRetentionLayer:
 
         self._init_rope(T, device)
 
+        # Short conv before QKV (Kimi K3 §3): depthwise causal conv1d
+        x_conv = x
+        if self.short_conv:
+            x_conv = self._apply_short_conv(x, B, T, D)
+
         # QKV+gate projection: (B, T, 4D)
-        qkvg = ttnn.linear(x, self.qkv_weight)
+        qkvg = ttnn.linear(x_conv, self.qkv_weight)
 
         # Split: q, k, v, g each (B, T, D)
         q = ttnn.slice(qkvg, [0, 0, 0], [B, T, D])
@@ -1600,24 +1759,62 @@ class TTRetentionLayer:
         rot1_q, rot2_q = self._apply_rope_split(q_4d, B, H, T)
         rot1_k, rot2_k = self._apply_rope_split(k_4d, B, H, T)
 
-        # Decay matrix: (1, H, T, T)
-        D_decay = self._get_decay_matrix(T, device)
-
-        # Scores: (B, H, T, T) = (Q @ K^T) * scale * D
+        # Scores: (B, H, T, T) = (Q @ K^T) * scale
         # Split matmul: qk = q1@k1^T + q2@k2^T (avoids concat of rot1/rot2)
         qk = ttnn.add(
             ttnn.matmul(rot1_q, ttnn.transpose(rot1_k, -2, -1)),
             ttnn.matmul(rot2_q, ttnn.transpose(rot2_k, -2, -1))
         )
         scale_tt = self._scale_tt
-        # Reshape to 2D for the fused kernel (it expects flat (BH*T, T) layout)
-        qk_2d = ttnn.reshape(qk, [B * H * T, T])
-        D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
-        scores_2d = self._fused_scale_decay(qk_2d, D_decay_2d, self.scale, B, H, T, device)
-        scores = ttnn.reshape(scores_2d, [B, H, T, T])
 
-        # Output: (B, H, T, d_head) = scores @ V
-        out_4d = ttnn.matmul(scores, v_4d)
+        if self.per_channel_decay:
+            # Per-channel decay (Kimi K3 §5): gamma is (H, d_head), not (H,).
+            # Use exp decomposition to avoid materializing (1, H, d_head, T, T):
+            #   out[t,d] = exp(t*lg) * sum_s scores[t,s] * exp(-s*lg) * v[s,d]
+            # Scores get scale + causal mask only (no decay).
+            pos_exp_neg, pos_exp_pos = self._get_pc_decay_scales(T, device)
+
+            # Ensure causal mask is initialized (needed for scores masking)
+            if self._decay_T != T or self._causal_tt is None:
+                pos_t = torch.arange(T, dtype=torch.float32)
+                diff = pos_t.unsqueeze(1) - pos_t.unsqueeze(0)
+                causal = (diff >= 0).to(torch.bfloat16)
+                causal_tt = causal.unsqueeze(0).unsqueeze(0)
+                self._causal_tt = ttnn.from_torch(causal_tt, dtype=ttnn.bfloat16,
+                                                   layout=ttnn.TILE_LAYOUT, device=device)
+                self._decay_T = T
+
+            # Apply scale + causal mask to scores (no decay matrix)
+            qk_2d = ttnn.reshape(qk, [B * H * T, T])
+            # Build (H, T, T) causal mask for the fused kernel (broadcast over B)
+            causal_H_2d = ttnn.reshape(
+                ttnn.from_torch(
+                    ttnn.to_torch(self._causal_tt).squeeze().unsqueeze(0).expand(H, T, T).contiguous(),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                [H * T, T])
+            scores_2d = self._fused_scale_decay(qk_2d, causal_H_2d, self.scale, B, H, T, device)
+            scores = ttnn.reshape(scores_2d, [B, H, T, T])
+
+            # Scale V by exp(-pos * log_gamma): v_scaled[b,h,s,d] = v[b,h,s,d] * exp(-s*lg[h,d])
+            v_scaled = ttnn.mul(v_4d, pos_exp_neg)  # (B,H,T,d_h) * (1,H,T,d_h)
+
+            # Output: (B, H, T, d_head) = scores @ v_scaled
+            raw_out = ttnn.matmul(scores, v_scaled)
+
+            # Scale output by exp(pos * log_gamma): out[b,h,t,d] = raw_out * exp(t*lg[h,d])
+            out_4d = ttnn.mul(raw_out, pos_exp_pos)
+        else:
+            # Scalar decay (original): D[h,t,s] = gamma[h]^(t-s)
+            D_decay = self._get_decay_matrix(T, device)
+
+            # Reshape to 2D for the fused kernel (it expects flat (BH*T, T) layout)
+            qk_2d = ttnn.reshape(qk, [B * H * T, T])
+            D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
+            scores_2d = self._fused_scale_decay(qk_2d, D_decay_2d, self.scale, B, H, T, device)
+            scores = ttnn.reshape(scores_2d, [B, H, T, T])
+
+            # Output: (B, H, T, d_head) = scores @ V
+            out_4d = ttnn.matmul(scores, v_4d)
 
         # Reshape to (B, T, D): permute (B,H,T,d_h) -> (B,T,H,d_h) -> (B,T,D)
         out_flat = ttnn.reshape(ttnn.permute(out_4d, [0, 2, 1, 3]), [B, T, D])
@@ -1631,15 +1828,22 @@ class TTRetentionLayer:
 
         # Cache for backward
         self._cache = {
-            "x": x, "qkvg": qkvg, "q": q, "k": k, "v": v, "g": g,
+            "x": x, "x_conv": x_conv, "qkvg": qkvg, "q": q, "k": k, "v": v, "g": g,
             "q_4d": q_4d, "k_4d": k_4d, "v_4d": v_4d,
             "rot1_q": rot1_q, "rot2_q": rot2_q,
             "rot1_k": rot1_k, "rot2_k": rot2_k,
             "qk": qk, "scores": scores,
             "out_4d": out_4d, "out_flat": out_flat,
             "gate": gate, "out_gated": out_gated,
-            "D_decay": D_decay, "scale_tt": scale_tt,
+            "scale_tt": scale_tt,
         }
+        if self.per_channel_decay:
+            self._cache["v_scaled"] = v_scaled
+            self._cache["raw_out"] = raw_out
+            self._cache["pos_exp_neg"] = pos_exp_neg
+            self._cache["pos_exp_pos"] = pos_exp_pos
+        else:
+            self._cache["D_decay"] = D_decay
 
         return out
 
@@ -1676,42 +1880,123 @@ class TTRetentionLayer:
             [0, 2, 1, 3]
         )  # (B, H, T, d_h)
 
-        # --- Backward through out_4d = scores @ v_4d ---
-        grad_scores = ttnn.matmul(grad_out_4d, ttnn.transpose(c["v_4d"], -2, -1))  # (B, H, T, T)
-        grad_v_4d = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_out_4d)  # (B, H, T, d_h)
+        if self.per_channel_decay:
+            # --- Per-channel decay backward ---
+            # Forward was:
+            #   v_scaled = v * pos_exp_neg
+            #   raw_out = scores @ v_scaled
+            #   out_4d = raw_out * pos_exp_pos
+            #
+            # Backward:
+            #   grad_raw_out = grad_out_4d * pos_exp_pos
+            #   grad_pos_pos = sum(grad_out_4d * raw_out * pos)  (for gamma grad)
+            #   grad_scores = grad_raw_out @ v_scaled^T
+            #   grad_v_scaled = scores^T @ grad_raw_out
+            #   grad_v = grad_v_scaled * pos_exp_neg
+            #   grad_pos_neg = sum(grad_v_scaled * v * (-pos))  (for gamma grad)
+            pos_exp_pos = c["pos_exp_pos"]
+            pos_exp_neg = c["pos_exp_neg"]
+            raw_out = c["raw_out"]
+            v_scaled = c["v_scaled"]
 
-        # --- Backward through scores = qk * scale * D_decay (fused in forward) ---
-        # grad_qk = grad_scores * scale * D  (fused kernel — same as forward)
-        # grad_D  = grad_scores * (qk * scale)  (recompute qk*scale, then mul)
-        D_decay = c["D_decay"]
-        qk = c["qk"]
+            # grad_raw_out = grad_out_4d * pos_exp_pos
+            grad_raw_out = ttnn.mul(grad_out_4d, pos_exp_pos)
 
-        # Fused: grad_scores * scale * D in one pass = grad w.r.t. QK^T
-        grad_scores_2d = ttnn.reshape(grad_scores, [B * H * T, T])
-        D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
-        grad_scores_scaled_2d = self._fused_scale_decay(
-            grad_scores_2d, D_decay_2d, self.scale, B, H, T, device)
-        grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+            # grad_scores = grad_raw_out @ v_scaled^T
+            grad_scores = ttnn.matmul(grad_raw_out, ttnn.transpose(v_scaled, -2, -1))
 
-        # grad_D_decay = grad_scores * (qk * scale)
-        qk_scaled = ttnn.mul(qk, c["scale_tt"])
-        grad_D_decay = ttnn.mul(grad_scores, qk_scaled)  # (B, H, T, T)
+            # grad_v_scaled = scores^T @ grad_raw_out
+            grad_v_scaled = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_raw_out)
 
-        # --- Backward through D_decay w.r.t. gamma (log_gamma) ---
-        # D[h,t,s] = exp(diff[t,s] * log_gamma[h]) for s <= t
-        # dD/d(log_gamma[h]) = D[h,t,s] * diff[t,s]
-        # grad_log_gamma[h] = sum_{b,t,s} grad_D_decay[b,h,t,s] * D[h,t,s] * diff[t,s]
-        # Computed fully on device to avoid the 33ms/iter host transfer that was
-        # 47% of total time in profiling. Uses the cached diff_tt from forward.
-        # weighted = grad_D_decay * D_decay * diff  -> (B, H, T, T)
-        weighted = ttnn.mul(grad_D_decay, D_decay)      # (B, H, T, T)
-        weighted = ttnn.mul(weighted, self._diff_tt)     # broadcast (1,1,T,T)
-        # Sum over batch (dim 0) and positions (dims 2, 3) -> (H,)
-        grad_log_gamma = ttnn.sum(weighted, dim=0)       # (H, T, T)
-        grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H, T)
-        grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H,)
-        # Store as fp32 to match gamma's dtype
-        grad_gamma = ttnn.typecast(grad_log_gamma, ttnn.float32)
+            # grad_v = grad_v_scaled * pos_exp_neg
+            grad_v_4d = ttnn.mul(grad_v_scaled, pos_exp_neg)
+
+            # --- gamma gradient for per-channel decay ---
+            # gamma[h,d] affects out through pos_exp_pos and pos_exp_neg.
+            # pos_exp_pos[t,d] = exp(t * log_gamma[h,d])
+            # pos_exp_neg[s,d] = exp(-s * log_gamma[h,d])
+            #
+            # grad_log_gamma from pos_exp_pos:
+            #   d(pos_exp_pos)/d(log_gamma) = pos_exp_pos * pos
+            #   grad += sum_{b,t} grad_out_4d[b,h,t,d] * raw_out[b,h,t,d] * pos_exp_pos[h,t,d] * t
+            #         = sum_{b,t} grad_raw_out[b,h,t,d] * raw_out[b,h,t,d] * t
+            #
+            # grad_log_gamma from pos_exp_neg:
+            #   d(pos_exp_neg)/d(log_gamma) = -pos * pos_exp_neg
+            #   grad += sum_{b,s} grad_v_scaled[b,h,s,d] * v[b,h,s,d] * (-s)
+            #
+            # Combined: grad_log_gamma[h,d] = sum_t grad_raw_out*raw_out*t - sum_s grad_v_scaled*v*s
+            # Computed on host since gamma is fp32 and the position weighting needs
+            # the position index — much simpler than device-side indexing.
+
+            # Bring needed tensors to host for gamma gradient
+            grad_raw_out_h = ttnn.to_torch(grad_raw_out).float()  # (B,H,T,d_h)
+            raw_out_h = ttnn.to_torch(raw_out).float()
+            grad_v_scaled_h = ttnn.to_torch(grad_v_scaled).float()
+            v_4d_h = ttnn.to_torch(c["v_4d"]).float()
+            pos = torch.arange(T, dtype=torch.float32)  # (T,)
+
+            # grad from pos_exp_pos: sum over B,T of grad_raw_out * raw_out * t
+            # (B,H,T,d_h) * (B,H,T,d_h) * (T,) → sum over B,T → (H, d_h)
+            grad_from_pos = (grad_raw_out_h * raw_out_h * pos.view(1, 1, T, 1)).sum(dim=(0, 2))
+
+            # grad from pos_exp_neg: sum over B,S of grad_v_scaled * v * (-s)
+            grad_from_neg = (grad_v_scaled_h * v_4d_h * (-pos.view(1, 1, T, 1))).sum(dim=(0, 2))
+
+            grad_log_gamma_h = grad_from_pos + grad_from_neg  # (H, d_h)
+            grad_gamma = ttnn.from_torch(grad_log_gamma_h, dtype=ttnn.float32,
+                                          layout=ttnn.TILE_LAYOUT, device=device)
+
+            # --- Backward through scores = qk * scale * causal_mask ---
+            # (no decay in scores for per-channel mode — just scale + causal)
+            qk = c["qk"]
+            # Fused: grad_scores * scale * causal_mask
+            grad_scores_2d = ttnn.reshape(grad_scores, [B * H * T, T])
+            causal_H_2d = ttnn.reshape(
+                ttnn.from_torch(
+                    ttnn.to_torch(self._causal_tt).squeeze().unsqueeze(0).expand(H, T, T).contiguous(),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                [H * T, T])
+            grad_scores_scaled_2d = self._fused_scale_decay(
+                grad_scores_2d, causal_H_2d, self.scale, B, H, T, device)
+            grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+
+        else:
+            # --- Scalar decay backward (original) ---
+            # --- Backward through out_4d = scores @ v_4d ---
+            grad_scores = ttnn.matmul(grad_out_4d, ttnn.transpose(c["v_4d"], -2, -1))  # (B, H, T, T)
+            grad_v_4d = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_out_4d)  # (B, H, T, d_h)
+
+            # --- Backward through scores = qk * scale * D_decay (fused in forward) ---
+            D_decay = c["D_decay"]
+            qk = c["qk"]
+
+            # Fused: grad_scores * scale * D in one pass = grad w.r.t. QK^T
+            grad_scores_2d = ttnn.reshape(grad_scores, [B * H * T, T])
+            D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
+            grad_scores_scaled_2d = self._fused_scale_decay(
+                grad_scores_2d, D_decay_2d, self.scale, B, H, T, device)
+            grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+
+            # grad_D_decay = grad_scores * (qk * scale)
+            qk_scaled = ttnn.mul(qk, c["scale_tt"])
+            grad_D_decay = ttnn.mul(grad_scores, qk_scaled)  # (B, H, T, T)
+
+            # --- Backward through D_decay w.r.t. gamma (log_gamma) ---
+            # D[h,t,s] = exp(diff[t,s] * log_gamma[h]) for s <= t
+            # dD/d(log_gamma[h]) = D[h,t,s] * diff[t,s]
+            # grad_log_gamma[h] = sum_{b,t,s} grad_D_decay[b,h,t,s] * D[h,t,s] * diff[t,s]
+            # Computed fully on device to avoid the 33ms/iter host transfer that was
+            # 47% of total time in profiling. Uses the cached diff_tt from forward.
+            # weighted = grad_D_decay * D_decay * diff  -> (B, H, T, T)
+            weighted = ttnn.mul(grad_D_decay, D_decay)      # (B, H, T, T)
+            weighted = ttnn.mul(weighted, self._diff_tt)     # broadcast (1,1,T,T)
+            # Sum over batch (dim 0) and positions (dims 2, 3) -> (H,)
+            grad_log_gamma = ttnn.sum(weighted, dim=0)       # (H, T, T)
+            grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H, T)
+            grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H,)
+            # Store as fp32 to match gamma's dtype
+            grad_gamma = ttnn.typecast(grad_log_gamma, ttnn.float32)
 
         # grad_q_rope = grad_scores_scaled @ k_rope (split: no concat needed)
         # grad_k_rope = grad_scores_scaled^T @ q_rope (split: no concat needed)
@@ -1733,25 +2018,39 @@ class TTRetentionLayer:
         # --- Backward through QKV split: concat([q, k, v, g]) ---
         grad_qkvg = ttnn.concat([grad_q, grad_k, grad_v, grad_g], dim=-1)  # (B, T, 4D)
 
-        # --- Backward through QKV linear: qkvg = linear(x, qkv_weight) ---
-        x_2d = ttnn.reshape(c["x"], [B * T, D])
+        # --- Backward through QKV linear: qkvg = linear(x_conv, qkv_weight) ---
+        # Use x_conv (post-short-conv) as the input to the linear, not x
+        x_conv = c["x_conv"]
+        x_conv_2d = ttnn.reshape(x_conv, [B * T, D])
         grad_qkvg_2d = ttnn.reshape(grad_qkvg, [B * T, 4 * D])
-        grad_qkv_weight = ttnn.matmul(ttnn.transpose(x_2d, 0, 1), grad_qkvg_2d)
+        grad_qkv_weight = ttnn.matmul(ttnn.transpose(x_conv_2d, 0, 1), grad_qkvg_2d)
 
-        grad_x = ttnn.matmul(grad_qkvg_2d, ttnn.transpose(self.qkv_weight, 0, 1))
-        grad_x = ttnn.reshape(grad_x, [B, T, D])
+        grad_x_conv = ttnn.matmul(grad_qkvg_2d, ttnn.transpose(self.qkv_weight, 0, 1))
+        grad_x_conv = ttnn.reshape(grad_x_conv, [B, T, D])
+
+        # --- Backward through short conv (if enabled) ---
+        if self.short_conv:
+            grad_x, grad_conv_weight = self._short_conv_backward(grad_x_conv)
+        else:
+            grad_x = grad_x_conv
+            grad_conv_weight = None
 
         grads = {
             "qkv_weight": grad_qkv_weight,
             "out_proj_weight": grad_out_proj_weight,
             "gamma": grad_gamma,
         }
+        if grad_conv_weight is not None:
+            grads["conv_weight"] = grad_conv_weight
 
         return grad_x, grads
 
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
-        return {"qkv_weight": self.qkv_weight, "out_proj_weight": self.out_proj_weight,
-                "gamma": self.gamma}
+        params = {"qkv_weight": self.qkv_weight, "out_proj_weight": self.out_proj_weight,
+                  "gamma": self.gamma}
+        if self.short_conv:
+            params["conv_weight"] = self.conv_weight
+        return params
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         if "qkv_weight" in params:
@@ -1760,6 +2059,8 @@ class TTRetentionLayer:
             self.out_proj_weight = params["out_proj_weight"]
         if "gamma" in params:
             self.gamma = params["gamma"]
+        if "conv_weight" in params and self.short_conv:
+            self.conv_weight = params["conv_weight"]
 
 
 class TTGatedResidualLayer:
@@ -1872,7 +2173,9 @@ class TTWorkspaceModule:
       1. Read: slots attend over hidden states (Q from slots, KV from x)
       2. Write: hidden states attend over slots (Q from x, KV from slots)
 
-    Both passes use gated residual connections and RMSNorm.
+    Both passes use ReZero gates (scalar, init=0) and RMSNorm.
+    QK Normalization is applied to both cross-attention passes to prevent
+    entropy collapse and bound attention logits regardless of weight magnitudes.
     No causal masking (bidirectional cross-attention). No RoPE.
     """
 
@@ -1902,6 +2205,15 @@ class TTWorkspaceModule:
         self.write_v_weight = to_device(torch.randn(self.d_model, self.d_model, dtype=torch.bfloat16) * 0.02, device)
         self.write_out_weight = to_device(torch.randn(self.d_model, self.d_model, dtype=torch.bfloat16) * 0.02, device)
 
+        # QK-Norm learnable scale parameters (one per attention pass, shared across heads).
+        # Initialized to 1/√d_head (the standard attention scale). QK-Norm normalizes
+        # Q and K to unit L2 norm per head, then scales by this learnable scalar.
+        # This bounds attention logits to [-scale, +scale] regardless of weight magnitudes,
+        # preventing the entropy collapse / ill-conditioned QK^T that caused divergence.
+        qk_scale_init = self.scale
+        self.read_qk_scale = ttnn.from_torch(torch.tensor([qk_scale_init], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.write_qk_scale = ttnn.from_torch(torch.tensor([qk_scale_init], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
         # Norms
         self.norm = TTRMSNorm(self.d_model, device)       # for x
         self.slot_norm = TTRMSNorm(self.d_model, device)  # for slots
@@ -1912,12 +2224,14 @@ class TTWorkspaceModule:
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
 
-        # Gates (zero-init: sigmoid(gate_init) ≈ 0.007, workspace starts as near-identity)
-        # The gates gradually open as the model learns to use the workspace.
-        # This is the same principle as zero-initialization in LoRA.
-        gate_init_val = config.gate_init
-        self.read_gate = ttnn.from_torch(torch.tensor([gate_init_val], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.write_gate = ttnn.from_torch(torch.tensor([gate_init_val], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # ReZero gates: scalar gates initialized to 0.0 (true identity at init).
+        # Unlike sigmoid gates (which start at ~0.12 and have saturating gradients),
+        # ReZero gates start at exactly 0 and grow linearly through gradient descent.
+        # This gives the backbone time to learn a good representation before the
+        # workspace starts contributing, and avoids the sigmoid' gradient saturation
+        # that made gates slow to adapt.  (Bachlechner et al., 2020)
+        self.read_gate = ttnn.from_torch(torch.tensor([0.0], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.write_gate = ttnn.from_torch(torch.tensor([0.0], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         # Slot decay: learned scalar that makes the slot update contractive.
         # slots_out = norm(decay * slots_in + gate * read_out)
@@ -1943,6 +2257,58 @@ class TTWorkspaceModule:
         grad_sum = ttnn.expand(grad_sum, [B, H, L_q, L_k])
         return ttnn.mul(ttnn.sub(grad_attn, grad_sum), attn)
 
+    def _l2_normalize_heads(self, x, B, H, L):
+        """L2-normalize along d_head dimension. x: (B, H, L, d_head) -> normalized (B, H, L, d_head)
+
+        QK-Norm: normalizes Q and K to unit L2 norm per (B, H, L) position before attention.
+        This bounds attention logits regardless of weight magnitudes, preventing entropy
+        collapse.  (Henry et al., 2020 — now standard in OLMo 2, Gemma 3, Qwen 3)
+        """
+        # Compute L2 norm along last dim: ||x|| = sqrt(sum(x^2, dim=-1))
+        sq = ttnn.mul(x, x)                              # (B, H, L, d_h)
+        norm_sq = ttnn.sum(sq, dim=-1)                   # (B, H, L)
+        norm_sq = ttnn.reshape(norm_sq, [B, H, L, 1])
+        norm_sq = ttnn.expand(norm_sq, [B, H, L, self.d_head])
+        # Add epsilon for numerical stability (avoid div-by-zero)
+        eps_tt = ttnn.from_torch(torch.tensor([1e-6], dtype=torch.bfloat16),
+                                  dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        norm_sq = ttnn.add(norm_sq, eps_tt)
+        # rsqrt via SFPU
+        inv_norm = ttnn.rsqrt(norm_sq)                   # (B, H, L, d_h) broadcast
+        return ttnn.mul(x, inv_norm)
+
+    def _l2_normalize_backward(self, grad_normed, x, B, H, L):
+        """Backward through L2 normalization.
+
+        For y = x / ||x||, the Jacobian is:
+          dy/dx = (I - y*y^T) / ||x||
+        So: grad_x = (grad_y - y * (grad_y . y)) / ||x||
+
+        x: (B, H, L, d_head) — original (pre-norm) tensor
+        grad_normed: (B, H, L, d_head) — gradient w.r.t. normalized output
+        Returns: grad_x (B, H, L, d_head)
+        """
+        # Recompute y = x / ||x|| and ||x||
+        sq = ttnn.mul(x, x)
+        norm_sq = ttnn.sum(sq, dim=-1)                   # (B, H, L)
+        norm_sq_scalar = ttnn.reshape(norm_sq, [B, H, L, 1])
+        norm_sq_expanded = ttnn.expand(norm_sq_scalar, [B, H, L, self.d_head])
+        eps_tt = ttnn.from_torch(torch.tensor([1e-6], dtype=torch.bfloat16),
+                                  dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        norm_sq_safe = ttnn.add(norm_sq_expanded, eps_tt)
+        inv_norm = ttnn.rsqrt(norm_sq_safe)
+        y = ttnn.mul(x, inv_norm)                        # normalized output
+
+        # dot = grad_y . y  (scalar per position)
+        dot = ttnn.sum(ttnn.mul(grad_normed, y), dim=-1)  # (B, H, L)
+        dot = ttnn.reshape(dot, [B, H, L, 1])
+        dot = ttnn.expand(dot, [B, H, L, self.d_head])
+
+        # grad_x = (grad_y - y * dot) * inv_norm
+        grad_x = ttnn.sub(grad_normed, ttnn.mul(y, dot))
+        grad_x = ttnn.mul(grad_x, inv_norm)
+        return grad_x
+
     def forward(self, x: "ttnn.Tensor", slot_state: Optional["ttnn.Tensor"]) -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
         """x: (B, T, D), slot_state: (B, m, D) or None -> (x_out, slot_state_out)"""
         B, T, D = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
@@ -1967,25 +2333,25 @@ class TTWorkspaceModule:
         else:
             slots = slot_state
 
-        scale_tt = ttnn.from_torch(torch.tensor([self.scale], dtype=torch.bfloat16),
-                                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-
         # --- Read: slots attend over hidden states ---
         rq = self._reshape_to_heads(ttnn.linear(slots, self.read_q_weight), B, m)   # (B, H, m, d_h)
         rk = self._reshape_to_heads(ttnn.linear(x, self.read_k_weight), B, T)       # (B, H, T, d_h)
         rv = self._reshape_to_heads(ttnn.linear(x, self.read_v_weight), B, T)       # (B, H, T, d_h)
 
-        read_scores = ttnn.matmul(rq, ttnn.transpose(rk, -2, -1))  # (B, H, m, T)
-        read_scores = ttnn.mul(read_scores, scale_tt)
+        # QK-Norm: L2-normalize Q and K along d_head before attention
+        rq_norm = self._l2_normalize_heads(rq, B, H, m)   # (B, H, m, d_h)
+        rk_norm = self._l2_normalize_heads(rk, B, H, T)   # (B, H, T, d_h)
+
+        read_scores = ttnn.matmul(rq_norm, ttnn.transpose(rk_norm, -2, -1))  # (B, H, m, T)
+        read_scores = ttnn.mul(read_scores, self.read_qk_scale)  # learnable scale
         read_attn = ttnn.softmax(read_scores, dim=-1)               # (B, H, m, T)
         read_out_4d = ttnn.matmul(read_attn, rv)                    # (B, H, m, d_h)
         read_out = self._reshape_from_heads(read_out_4d, B, m)      # (B, m, D)
         read_out_proj = ttnn.linear(read_out, self.read_out_weight)  # (B, m, D)
 
-        # slots = slot_norm(decay * slots + sigmoid(read_gate) * read_out_proj)
-        # The decay factor makes the slot update contractive — old information
-        # fades unless the read gate actively reinforces it.
-        read_gate_val = ttnn.sigmoid(self.read_gate)
+        # slots = slot_norm(decay * slots + read_gate * read_out_proj)
+        # ReZero gate: scalar (no sigmoid), starts at 0.0 (true identity)
+        read_gate_val = self.read_gate  # ReZero: direct scalar, no sigmoid
         decayed_slots = ttnn.mul(self.slot_decay, slots)
         slots_pre_norm = ttnn.add(decayed_slots, ttnn.mul(read_gate_val, read_out_proj))
         slots_out = self.slot_norm.forward(slots_pre_norm)
@@ -1995,15 +2361,20 @@ class TTWorkspaceModule:
         wk = self._reshape_to_heads(ttnn.linear(slots_out, self.write_k_weight), B, m)  # (B, H, m, d_h)
         wv = self._reshape_to_heads(ttnn.linear(slots_out, self.write_v_weight), B, m)  # (B, H, m, d_h)
 
-        write_scores = ttnn.matmul(wq, ttnn.transpose(wk, -2, -1))  # (B, H, T, m)
-        write_scores = ttnn.mul(write_scores, scale_tt)
+        # QK-Norm: L2-normalize Q and K along d_head before attention
+        wq_norm = self._l2_normalize_heads(wq, B, H, T)   # (B, H, T, d_h)
+        wk_norm = self._l2_normalize_heads(wk, B, H, m)   # (B, H, m, d_h)
+
+        write_scores = ttnn.matmul(wq_norm, ttnn.transpose(wk_norm, -2, -1))  # (B, H, T, m)
+        write_scores = ttnn.mul(write_scores, self.write_qk_scale)  # learnable scale
         write_attn = ttnn.softmax(write_scores, dim=-1)              # (B, H, T, m)
         write_out_4d = ttnn.matmul(write_attn, wv)                   # (B, H, T, d_h)
         write_out = self._reshape_from_heads(write_out_4d, B, T)     # (B, T, D)
         write_out_proj = ttnn.linear(write_out, self.write_out_weight)  # (B, T, D)
 
-        # x = norm(x + sigmoid(write_gate) * write_out_proj)
-        write_gate_val = ttnn.sigmoid(self.write_gate)
+        # x = norm(x + write_gate * write_out_proj)
+        # ReZero gate: scalar (no sigmoid), starts at 0.0 (true identity)
+        write_gate_val = self.write_gate  # ReZero: direct scalar, no sigmoid
         x_pre_norm = ttnn.add(x, ttnn.mul(write_gate_val, write_out_proj))
         x_out = self.norm.forward(x_pre_norm)
 
@@ -2018,7 +2389,7 @@ class TTWorkspaceModule:
             "wq": wq, "wk": wk, "wv": wv, "write_attn": write_attn, "write_out_4d": write_out_4d,
             "write_out": write_out, "write_out_proj": write_out_proj,
             "write_gate_val": write_gate_val,
-            "x_pre_norm": x_pre_norm, "scale_tt": scale_tt,
+            "x_pre_norm": x_pre_norm,
             "B": B, "T": T, "m": m,
             "slot_perm": slot_perm,
         }
@@ -2046,20 +2417,17 @@ class TTWorkspaceModule:
         B, T, m = c["B"], c["T"], c["m"]
         H, d_h, D = self.n_heads, self.d_head, self.d_model
         device = self.device
-        scale_tt = c["scale_tt"]
 
         # --- Backward through x_out = norm(x_pre_norm) ---
         grad_x_pre_norm, grad_norm_w = self.norm.backward(grad_x_out, c["x_pre_norm"])
 
-        # --- Backward through x_pre_norm = x + sigmoid(write_gate) * write_out_proj ---
+        # --- Backward through x_pre_norm = x + write_gate * write_out_proj ---
+        # ReZero gate: no sigmoid, gate is a direct scalar
         grad_x_from_write = grad_x_pre_norm  # residual
         grad_write_out_proj = ttnn.mul(grad_x_pre_norm, c["write_gate_val"])
 
-        # grad_write_gate = sum(grad_x_pre_norm * write_out_proj * sigmoid'(write_gate))
-        write_gate_val = c["write_gate_val"]
-        ones_1 = ttnn.from_torch(torch.ones(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        write_sig_prime = ttnn.mul(write_gate_val, ttnn.sub(ones_1, write_gate_val))
-        grad_write_gate = ttnn.mul(ttnn.mul(grad_x_pre_norm, c["write_out_proj"]), write_sig_prime)
+        # grad_write_gate = sum(grad_x_pre_norm * write_out_proj)  (no sigmoid derivative)
+        grad_write_gate = ttnn.mul(grad_x_pre_norm, c["write_out_proj"])
         grad_write_gate = ttnn.sum(ttnn.sum(ttnn.sum(grad_write_gate, dim=0), dim=0), dim=0)
 
         # --- Backward through write_out_proj = linear(write_out) ---
@@ -2076,15 +2444,28 @@ class TTWorkspaceModule:
             grad_write_attn = ttnn.add(grad_write_attn, extra_grad_write_attn)
         grad_wv = ttnn.matmul(ttnn.transpose(c["write_attn"], -2, -1), grad_write_out_4d)  # (B, H, m, d_h)
 
-        # --- Backward through write_attn = softmax(write_scores * scale) ---
+        # --- Backward through write_attn = softmax(write_scores * write_qk_scale) ---
+        # softmax_backward gives d(L)/d(scores) where scores = scores_pre * qk_scale
         grad_write_scores = self._softmax_backward(grad_write_attn, c["write_attn"], B, H, T, m)
-        grad_write_scores = ttnn.mul(grad_write_scores, scale_tt)
 
-        # grad_wq = grad_write_scores @ wk, grad_wk = grad_write_scores^T @ wq
-        wk = c["wk"]
+        # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling
         wq = c["wq"]
-        grad_wq = ttnn.matmul(grad_write_scores, wk)               # (B, H, T, d_h)
-        grad_wk = ttnn.matmul(ttnn.transpose(grad_write_scores, -2, -1), wq)  # (B, H, m, d_h)
+        wk = c["wk"]
+        wq_norm = self._l2_normalize_heads(wq, B, H, T)
+        wk_norm = self._l2_normalize_heads(wk, B, H, m)
+        write_scores_pre = ttnn.matmul(wq_norm, ttnn.transpose(wk_norm, -2, -1))
+        grad_write_qk_scale = ttnn.sum(ttnn.mul(grad_write_scores, write_scores_pre))
+
+        # Now scale: d(L)/d(scores_pre) = d(L)/d(scores) * qk_scale
+        grad_write_scores = ttnn.mul(grad_write_scores, self.write_qk_scale)
+
+        # grad_wq_norm = d(L)/d(scores_pre) @ wk_norm, etc.
+        grad_wq_norm = ttnn.matmul(grad_write_scores, wk_norm)               # (B, H, T, d_h)
+        grad_wk_norm = ttnn.matmul(ttnn.transpose(grad_write_scores, -2, -1), wq_norm)  # (B, H, m, d_h)
+
+        # --- Backward through QK-Norm: wq_norm = L2_normalize(wq), wk_norm = L2_normalize(wk) ---
+        grad_wq = self._l2_normalize_backward(grad_wq_norm, wq, B, H, T)
+        grad_wk = self._l2_normalize_backward(grad_wk_norm, wk, B, H, m)
 
         # --- Backward through write projections ---
         # wq = linear(x), wk = linear(slots_out), wv = linear(slots_out)
@@ -2114,14 +2495,13 @@ class TTWorkspaceModule:
         # --- Backward through slots_out = slot_norm(slots_pre_norm) ---
         grad_slots_pre_norm, grad_slot_norm_w = self.slot_norm.backward(grad_slots_total, c["slots_pre_norm"])
 
-        # --- Backward through slots_pre_norm = decay * slots_in + sigmoid(read_gate) * read_out_proj ---
+        # --- Backward through slots_pre_norm = decay * slots_in + read_gate * read_out_proj ---
+        # ReZero gate: no sigmoid, gate is a direct scalar
         grad_slots_in_from_read = ttnn.mul(grad_slots_pre_norm, self.slot_decay)  # residual * decay
         grad_read_out_proj = ttnn.mul(grad_slots_pre_norm, c["read_gate_val"])
 
-        # grad_read_gate
-        read_gate_val = c["read_gate_val"]
-        read_sig_prime = ttnn.mul(read_gate_val, ttnn.sub(ones_1, read_gate_val))
-        grad_read_gate = ttnn.mul(ttnn.mul(grad_slots_pre_norm, c["read_out_proj"]), read_sig_prime)
+        # grad_read_gate = sum(grad_slots_pre_norm * read_out_proj)  (no sigmoid derivative)
+        grad_read_gate = ttnn.mul(grad_slots_pre_norm, c["read_out_proj"])
         grad_read_gate = ttnn.sum(ttnn.sum(ttnn.sum(grad_read_gate, dim=0), dim=0), dim=0)
 
         # grad_slot_decay = sum(grad_slots_pre_norm * slots_in)
@@ -2142,15 +2522,28 @@ class TTWorkspaceModule:
             grad_read_attn = ttnn.add(grad_read_attn, extra_grad_read_attn)
         grad_rv = ttnn.matmul(ttnn.transpose(c["read_attn"], -2, -1), grad_read_out_4d)  # (B, H, T, d_h)
 
-        # --- Backward through read_attn = softmax(read_scores * scale) ---
+        # --- Backward through read_attn = softmax(read_scores * read_qk_scale) ---
+        # softmax_backward gives d(L)/d(scores) where scores = scores_pre * qk_scale
         grad_read_scores = self._softmax_backward(grad_read_attn, c["read_attn"], B, H, m, T)
-        grad_read_scores = ttnn.mul(grad_read_scores, scale_tt)
 
-        # grad_rq = grad_read_scores @ rk, grad_rk = grad_read_scores^T @ rq
+        # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling
         rk = c["rk"]
         rq = c["rq"]
-        grad_rq = ttnn.matmul(grad_read_scores, rk)               # (B, H, m, d_h)
-        grad_rk = ttnn.matmul(ttnn.transpose(grad_read_scores, -2, -1), rq)  # (B, H, T, d_h)
+        rq_norm = self._l2_normalize_heads(rq, B, H, m)
+        rk_norm = self._l2_normalize_heads(rk, B, H, T)
+        read_scores_pre = ttnn.matmul(rq_norm, ttnn.transpose(rk_norm, -2, -1))
+        grad_read_qk_scale = ttnn.sum(ttnn.mul(grad_read_scores, read_scores_pre))
+
+        # Now scale: d(L)/d(scores_pre) = d(L)/d(scores) * qk_scale
+        grad_read_scores = ttnn.mul(grad_read_scores, self.read_qk_scale)
+
+        # grad_rq_norm = d(L)/d(scores_pre) @ rk_norm, etc.
+        grad_rq_norm = ttnn.matmul(grad_read_scores, rk_norm)               # (B, H, m, d_h)
+        grad_rk_norm = ttnn.matmul(ttnn.transpose(grad_read_scores, -2, -1), rq_norm)  # (B, H, T, d_h)
+
+        # --- Backward through QK-Norm: rq_norm = L2_normalize(rq), rk_norm = L2_normalize(rk) ---
+        grad_rq = self._l2_normalize_backward(grad_rq_norm, rq, B, H, m)
+        grad_rk = self._l2_normalize_backward(grad_rk_norm, rk, B, H, T)
 
         # --- Backward through read projections ---
         grad_rq_3d = self._reshape_from_heads(grad_rq, B, m)
@@ -2202,6 +2595,8 @@ class TTWorkspaceModule:
             "read_gate": grad_read_gate,
             "write_gate": grad_write_gate,
             "slot_decay": grad_slot_decay,
+            "read_qk_scale": grad_read_qk_scale,
+            "write_qk_scale": grad_write_qk_scale,
         }
 
         return grad_x, grad_slots_in, grads
@@ -2216,6 +2611,7 @@ class TTWorkspaceModule:
             "ws_norm_weight": self.norm.weight, "ws_slot_norm_weight": self.slot_norm.weight,
             "read_gate": self.read_gate, "write_gate": self.write_gate,
             "slot_decay": self.slot_decay,
+            "read_qk_scale": self.read_qk_scale, "write_qk_scale": self.write_qk_scale,
         }
 
     def normalize_slots(self):
@@ -2328,6 +2724,260 @@ class TTWorkspaceModule:
                 setattr(self, k, v)
 
 
+# ---------------------------------------------------------------------------
+# Attention Residual Core (Kimi K3 style)
+# ---------------------------------------------------------------------------
+
+class AttentionResidual:
+    """Attention Residuals for the recurrent core — replaces fixed blend.
+
+    Instead of blending iteration outputs with a fixed linear combination
+    (x = blend * x_new + (1 - blend) * x), this module computes softmax
+    attention over all iteration outputs (including the pre-core input),
+    using a learned query vector that is not input-dependent.
+
+    This gives every iteration selective access to all previous iteration
+    representations, with bounded output magnitude (softmax normalizes)
+    and consistent gradient magnitude across K iterations — directly
+    addressing the gradient amplification that caused Cell C divergence.
+
+    Based on Kimi K3's Attention Residuals (Bachlechner et al., 2020;
+    Moonshot AI, 2026). See kimi-k3-relevance-notes.md §2.
+
+    Forward:
+        Given K+1 outputs [x_0, x_1, ..., x_K] (each (B, T, d_model)):
+        scores_k = sum_d(x_k * query) * scale       → (B, T) per k
+        alpha = softmax([scores_0, ..., scores_K])   → (B, T, K+1)
+        x_final = sum_k alpha_k * x_k                → (B, T, d_model)
+
+    The query is a single (d_model,) vector shared across all positions and
+    batches. The scale is a learnable scalar (init 1/sqrt(d_model)).
+    """
+
+    def __init__(self, d_model: int, device, k_max: int):
+        self.d_model = d_model
+        self.device = device
+        self.k_max = k_max  # max number of iterations (for mask precomputation)
+
+        # Learned query vector: (d_model,) → stored as (1, d_model) for tiling
+        query_init = torch.randn(1, d_model, dtype=torch.bfloat16) / math.sqrt(d_model)
+        self.query = ttnn.from_torch(query_init, dtype=ttnn.bfloat16,
+                                      layout=ttnn.TILE_LAYOUT, device=device)
+
+        # Learnable scale: init 1/sqrt(d_model) (standard attention scale)
+        scale_init = 1.0 / math.sqrt(d_model)
+        self.scale = ttnn.from_torch(torch.tensor([scale_init], dtype=torch.bfloat16),
+                                      dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+        # Cache for backward
+        self._cache = {}
+
+    def _mask_scores(self, scores_list, K_active, B, T):
+        """Apply mask to scores: set inactive iteration scores to -1e4.
+
+        scores_list: list of (B, T) tensors, length k_max+1
+        K_active: number of active iterations (scores 0..K_active are kept)
+        Returns: list of masked (B, T) scores
+        """
+        device = self.device
+        masked = []
+        neg_inf = ttnn.from_torch(
+            torch.tensor([-1e4], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        for k, score in enumerate(scores_list):
+            if k <= K_active:
+                masked.append(score)
+            else:
+                # Replace with -1e4 so softmax gives ~0 weight
+                masked.append(ttnn.mul(ttnn.zeros_like(score), neg_inf))
+        return masked
+
+    def forward(self, x_outputs, K_active) -> "ttnn.Tensor":
+        """Compute attention residual over iteration outputs.
+
+        Args:
+            x_outputs: list of (B, T, d_model) tensors, length k_max+1.
+                       x_outputs[0] is the pre-core input, [1..K] are iteration outputs.
+            K_active: number of active iterations (0..K_active are included in attention)
+
+        Returns: (B, T, d_model) — attention-weighted combination
+        """
+        device = self.device
+        D = self.d_model
+        n_outputs = len(x_outputs)  # k_max + 1
+
+        # Reshape query for broadcasting: (1, d_model) → (1, 1, d_model)
+        query_b = ttnn.reshape(self.query, [1, 1, D])
+
+        # Compute scores: score_k = sum_d(x_k * query) for each (B, T) position
+        scores_list = []
+        scores_pre_scale = []  # before scale (for backward)
+        for k, x_k in enumerate(x_outputs):
+            # x_k: (B, T, D), query_b: (1, 1, D) → broadcast mul → (B, T, D)
+            xq = ttnn.mul(x_k, query_b)  # (B, T, D)
+            score_k = ttnn.sum(xq, dim=-1)  # (B, T) — drops last dim
+            # Reshape to (B, T, 1) for concat
+            B_k, T_k = int(score_k.shape[0]), int(score_k.shape[1])
+            score_k = ttnn.reshape(score_k, [B_k, T_k, 1])
+            scores_pre_scale.append(score_k)
+            # Apply scale
+            score_k_scaled = ttnn.mul(score_k, self.scale)
+            scores_list.append(score_k_scaled)
+
+        # Mask inactive iterations
+        scores_masked = self._mask_scores(scores_list, K_active, int(x_outputs[0].shape[0]), int(x_outputs[0].shape[1]))
+
+        # Concat scores: (B, T, n_outputs)
+        scores = ttnn.concat(scores_masked, dim=-1)
+
+        # Softmax over the n_outputs dimension
+        alpha = ttnn.softmax(scores, dim=-1)  # (B, T, n_outputs)
+
+        # Weighted sum: x_final = sum_k alpha_k * x_k
+        B, T = int(x_outputs[0].shape[0]), int(x_outputs[0].shape[1])
+        x_final = None
+        for k, x_k in enumerate(x_outputs):
+            # Slice alpha_k: (B, T, 1)
+            alpha_k = ttnn.slice(alpha, [0, 0, k], [B, T, k + 1])  # (B, T, 1)
+            # Broadcast multiply: (B, T, D) * (B, T, 1) → (B, T, D)
+            term = ttnn.mul(x_k, alpha_k)
+            if x_final is None:
+                x_final = term
+            else:
+                x_final = ttnn.add(x_final, term)
+
+        # Cache for backward
+        self._cache = {
+            "x_outputs": x_outputs,
+            "scores_pre_scale": scores_pre_scale,  # before scale, before mask
+            "scores_masked": scores_masked,  # after scale, after mask
+            "alpha": alpha,
+            "K_active": K_active,
+            "B": B, "T": T, "D": D,
+            "query_b": query_b,
+        }
+
+        return x_final
+
+    def backward(self, grad_x_final):
+        """Backward through attention residual.
+
+        Args:
+            grad_x_final: (B, T, d_model) — gradient w.r.t. attention output
+
+        Returns:
+            grad_x_list: list of (B, T, d_model) — gradients w.r.t. each x_k
+            grads: dict with gradients for query and scale
+        """
+        c = self._cache
+        x_outputs = c["x_outputs"]
+        scores_pre_scale = c["scores_pre_scale"]
+        scores_masked = c["scores_masked"]
+        alpha = c["alpha"]
+        K_active = c["K_active"]
+        B, T, D = c["B"], c["T"], c["D"]
+        query_b = c["query_b"]
+        device = self.device
+        n_outputs = len(x_outputs)
+
+        # --- Through x_final = sum_k alpha_k * x_k ---
+        # grad_alpha_k = sum_d(grad_x_final * x_k) → (B, T, 1) per k
+        # grad_x_k_from_v = alpha_k * grad_x_final → (B, T, D)
+        grad_alpha_list = []
+        grad_x_from_v = []
+        for k, x_k in enumerate(x_outputs):
+            # grad_alpha_k = (grad_x_final * x_k).sum(dim=-1)
+            gx_xk = ttnn.mul(grad_x_final, x_k)  # (B, T, D)
+            grad_alpha_k = ttnn.sum(gx_xk, dim=-1)  # (B, T)
+            grad_alpha_k = ttnn.reshape(grad_alpha_k, [B, T, 1])
+            grad_alpha_list.append(grad_alpha_k)
+
+            # grad_x_k_from_v = alpha_k * grad_x_final
+            alpha_k = ttnn.slice(alpha, [0, 0, k], [B, T, k + 1])  # (B, T, 1)
+            grad_xk_v = ttnn.mul(alpha_k, grad_x_final)  # (B, T, D)
+            grad_x_from_v.append(grad_xk_v)
+
+        # Concat grad_alpha: (B, T, n_outputs)
+        grad_alpha = ttnn.concat(grad_alpha_list, dim=-1)
+
+        # --- Through alpha = softmax(scores_masked) ---
+        # Manual softmax backward: grad_scores = (grad_alpha - sum(grad_alpha*alpha, -1, keepdim)) * alpha
+        grad_sum = ttnn.sum(ttnn.mul(grad_alpha, alpha), dim=-1)  # (B, T)
+        grad_sum = ttnn.reshape(grad_sum, [B, T, 1])
+        grad_sum = ttnn.expand(grad_sum, [B, T, n_outputs])
+        grad_scores = ttnn.mul(ttnn.sub(grad_alpha, grad_sum), alpha)  # (B, T, n_outputs)
+
+        # --- Through scores_masked = scores_list * mask_or_keep ---
+        # For active k: scores_masked_k = scores_list_k (no change)
+        # For inactive k: scores_masked_k = -1e4 (constant, grad = 0)
+        # So grad_scores_list_k = grad_scores_k for active, 0 for inactive
+        # Also, scores_list_k = scores_pre_scale_k * scale
+        # grad_scale = sum(grad_scores_k * scores_pre_scale_k) for active k
+        grad_scale = ttnn.from_torch(
+            torch.tensor([0.0], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        grad_scores_pre_scale_list = []
+        for k in range(n_outputs):
+            grad_score_k = ttnn.slice(grad_scores, [0, 0, k], [B, T, k + 1])  # (B, T, 1)
+            if k <= K_active:
+                # grad_scale += grad_score_k * scores_pre_scale_k
+                grad_scale = ttnn.add(grad_scale, ttnn.sum(ttnn.mul(grad_score_k, scores_pre_scale[k])))
+                # grad_scores_pre_scale_k = grad_score_k * scale
+                grad_spk = ttnn.mul(grad_score_k, self.scale)
+            else:
+                # Inactive: no gradient flows to scores_pre_scale
+                grad_spk = ttnn.zeros_like(grad_score_k)
+            grad_scores_pre_scale_list.append(grad_spk)
+
+        # --- Through scores_pre_scale_k = sum_d(x_k * query) ---
+        # grad_x_k_from_score = grad_scores_pre_scale_k * query  (broadcast)
+        # grad_query += sum over k, positions of grad_scores_pre_scale_k * x_k
+        grad_query = ttnn.from_torch(
+            torch.zeros(1, D, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        grad_x_list = []
+        for k, x_k in enumerate(x_outputs):
+            grad_spk = grad_scores_pre_scale_list[k]  # (B, T, 1)
+            # grad_x_k_from_score = grad_spk * query (broadcast over D)
+            # query_b is (1, 1, D), grad_spk is (B, T, 1) → mul broadcasts → (B, T, D)
+            grad_xk_s = ttnn.mul(grad_spk, query_b)  # (B, T, D)
+
+            # grad_query += sum over (B, T) of grad_spk * x_k
+            # grad_spk: (B, T, 1), x_k: (B, T, D) → mul → (B, T, D) → sum to (1, D)
+            gq_term = ttnn.mul(grad_spk, x_k)  # (B, T, D)
+            # Sum over B and T dims
+            gq_term = ttnn.sum(gq_term, dim=0)  # (T, D) — wait, sum over dim=0
+            # Actually ttnn.sum reduces the specified dim. Need to sum over B (dim 0) and T (dim 1)
+            # After sum dim=0: shape depends on ttnn behavior. Let's sum both dims.
+            gq_term = ttnn.sum(gq_term, dim=0)  # sum remaining batch/spatial dim
+            # Reshape to (1, D) for accumulation
+            gq_term = ttnn.reshape(gq_term, [1, D])
+            grad_query = ttnn.add(grad_query, gq_term)
+
+            # Total grad_x_k = grad_x_k_from_v + grad_x_k_from_score
+            grad_x_k = ttnn.add(grad_x_from_v[k], grad_xk_s)
+            grad_x_list.append(grad_x_k)
+
+        grads = {
+            "ar_query": grad_query,
+            "ar_scale": grad_scale,
+        }
+
+        return grad_x_list, grads
+
+    def get_params(self) -> Dict[str, "ttnn.Tensor"]:
+        return {"ar_query": self.query, "ar_scale": self.scale}
+
+    def set_params(self, params: Dict[str, "ttnn.Tensor"]):
+        if "ar_query" in params:
+            self.query = params["ar_query"]
+        if "ar_scale" in params:
+            self.scale = params["ar_scale"]
+
+
 class TTMambaWorkspaceModel:
     """Full model using tt-nn operations.
 
@@ -2369,6 +3019,13 @@ class TTMambaWorkspaceModel:
             self.workspace = TTWorkspaceModule(config, device)
         else:
             self.workspace = None
+
+        # Attention Residual Core (Cell C with Kimi K3 style residuals)
+        # Replaces the fixed blend with learned attention over iteration outputs
+        if config.recurrent_core and config.attention_residual_core:
+            self.attn_residual = AttentionResidual(config.d_model, device, config.k_train_max)
+        else:
+            self.attn_residual = None
 
         # Final norm and LM head (weight-tied with embedding)
         self.norm = TTRMSNorm(config.d_model, device)
@@ -2427,74 +3084,157 @@ class TTMambaWorkspaceModel:
         # --- Phase 2: recurrent core (core_start..core_end-1) ---
         if config.recurrent_core:
             core_layer_indices = list(range(config.core_start, config.core_end))
-            self._core_blend_info = []  # (iter, active_scalar_tensor, x_before, slot_before, x_new, slot_new)
 
-            # 1/sqrt(K) residual scaling: normalizes gradient accumulation across K
-            # iterations so that the total gradient norm is independent of K.
-            # Without this, gradients from K iterations sum to ~K*sigma, causing
-            # instability at large K. With 1/sqrt(K) scaling, they sum to ~sqrt(K)*sigma.
-            # The blend factor becomes active/sqrt(K) instead of active, turning the
-            # full replacement (x = x_new) into a partial update:
-            #   x = (1 - active/sqrt(K)) * x + (active/sqrt(K)) * x_new
-            import math
-            k_scale = 1.0 / math.sqrt(K) if K > 0 else 0.0
+            if self.attn_residual is not None:
+                # === Attention Residual Core (Kimi K3 style) ===
+                # Run K active iterations without blend, storing each output.
+                # After all iterations, compute softmax attention over all
+                # outputs (including pre-core input x_0) with a learned query.
+                # Inactive iterations (k >= K) are skipped entirely.
+                #
+                # The slot_state chains normally through workspace calls (no
+                # blend). The 1/K slot gradient scaling is applied in backward
+                # to dampen the slot chain's multiplicative gradient path.
+                self._core_blend_info = []
+                self._core_x_outputs = [x]  # x_0 = pre-core output
 
-            for iteration in range(k_max):
-                active = 1.0 if iteration < K else 0.0
-                # Scale the blend factor by 1/sqrt(K) for gradient normalization
-                blend_factor = active * k_scale
-                active_tt = ttnn.from_torch(
-                    torch.tensor([blend_factor], dtype=torch.bfloat16),
-                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-                )
+                import math
+                slot_scale = 1.0 / K if K > 0 else 0.0
 
-                # Run one core iteration
-                x_new = x
-                slot_state_new = slot_state
-                for i in core_layer_indices:
-                    if self.workspace is not None and i in self.attention_positions:
+                for iteration in range(k_max):
+                    active = (iteration < K)
+                    if not active:
+                        # Inactive: skip core layers, store current x (will be masked)
+                        self._core_x_outputs.append(x)
+                        # Record blend info with slot_scale for backward
+                        slot_scale_tt = ttnn.from_torch(
+                            torch.tensor([0.0], dtype=torch.bfloat16),
+                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                        )
+                        self._core_blend_info.append({
+                            "iteration": iteration, "active": 0.0,
+                            "slot_scale_tt": slot_scale_tt,
+                        })
+                        continue
+
+                    # Run one core iteration (no blend — just pass through)
+                    for i in core_layer_indices:
+                        if self.workspace is not None and i in self.attention_positions:
+                            was_none = (slot_state is None)
+                            x, slot_state = self.workspace.forward(x, slot_state)
+                            self._fwd_trace.append(("ws", "core", iteration, i, was_none))
+                        x = self.layers[i].forward(x)
+                        self._fwd_trace.append(("layer", "core", iteration, i))
+
+                    # Final workspace at end of core iteration
+                    if self.workspace is not None:
+                        was_none = (slot_state is None)
+                        x, slot_state = self.workspace.forward(x, slot_state)
+                        self._fwd_trace.append(("ws", "core_end", iteration, -1, was_none))
+
+                    # Store output (no blend — x is the raw iteration output)
+                    self._core_x_outputs.append(x)
+
+                    # Slot gradient scaling factor for backward
+                    slot_scale_tt = ttnn.from_torch(
+                        torch.tensor([slot_scale], dtype=torch.bfloat16),
+                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                    )
+                    self._core_blend_info.append({
+                        "iteration": iteration, "active": 1.0,
+                        "slot_scale_tt": slot_scale_tt,
+                    })
+
+                # Compute attention residual over all stored outputs
+                # x_outputs has k_max+1 entries: [x_0, x_1, ..., x_{k_max}]
+                # Only entries 0..K are active (rest are duplicates, masked in attention)
+                x = self.attn_residual.forward(self._core_x_outputs, K_active=K)
+                self._fwd_trace.append(("ar", "core", K))
+
+            else:
+                # === Fixed blend core (original) ===
+                self._core_blend_info = []  # (iter, active_scalar_tensor, x_before, slot_before, x_new, slot_new)
+
+                # 1/sqrt(K) residual scaling: normalizes gradient accumulation across K
+                # iterations so that the total gradient norm is independent of K.
+                # Without this, gradients from K iterations sum to ~K*sigma, causing
+                # instability at large K. With 1/sqrt(K) scaling, they sum to ~sqrt(K)*sigma.
+                # The blend factor becomes active/sqrt(K) instead of active, turning the
+                # full replacement (x = x_new) into a partial update:
+                #   x = (1 - active/sqrt(K)) * x + (active/sqrt(K)) * x_new
+                import math
+                k_scale = 1.0 / math.sqrt(K) if K > 0 else 0.0
+                # Slot-state gradient scaling: 1/K (more conservative than 1/sqrt(K))
+                # The x residual uses 1/sqrt(K) blend, but the slot chain compounds
+                # the workspace's gradient amplification multiplicatively across K
+                # iterations. Using 1/K for the slot chain makes the per-iteration
+                # gain A/K² + 1 - 1/sqrt(K), which is ≤1 when A ≤ K*sqrt(K)/K = sqrt(K)
+                # — much more robust than 1/sqrt(K) which requires A ≤ sqrt(K).
+                slot_scale = 1.0 / K if K > 0 else 0.0
+
+                for iteration in range(k_max):
+                    active = 1.0 if iteration < K else 0.0
+                    # Scale the blend factor by 1/sqrt(K) for gradient normalization
+                    blend_factor = active * k_scale
+                    active_tt = ttnn.from_torch(
+                        torch.tensor([blend_factor], dtype=torch.bfloat16),
+                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                    )
+                    # Slot-state gradient scaling factor (1/K for active iterations)
+                    slot_blend_factor = active * slot_scale
+                    slot_scale_tt = ttnn.from_torch(
+                        torch.tensor([slot_blend_factor], dtype=torch.bfloat16),
+                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                    )
+
+                    # Run one core iteration
+                    x_new = x
+                    slot_state_new = slot_state
+                    for i in core_layer_indices:
+                        if self.workspace is not None and i in self.attention_positions:
+                            was_none = (slot_state_new is None)
+                            x_new, slot_state_new = self.workspace.forward(x_new, slot_state_new)
+                            self._fwd_trace.append(("ws", "core", iteration, i, was_none))
+                        x_new = self.layers[i].forward(x_new)
+                        self._fwd_trace.append(("layer", "core", iteration, i))
+
+                    # Final workspace at end of core iteration
+                    if self.workspace is not None:
                         was_none = (slot_state_new is None)
                         x_new, slot_state_new = self.workspace.forward(x_new, slot_state_new)
-                        self._fwd_trace.append(("ws", "core", iteration, i, was_none))
-                    x_new = self.layers[i].forward(x_new)
-                    self._fwd_trace.append(("layer", "core", iteration, i))
+                        self._fwd_trace.append(("ws", "core_end", iteration, -1, was_none))
 
-                # Final workspace at end of core iteration
-                if self.workspace is not None:
-                    was_none = (slot_state_new is None)
-                    x_new, slot_state_new = self.workspace.forward(x_new, slot_state_new)
-                    self._fwd_trace.append(("ws", "core_end", iteration, -1, was_none))
+                    # Blend: active iterations partially update state (1/sqrt(K) scaling),
+                    # padding iterations keep old state.
+                    if slot_state is None:
+                        # First iteration is always active (K >= 1)
+                        # Use scaled blend: x = blend * x_new + (1 - blend) * x
+                        x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
+                            ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                           dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                            active_tt), x))
+                        slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
+                                              ttnn.mul(ttnn.sub(
+                                                  ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                                                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                                                  active_tt), slot_state_new))
+                    else:
+                        # x = blend * x_new + (1 - blend) * x
+                        x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
+                            ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                           dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                            active_tt), x))
+                        slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
+                                              ttnn.mul(ttnn.sub(
+                                                  ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                                                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                                                  active_tt), slot_state))
 
-                # Blend: active iterations partially update state (1/sqrt(K) scaling),
-                # padding iterations keep old state.
-                if slot_state is None:
-                    # First iteration is always active (K >= 1)
-                    # Use scaled blend: x = blend * x_new + (1 - blend) * x
-                    x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
-                        ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                       dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                        active_tt), x))
-                    slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
-                                          ttnn.mul(ttnn.sub(
-                                              ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                                             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                                              active_tt), slot_state_new))
-                else:
-                    # x = blend * x_new + (1 - blend) * x
-                    x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
-                        ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                       dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                        active_tt), x))
-                    slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
-                                          ttnn.mul(ttnn.sub(
-                                              ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                                             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                                              active_tt), slot_state))
-
-                self._core_blend_info.append({
-                    "iteration": iteration, "active": active,
-                    "active_tt": active_tt,
-                })
+                    self._core_blend_info.append({
+                        "iteration": iteration, "active": active,
+                        "active_tt": active_tt,
+                        "slot_scale_tt": slot_scale_tt,
+                    })
 
         # --- Phase 3: post-core layers (core_end..n_layers-1) ---
         post_core_start = config.core_end if config.recurrent_core else config.n_layers
@@ -2707,9 +3447,12 @@ class TTMambaWorkspaceModel:
         pre_trace = []
         core_trace = []
         post_trace = []
+        ar_trace = []  # attention residual entries
         current_phase = "pre"
         for entry in trace:
-            if entry[0] == "layer":
+            if entry[0] == "ar":
+                ar_trace.append(entry)
+            elif entry[0] == "layer":
                 phase = entry[1]
                 if phase == "pre":
                     pre_trace.append(entry)
@@ -2761,21 +3504,24 @@ class TTMambaWorkspaceModel:
         # --- Backward through recurrent core (reverse iterations) ---
         if recurrent:
             blend_info = self._core_blend_info
-            # Group core_trace by iteration
-            # Each iteration has: ws calls for core layers, layer calls, ws at core_end
-            # We need to unroll in reverse iteration order
+            if self.attn_residual is not None:
+                # === Attention Residual Core backward ===
+                # 1. Backward through attention residual → get grad for each stored x
+                # 2. Backward through iterations in reverse, adding AR gradients
+                grad_x_list, ar_grads = self.attn_residual.backward(grad_x)
+                accum_ws_grads(ar_grads)  # ar_query and ar_scale are stored with ws_ prefix
 
-            # Split core_trace into per-iteration segments
-            iter_segments = []  # list of (iter_num, entries)
-            current_iter = -1
-            current_entries = []
-            for entry in core_trace:
-                if entry[0] == "ws":
-                    phase = entry[1]
-                    if phase == "core":
+                # Group core_trace by iteration (same as blend path)
+                iter_segments = []
+                current_iter = -1
+                current_entries = []
+                for entry in core_trace:
+                    if entry[0] == "ws":
                         iter_num = entry[2]
-                    elif phase == "core_end":
+                    elif entry[0] == "layer":
                         iter_num = entry[2]
+                    else:
+                        continue
                     if iter_num != current_iter:
                         if current_entries:
                             iter_segments.append((current_iter, current_entries))
@@ -2783,83 +3529,195 @@ class TTMambaWorkspaceModel:
                         current_entries = [entry]
                     else:
                         current_entries.append(entry)
-                elif entry[0] == "layer":
-                    iter_num = entry[2]
-                    if iter_num != current_iter:
-                        if current_entries:
-                            iter_segments.append((current_iter, current_entries))
-                        current_iter = iter_num
-                        current_entries = [entry]
+                if current_entries:
+                    iter_segments.append((current_iter, current_entries))
+
+                # K_active = number of active iterations (0..K_active are in attention)
+                K_active = ar_trace[0][2] if ar_trace else 0
+
+                # Unroll in reverse iteration order.
+                # For each iteration, first add the AR gradient for that
+                # iteration's output (x_{iter+1}), then backward through the
+                # iteration's core layers.  The AR gradient for x_K is added
+                # in the first loop iteration — do NOT pre-initialize grad_x
+                # with grad_x_list[K_active], that double-counts it.
+                #
+                # CRITICAL: scale the chained gradient by 1/K before adding
+                # the AR gradient.  Without this, the gradient from each
+                # iteration flows through the shared core layers at full
+                # magnitude and accumulates exponentially: the gradient at
+                # iteration 0 is ~sum_k A^(K-k) * |ar_grad_x[k]|, where A is
+                # the layer backward amplification (A > 1 when the workspace
+                # cross-attention is active).  For K=6 and A≈2, this gives
+                # ~64x amplification, causing divergence at step ~1550.
+                #
+                # Scaling the chain by 1/K gives per-iteration gain A/K,
+                # which is stable for A < K (much more robust than 1/sqrt(K)
+                # which requires A < sqrt(K)).  The AR gradient itself is
+                # not scaled — it's bounded by softmax (weights sum to 1).
+                grad_x = None
+
+                for iter_num, entries in reversed(iter_segments):
+                    blend = blend_info[iter_num]
+                    slot_scale_tt = blend["slot_scale_tt"]
+
+                    # Add attention residual gradient for this iteration's output
+                    # x_outputs[iter_num+1] is the output of iteration iter_num
+                    # grad_x_list[iter_num+1] is the AR gradient for that output
+                    ar_grad_x = grad_x_list[iter_num + 1]
+                    if grad_x is None:
+                        grad_x = ar_grad_x
                     else:
-                        current_entries.append(entry)
-            if current_entries:
-                iter_segments.append((current_iter, current_entries))
+                        # Scale chained gradient by 1/K (slot_scale_tt = 1/K
+                        # for active iterations) before adding AR gradient
+                        grad_x = ttnn.add(ttnn.mul(slot_scale_tt, grad_x), ar_grad_x)
 
-            # Unroll in reverse iteration order
-            for iter_num, entries in reversed(iter_segments):
-                blend = blend_info[iter_num]
-                active = blend["active"]
-                active_tt = blend["active_tt"]
-
-                # All iterations (including the first) use the scaled blend:
-                # x = blend * x_new + (1 - blend) * x_old
-                # grad_x_new = blend * grad_x  (flows into core layers)
-                # grad_x_old = (1 - blend) * grad_x  (flows to previous iteration or pre-core)
-                grad_x_new = ttnn.mul(active_tt, grad_x)
-                grad_x_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_x)
-                grad_slot_new = ttnn.mul(active_tt, grad_slot_state) if grad_slot_state is not None else None
-                grad_slot_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_slot_state) if grad_slot_state is not None else None
-                # grad_x for the core iteration = grad_x_new
-                # grad_x_old accumulates into the previous iteration's output
-                grad_x = grad_x_new
-                if grad_slot_old is not None:
-                    grad_slot_state = grad_slot_new
-                    # grad_slot_old will be added to the previous iteration's grad
-                    self._pending_grad_slot_old = grad_slot_old
-                else:
-                    grad_slot_state = None
-                    self._pending_grad_slot_old = None
-
-                # Backward through this iteration's entries (reverse)
-                for entry in reversed(entries):
-                    if entry[0] == "layer":
-                        idx = entry[3]
-                        grad_x, layer_grads = self.layers[idx].backward(grad_x)
-                        accum_layer_grads(idx, layer_grads)
-                    elif entry[0] == "ws":
-                        ws_iter = entry[2]
-                        idx = entry[3]
-                        was_none = entry[4]
-                        if grad_slot_state is None:
-                            B = int(grad_x.shape[0])
-                            m = self.workspace.n_slots
-                            grad_slot_state = ttnn.zeros((B, m, config.d_model), dtype=ttnn.bfloat16,
-                                                          layout=ttnn.TILE_LAYOUT, device=device)
-                        extra_r, extra_w, extra_s = self._pop_reg_grads()
-                        grad_x, grad_slots_in, ws_grads = self.workspace.backward(
-                            grad_x, grad_slot_state, extra_r, extra_w, extra_s)
-                        accum_ws_grads(ws_grads)
-                        if was_none:
-                            grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
-                            if "ws_slots" in all_grads:
-                                all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                    # Backward through this iteration's entries (reverse)
+                    # No blend — grad_x flows directly through core layers
+                    for entry in reversed(entries):
+                        if entry[0] == "layer":
+                            idx = entry[3]
+                            grad_x, layer_grads = self.layers[idx].backward(grad_x)
+                            accum_layer_grads(idx, layer_grads)
+                        elif entry[0] == "ws":
+                            ws_iter = entry[2]
+                            idx = entry[3]
+                            was_none = entry[4]
+                            if grad_slot_state is None:
+                                B = int(grad_x.shape[0])
+                                m = self.workspace.n_slots
+                                grad_slot_state = ttnn.zeros((B, m, config.d_model), dtype=ttnn.bfloat16,
+                                                              layout=ttnn.TILE_LAYOUT, device=device)
+                            extra_r, extra_w, extra_s = self._pop_reg_grads()
+                            grad_x, grad_slots_in, ws_grads = self.workspace.backward(
+                                grad_x, grad_slot_state, extra_r, extra_w, extra_s)
+                            accum_ws_grads(ws_grads)
+                            if was_none:
+                                grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
+                                if "ws_slots" in all_grads:
+                                    all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                                else:
+                                    all_grads["ws_slots"] = grad_slots_param
+                                grad_slot_state = None
                             else:
-                                all_grads["ws_slots"] = grad_slots_param
-                            grad_slot_state = None
-                        else:
-                            grad_slot_state = grad_slots_in
+                                # Scale grad_slots_in by 1/K before chaining
+                                # (same as blend path — dampens slot chain amplification)
+                                grad_slot_state = ttnn.mul(slot_scale_tt, grad_slots_in)
 
-                # After processing this iteration, add grad_x_old from blend.
-                # For iter_num > 0, grad_x_old flows to the previous iteration.
-                # For iter_num == 0, grad_x_old flows to the pre-core layers
-                # (it will be picked up by the pre-core backward below).
-                grad_x = ttnn.add(grad_x, grad_x_old)
-                if hasattr(self, '_pending_grad_slot_old') and self._pending_grad_slot_old is not None:
-                    if grad_slot_state is None:
-                        grad_slot_state = self._pending_grad_slot_old
+                # After all iterations, add AR gradient for x_0 (pre-core output)
+                grad_x = ttnn.add(grad_x, grad_x_list[0])
+
+            else:
+                # === Fixed blend core backward (original) ===
+                # Group core_trace by iteration
+                # Each iteration has: ws calls for core layers, layer calls, ws at core_end
+                # We need to unroll in reverse iteration order
+
+                # Split core_trace into per-iteration segments
+                iter_segments = []  # list of (iter_num, entries)
+                current_iter = -1
+                current_entries = []
+                for entry in core_trace:
+                    if entry[0] == "ws":
+                        phase = entry[1]
+                        if phase == "core":
+                            iter_num = entry[2]
+                        elif phase == "core_end":
+                            iter_num = entry[2]
+                        if iter_num != current_iter:
+                            if current_entries:
+                                iter_segments.append((current_iter, current_entries))
+                            current_iter = iter_num
+                            current_entries = [entry]
+                        else:
+                            current_entries.append(entry)
+                    elif entry[0] == "layer":
+                        iter_num = entry[2]
+                        if iter_num != current_iter:
+                            if current_entries:
+                                iter_segments.append((current_iter, current_entries))
+                            current_iter = iter_num
+                            current_entries = [entry]
+                        else:
+                            current_entries.append(entry)
+                if current_entries:
+                    iter_segments.append((current_iter, current_entries))
+
+                # Unroll in reverse iteration order
+                for iter_num, entries in reversed(iter_segments):
+                    blend = blend_info[iter_num]
+                    active = blend["active"]
+                    active_tt = blend["active_tt"]
+                    slot_scale_tt = blend["slot_scale_tt"]
+
+                    # All iterations (including the first) use the scaled blend:
+                    # x = blend * x_new + (1 - blend) * x_old
+                    # grad_x_new = blend * grad_x  (flows into core layers)
+                    # grad_x_old = (1 - blend) * grad_x  (flows to previous iteration or pre-core)
+                    grad_x_new = ttnn.mul(active_tt, grad_x)
+                    grad_x_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_x)
+                    grad_slot_new = ttnn.mul(active_tt, grad_slot_state) if grad_slot_state is not None else None
+                    grad_slot_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_slot_state) if grad_slot_state is not None else None
+                    # grad_x for the core iteration = grad_x_new
+                    # grad_x_old accumulates into the previous iteration's output
+                    grad_x = grad_x_new
+                    if grad_slot_old is not None:
+                        grad_slot_state = grad_slot_new
+                        # grad_slot_old will be added to the previous iteration's grad
+                        self._pending_grad_slot_old = grad_slot_old
                     else:
-                        grad_slot_state = ttnn.add(grad_slot_state, self._pending_grad_slot_old)
-                self._pending_grad_slot_old = None
+                        grad_slot_state = None
+                        self._pending_grad_slot_old = None
+
+                    # Backward through this iteration's entries (reverse)
+                    for entry in reversed(entries):
+                        if entry[0] == "layer":
+                            idx = entry[3]
+                            grad_x, layer_grads = self.layers[idx].backward(grad_x)
+                            accum_layer_grads(idx, layer_grads)
+                        elif entry[0] == "ws":
+                            ws_iter = entry[2]
+                            idx = entry[3]
+                            was_none = entry[4]
+                            if grad_slot_state is None:
+                                B = int(grad_x.shape[0])
+                                m = self.workspace.n_slots
+                                grad_slot_state = ttnn.zeros((B, m, config.d_model), dtype=ttnn.bfloat16,
+                                                              layout=ttnn.TILE_LAYOUT, device=device)
+                            extra_r, extra_w, extra_s = self._pop_reg_grads()
+                            grad_x, grad_slots_in, ws_grads = self.workspace.backward(
+                                grad_x, grad_slot_state, extra_r, extra_w, extra_s)
+                            accum_ws_grads(ws_grads)
+                            if was_none:
+                                grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
+                                if "ws_slots" in all_grads:
+                                    all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                                else:
+                                    all_grads["ws_slots"] = grad_slots_param
+                                grad_slot_state = None
+                            else:
+                                # Scale grad_slots_in by 1/K (slot_scale_tt) before
+                                # chaining to the previous iteration. The workspace
+                                # backward received 1/sqrt(K)-scaled inputs, so
+                                # grad_slots_in is already 1/sqrt(K) * true_grad.
+                                # Scaling by 1/K gives 1/(K*sqrt(K)) * true_grad,
+                                # making the per-iteration gain A/K² + 1 - 1/sqrt(K),
+                                # which is ≤1 for A ≤ sqrt(K) — much more robust than
+                                # the 1/sqrt(K) scaling which required A ≤ sqrt(K)
+                                # for the gain to be ≤1.
+                                grad_slot_state = ttnn.mul(slot_scale_tt, grad_slots_in)
+
+                    # After processing this iteration, add grad_x_old from blend.
+                    # For iter_num > 0, grad_x_old flows to the previous iteration.
+                    # For iter_num == 0, grad_x_old flows to the pre-core layers
+                    # (it will be picked up by the pre-core backward below).
+                    grad_x = ttnn.add(grad_x, grad_x_old)
+                    if hasattr(self, '_pending_grad_slot_old') and self._pending_grad_slot_old is not None:
+                        if grad_slot_state is None:
+                            grad_slot_state = self._pending_grad_slot_old
+                        else:
+                            grad_slot_state = ttnn.add(grad_slot_state, self._pending_grad_slot_old)
+                    self._pending_grad_slot_old = None
 
         # --- Backward through pre-core layers (reverse) ---
         for entry in reversed(pre_trace):
@@ -2919,6 +3777,14 @@ class TTMambaWorkspaceModel:
         all_grads["token_emb_weight"] = grad_emb
         all_grads["norm_weight"] = grad_norm_w
 
+        # If gamma is frozen, drop gamma gradients so they don't enter
+        # clip_grad_norm or the optimizer.  The backward pass still computes
+        # them (they're part of the chain rule for grad_x), but they're
+        # harmless if unused — the gamma parameter simply never updates.
+        if self.config.freeze_gamma:
+            all_grads = {k: v for k, v in all_grads.items()
+                         if not k.endswith("_gamma")}
+
         return all_grads
 
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
@@ -2926,10 +3792,16 @@ class TTMambaWorkspaceModel:
         for i, layer in enumerate(self.layers):
             layer_params = layer.get_params()
             for k, v in layer_params.items():
+                # Skip gamma if frozen — it stays at init and is not optimizer-managed
+                if self.config.freeze_gamma and k == "gamma":
+                    continue
                 params[f"layer_{i}_{k}"] = v
         if self.workspace is not None:
             for k, v in self.workspace.get_params().items():
                 params[f"ws_{k}"] = v
+        if self.attn_residual is not None:
+            for k, v in self.attn_residual.get_params().items():
+                params[f"ws_{k}"] = v  # use ws_ prefix so lr_groups applies
         return params
 
     def get_num_params(self) -> int:
@@ -2953,6 +3825,66 @@ class TTMambaWorkspaceModel:
         if self.workspace is not None:
             self.workspace.normalize_slots()
             self.workspace.spectral_normalize_weights()
+
+    def spectral_normalize_backbone_weights(self):
+        """Cap spectral norm of qkv_weight and out_proj_weight in all backbone layers.
+
+        Uses the same power-iteration approach as the workspace spectral norm.
+        The bound (config.backbone_spectral_norm_bound, default 2.0) is chosen
+        below the divergence threshold (~2.3) observed in the second run, where
+        the workspace's multiplicative gradient amplification causes instability
+        once backbone norms exceed ~2.3. Cell A (no workspace) is stable at
+        norms up to 6.4, but the workspace adds cross-attention gradient paths
+        that amplify backbone weight growth. A bound of 2.0 allows healthy
+        growth (Cell B reached loss 0.25 with norms at 2.3) while staying
+        safely below the instability threshold.
+
+        Only scales down when sigma > bound — never scales up. This lets the
+        optimizer grow weights naturally up to the bound.
+        """
+        device = self.device
+        bound = self.config.backbone_spectral_norm_bound
+        bound_tt = ttnn.from_torch(
+            torch.tensor([bound], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        eps_tt = ttnn.from_torch(
+            torch.tensor([1e-6], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+
+        for wrapped in self.layers:
+            inner = wrapped.layer
+            for wname in ("qkv_weight", "out_proj_weight"):
+                if not hasattr(inner, wname):
+                    continue
+                W = getattr(inner, wname)
+                m, n = int(W.shape[0]), int(W.shape[1])
+
+                # Power iteration to estimate spectral norm (10 steps)
+                v = ttnn.from_torch(
+                    torch.randn(n, 1, dtype=torch.bfloat16) / math.sqrt(n),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                )
+                for _ in range(10):
+                    u = ttnn.matmul(W, v)  # (m, 1)
+                    u_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(u, u)))
+                    u_norm = ttnn.maximum(u_norm, eps_tt)
+                    u = ttnn.mul(u, ttnn.reciprocal(u_norm))
+
+                    v = ttnn.matmul(ttnn.transpose(W, 0, 1), u)  # (n, 1)
+                    v_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(v, v)))
+                    v_norm = ttnn.maximum(v_norm, eps_tt)
+                    v = ttnn.mul(v, ttnn.reciprocal(v_norm))
+
+                Wv = ttnn.matmul(W, v)
+                sigma = ttnn.sqrt(ttnn.sum(ttnn.mul(Wv, Wv)))
+                sigma = ttnn.maximum(sigma, eps_tt)
+
+                # scale = min(1, bound/sigma) = bound / max(bound, sigma)
+                scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma)))
+                W_normalized = ttnn.mul(W, scale_factor)
+                setattr(inner, wname, W_normalized)
 
     def clamp_retention_gammas(self, max_log_gamma: float = -0.02):
         """Clamp retention layer log-gamma to <= max_log_gamma after each optimizer step.
@@ -2987,13 +3919,47 @@ class TTMambaWorkspaceModel:
                         clamped, dtype=ttnn.float32,
                         layout=ttnn.TILE_LAYOUT, device=inner.gamma.device())
 
+    def get_workspace_stats(self):
+        """Extract workspace gate, QK scale, and slot-decay scalars to host for logging.
+
+        With ReZero gates, the gate values are direct scalars (no sigmoid).
+        Returns dict with read_gate, write_gate, slot_decay, read_qk_scale,
+        write_qk_scale as Python floats, or None if no workspace (Cell A).
+        Also includes ar_scale (attention residual scale) if present.
+        """
+        if self.workspace is None:
+            return None
+        ws = self.workspace
+        rg = ttnn.to_torch(ws.read_gate).float().item()
+        wg = ttnn.to_torch(ws.write_gate).float().item()
+        sd = ttnn.to_torch(ws.slot_decay).float().item()
+        rqs = ttnn.to_torch(ws.read_qk_scale).float().item()
+        wqs = ttnn.to_torch(ws.write_qk_scale).float().item()
+        stats = {
+            'read_gate': rg,
+            'write_gate': wg,
+            'slot_decay': sd,
+            'read_qk_scale': rqs,
+            'write_qk_scale': wqs,
+        }
+        if self.attn_residual is not None:
+            ars = ttnn.to_torch(self.attn_residual.scale).float().item()
+            stats['ar_scale'] = ars
+        return stats
+
     def apply_gate_schedule(self, step: int, gate_schedule_steps: int, gate_init_val: float):
         """Force workspace gates open on a schedule.
 
-        Linearly anneals gate values from gate_init (e.g. -2, sigmoid=0.12) to
-        0 (sigmoid=0.5) over gate_schedule_steps. This ensures the workspace
-        contributes enough that the model must learn good routing — at 12% mixing
-        the backbone can route around the workspace, so the gates never open
+        With ReZero gates (init=0), this is a no-op — gates already start at 0
+        (true identity) and the optimizer controls them freely from step 0.
+        This method is kept for backward compatibility with configs that set
+        gate_schedule_steps > 0.
+
+        Previously (with sigmoid gates): linearly annealed gate values from
+        gate_init (e.g. -2, sigmoid=0.12) to 0 (sigmoid=0.5) over
+        gate_schedule_steps. This ensured the workspace contributed enough that
+        the model must learn good routing — at 12% mixing the backbone can
+        route around the workspace, so the gates never open
         naturally. Forcing them to 50% creates gradient signal that drives
         content-addressed routing.
 
@@ -3006,14 +3972,11 @@ class TTMambaWorkspaceModel:
             return
         if step >= gate_schedule_steps:
             return
-        # Linear anneal from gate_init to 0.0
-        target = gate_init_val + (0.0 - gate_init_val) * step / gate_schedule_steps
-        target_tt = ttnn.from_torch(
-            torch.tensor([target], dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
-        )
-        self.workspace.read_gate = target_tt
-        self.workspace.write_gate = target_tt
+        # With ReZero gates (init=0), the gate schedule is a no-op — gates
+        # already start at 0 (true identity). The optimizer controls them
+        # freely from step 0. This method is kept for backward compatibility
+        # with configs that set gate_schedule_steps > 0.
+        # (Previously annealed sigmoid gates from gate_init to 0.)
 
     def save_checkpoint(self, path: str, optimizer_state: dict = None, step: int = 0):
         """Save model checkpoint to a PyTorch state dict file.
@@ -3092,6 +4055,9 @@ class TTMambaWorkspaceModel:
             layer_idx = int(parts[1])
             param_name = parts[2]
             self.layers[layer_idx].set_params({param_name: tt_tensor})
+        elif name in ("ws_ar_query", "ws_ar_scale") and self.attn_residual is not None:
+            ar_param_name = name[3:]  # strip "ws_" prefix
+            self.attn_residual.set_params({ar_param_name: tt_tensor})
         elif name.startswith("ws_") and self.workspace is not None:
             ws_param_name = name[3:]  # strip "ws_" prefix
             self.workspace.set_params({ws_param_name: tt_tensor})

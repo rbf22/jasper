@@ -1,8 +1,14 @@
-# Mamba + Workspace POC — Code Guide
+# Jasper POC — Code Guide
 
-This is the code for a desktop-scale proof-of-concept that tests whether a hybrid Mamba model with an engineered workspace and recurrent core reasons better than parameter-matched controls. The experiment takes ~1 week and ~$20–30, and produces a go/no-go decision for a $3–5K language-scale ablation.
+**Jasper** is a workspace-augmented retention network with recurrent core —
+a novel architecture that combines RetNet-style linear attention, Perceiver-style
+external memory (workspace), depth-recurrent iteration, and attention residuals
+into a unified model. This is the code for a desktop-scale proof-of-concept that
+tests whether Jasper reasons better than parameter-matched controls. The
+experiment takes ~1 week and ~$20–30, and produces a go/no-go decision for a
+$3–5K language-scale ablation.
 
-See the [root README](../README.md) for the project overview and [desktop-mamba-workspace-poc.md](../desktop-mamba-workspace-poc.md) for the full experiment design.
+See the [root README](../README.md) for the project overview and [desktop-jasper-workspace-poc.md](../desktop-jasper-workspace-poc.md) for the full experiment design.
 
 ---
 
@@ -11,8 +17,8 @@ See the [root README](../README.md) for the project overview and [desktop-mamba-
 | File | What it does |
 |------|-------------|
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
-| `model.py` | The full model (`MambaWorkspaceModel`) with three cell configurations behind config flags. Contains the pure-PyTorch Mamba2 SSD layer, multi-head attention with RoPE, perceiver-style workspace module, and the recurrent core loop. |
-| `model_ttnn.py` | Tenstorrent-native model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes custom fused kernels for RoPE, scale+decay, and gate backward. |
+| `model.py` | The full PyTorch model (`MambaWorkspaceModel`) with three cell configurations behind config flags. Contains the pure-PyTorch Mamba2 SSD layer, multi-head attention with RoPE, perceiver-style workspace module, and the recurrent core loop. (Deprecated — `model_ttnn.py` is the active Jasper implementation.) |
+| `model_ttnn.py` | Jasper model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes the TTWorkspaceModule (perceiver-style workspace with QK-Norm and ReZero gates), custom fused kernels for RoPE, scale+decay, and gate backward, and the retention layer. |
 | `mamba3_layer.py` | Fixed Mamba-3 layer (replaces Mamba-2's selective scan with decayed linear attention). Used unconditionally for all non-attention layers. |
 | `retention_reference.py` | PyTorch reference implementation of the retention layer (decayed linear attention + RoPE). Used for parity testing. |
 | `train.py` | Training loop (PyTorch) with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection. (Deprecated — use `train_ttnn.py`.) |
@@ -87,11 +93,11 @@ All cells are ~25–30M parameters, `d_model=384`, vocabulary ~128 (character-le
 
 | Cell | Architecture | Config flags | Key params |
 |------|-------------|--------------|------------|
-| **A** | Hybrid (12 Mamba2 + 2 attention at positions 5, 10), no workspace | `use_attention=true, use_workspace=false, recurrent_core=false` | The no-workspace control — isolates workspace effect |
-| **B** | Hybrid + workspace (11 Mamba2 + 2 attention + 16-slot perceiver workspace) | `use_attention=true, use_workspace=true, recurrent_core=false` | Does an engineered workspace help without recurrence? |
-| **C** | Full architecture (hybrid + workspace + layers 6–9 looped K times) | `use_attention=true, use_workspace=true, recurrent_core=true` | The go/no-go cell |
+| **A** | Hybrid (Mamba-3 + 2 attention at positions 5, 10), no workspace | `use_attention=true, use_workspace=false, recurrent_core=false` | The no-workspace control — isolates workspace effect |
+| **B** | Hybrid + workspace (Mamba-3 + 2 attention + 16-slot perceiver workspace with QK-Norm + ReZero gates) | `use_attention=true, use_workspace=true, recurrent_core=false` | Does an engineered workspace help without recurrence? |
+| **C** | Full architecture (hybrid + workspace + layers 6–9 looped K=6 times) | `use_attention=true, use_workspace=true, recurrent_core=true` | The go/no-go cell |
 
-Cell C's recurrent core (layers 6–9) is applied K times per forward pass. During training, K is sampled uniformly from {1…6} per batch. At inference, K can be swept (the `k_inference` config field or `--k_override` in code).
+Cell C's recurrent core (layers 6–9) is applied K times per forward pass. During training, K is sampled uniformly from {1…6} per batch. At inference, K can be swept (the `k_inference` config field or `--k_override` in code). K was temporarily reduced from 6 to 3 to limit gradient amplification, then restored to 6 after fixing the slot-state gradient scaling (see "Slot-state gradient scaling" below).
 
 Cell B removes one Mamba layer (13 vs 14) to compensate for the ~2M workspace parameters, keeping cells parameter-matched.
 
@@ -115,28 +121,115 @@ For cells without a recurrent core (A, B), all layers run once in the pre-core p
 
 ### The workspace module
 
-The `WorkspaceModule` is a perceiver-style cross-attention block with 16 learned slot vectors. Each application does two steps:
+The `TTWorkspaceModule` is a perceiver-style cross-attention block with 16 learned slot vectors. Each application does two steps:
 
 1. **Read**: slots attend over hidden states (slots query, hidden states are keys/values)
 2. **Write**: hidden states attend over slots (hidden states query, slots are keys/values)
+
+Both passes use **QK Normalization** (L2-normalize Q and K before attention scores,
+with learnable scale) to prevent entropy collapse, and **ReZero gates** (scalar,
+init=0, no sigmoid) so the workspace starts as a true identity and grows naturally.
 
 Slot state persists across recurrent iterations (passed as `slot_state`), so each loop iteration reads and revises the same workspace — the model can iteratively refine its reasoning in the slots rather than in the token stream.
 
 ### Training stabilization
 
-The workspace and recurrent core introduce four sources of gradient instability that are not present in the baseline hybrid model. Each is addressed with a targeted normalization:
+The workspace and recurrent core introduce gradient instability that is not
+present in the baseline hybrid model. Multiple rounds of fixes were attempted
+(see "History of gradient instability" below), culminating in the current
+**architecture v2** design which addresses the root cause rather than symptoms.
 
-1. **Per-parameter LR groups** (`lr_groups` config field): Workspace parameters receive 0.25x the base learning rate (5e-5 vs 2e-4 for the backbone). The workspace creates a sharper loss landscape where equal-LR training causes workspace gradients to dominate and destabilize. The backbone LR is kept at 2e-4 to match Cell A (the control). Config: `lr_groups: {ws_: 0.25}`
+#### Architecture v2: QK-Norm + ReZero + component-wise clipping
 
-2. **1/sqrt(K) residual scaling** (in `model_ttnn.py` / `model.py`): The recurrent core's blend factor is scaled by 1/sqrt(K), turning the full replacement (x = x_new) into a partial update (x = (1/sqrt(K)) * x_new + (1 - 1/sqrt(K)) * x). This normalizes gradient accumulation across K iterations so the total gradient norm is independent of K. Uses the actual K sampled per batch. Based on the variance-preserving principle from DeepNorm.
+Three architectural changes, all based on published techniques:
 
-3. **Slot parameter normalization** (in `model_ttnn.py` / `model.py`): The learned slot parameters are normalized to unit RMS after each optimizer step, breaking the positive feedback loop: large slots → sharp attention → large gradients → larger slots. This is a parameter constraint (like weight clipping in GANs) that allows slot direction to change freely while constraining magnitude. Applied automatically in the training loop via `model.normalize_workspace_slots()`.
+1. **QK Normalization** (`_l2_normalize_heads` in `TTWorkspaceModule`):
+   L2-normalizes Q and K along the d_head dimension before computing attention
+   scores in both read and write passes. A learnable scale parameter
+   (`read_qk_scale`, `write_qk_scale`, initialized to 1/√d_head) replaces the
+   fixed 1/√d_head scale. This bounds attention logits regardless of weight
+   magnitudes, preventing the **entropy collapse** (ill-conditioned QK^T with
+   condition numbers of 40,000–112,000) that caused all previous divergence
+   events. (Henry et al., 2020 — now standard in OLMo 2, Gemma 3, Qwen 3)
 
-4. **Spectral normalization of workspace weights** (in `model_ttnn.py` / `model.py`): All eight workspace weight matrices (read_q, read_k, read_v, read_out, write_q, write_k, write_v, write_out) have their spectral norm capped at C=5 after each optimizer step. If the spectral norm exceeds C, the matrix is scaled down to C; if below C, it's left unchanged (cap, not target). This addresses the root cause of weight growth directly — with spectral norm ≤ C, unit-RMS slots, and LayerNorm on inputs, attention logits are bounded by C²/sqrt(d_h) ≈ 2.55, giving a max attention ratio of ~164:1 — enough for selective attention but preventing the e^100+ ratios that cause gradient explosion. Uses 10 steps of power iteration on-device (same algorithm as Spectral Normalization GANs, Miyato et al. 2018). Config: `spectral_norm_bound: 5.0`. Applied automatically in the training loop via `model.normalize_workspace_slots()`.
+2. **ReZero gates** (replaces sigmoid gates): Scalar gates initialized to 0.0
+   (true identity at init), no sigmoid. The workspace starts as a no-op and
+   grows naturally through gradient descent. This gives the backbone time to
+   learn a good representation before the workspace starts contributing, and
+   avoids the sigmoid's gradient saturation that made gates slow to adapt.
+   (Bachlechner et al., 2020 — "ReZero is All You Need")
 
-**Why C=5?** The standard spectral normalization bound (used in GANs) is C=1. We tried C=1 first — it eliminated the early gradient spikes and allowed both cells to pass their previous collapse points (Cell B at step 300, Cell C at step 250). However, the collapse re-emerged at peak LR (step 400 for B with grad norm 19.7, step 300 for C with grad norm 61.1). The root cause was a **capacity mismatch**: with C=1, the max attention ratio is only e^(2/sqrt(d_h)) ≈ 1.2:1 (nearly uniform) — the workspace cannot provide selective attention. The backbone adapts fast at peak LR and develops expectations that the workspace will selectively attend to specific positions, but the workspace is trapped at spectral norm 1 and cannot deliver. The resulting tug-of-war at the constraint boundary produces the gradient spike. C=5 allows attention ratios up to ~164:1 — sufficient for selective attention while still bounded. The cap (rather than hard normalization to C) lets weights grow naturally up to the bound, preventing disruption when resuming from checkpoints saved with smaller spectral norms.
+3. **Component-wise gradient clipping** (`clip_grad_norm` in `train_ttnn.py`):
+   Workspace parameters (ws_*) are clipped at `ws_grad_clip` (0.5), backbone
+   parameters at `grad_clip` (1.0). Each group's norm is computed and clipped
+   independently. This prevents workspace gradient spikes from dominating the
+   global clip and starving the backbone of learning signal.
+   (Yang et al., 2022 — EMNLP 2022)
 
-All four are deterministic (one hyperparameter: the spectral norm bound C=5) and can be disabled independently for ablation.
+#### Additional stabilizers (from earlier runs, still in place)
+
+4. **Per-parameter LR groups** (`lr_groups` config field): Workspace
+   parameters receive 0.25x the base learning rate (5e-5 vs 2e-4 for the
+   backbone). Gates get 10x base LR so they open fast enough to contribute
+   within the training budget. QK scale parameters get 1.0x (same as backbone).
+   Config: `lr_groups` in the YAML.
+
+5. **1/sqrt(K) residual scaling** (in `model_ttnn.py`): The recurrent core's
+   blend factor is scaled by 1/sqrt(K), normalizing gradient accumulation
+   across K iterations so the total gradient norm is independent of K. Based
+   on the variance-preserving principle from DeepNorm.
+
+6. **Slot parameter normalization** (in `model_ttnn.py`): The learned slot
+   parameters are normalized to unit RMS after each optimizer step, breaking
+   the positive feedback loop: large slots → sharp attention → large gradients
+   → larger slots. Applied via `model.normalize_workspace_slots()`.
+
+7. **Spectral normalization of workspace weights** (in `model_ttnn.py`): All
+   eight workspace weight matrices have their spectral norm capped at C=5
+   after each optimizer step. Uses 10 steps of power iteration on-device.
+   Config: `spectral_norm_bound: 5.0`.
+
+8. **Backbone spectral normalization** (in `model_ttnn.py`): Backbone qkv and
+   out_proj weights are capped at `backbone_spectral_norm_bound` (2.0) after
+   each optimizer step. The workspace feedback loop caused exponential backbone
+   weight growth in earlier runs; this cap prevents it while allowing healthy
+   growth (Cell A reaches ~1.6).
+
+9. **Gamma freezing** (`freeze_gamma: true`): Retention gamma (decay parameter)
+   is frozen — not optimizer-managed. The O(T²) gamma gradient was structurally
+   unstable with the workspace. Gamma barely moves during training (drift <0.03
+   from init), so freezing it loses nothing while eliminating that gradient
+   path. (RetNet keeps γ fixed for the same reason — Sun et al., 2023)
+
+10. **Slot decay** (`slot_decay_init: 1.0`): The slot update includes a learned
+    decay scalar: `slots = norm(decay * slots + gate * read_out)`. This makes
+    the slot update contractive — old information fades unless actively
+    reinforced, providing a restoring force against attention sharpening.
+
+#### History of gradient instability
+
+The workspace's two-pass cross-attention (read + write) creates a
+multiplicative gradient amplification path. Across four rounds of fixes, the
+instability pattern was consistent: training is stable until gates open to
+~0.20–0.25, then gradient norms spike and divergence follows.
+
+| Run | Fix | Cell B diverges | Cell C diverges | Gate at divergence |
+|-----|-----|-----------------|-----------------|-------------------|
+| 1 | None (bound=3.0, gamma trainable) | step ~2300 | step ~700 | ~0.15 |
+| 2 | bb_bound=2.0, gamma clip | step ~1800 | step ~700 | ~0.22 |
+| 3 | bb_bound=2.0, gamma frozen | step ~1700 | step ~900 | ~0.21 |
+| 4 | Same as 3 (re-run) | step ~1400 | step ~900 | ~0.21 |
+
+**Root cause** (identified from checkpoint analysis): The workspace QK^T had
+condition numbers of 40,000–112,000 (entropy collapse). Spectral norm bounds
+on weights didn't help because they don't bound the *product* QK^T. When gates
+opened to ~0.20, individual batches produced gradient spikes through the
+cross-attention paths, which corrupted the AdamW EMA state, causing
+cascading divergence. Architecture v2 (QK-Norm + ReZero + component-wise
+clipping) addresses this structurally — QK-Norm bounds the logits by
+construction, ReZero gives the backbone time to stabilize before the workspace
+contributes, and component-wise clipping prevents workspace spikes from
+affecting the backbone.
 
 ### Attention regularizers (entropy + diversity) — IMPLEMENTED, MEASURED HARMFUL, DISABLED
 
@@ -170,17 +263,37 @@ Two task-agnostic regularizers address this (both can remain active during langu
 
 Both are computed via host-side PyTorch autograd on the cached attention and slot tensors, with gradients injected into the workspace backward pass at the softmax and slot-state boundaries. They contribute ~5% of the total loss signal — a gentle nudge, not a dominant force. Config: `ws_entropy_weight`, `ws_diversity_weight` in the YAML configs.
 
-### Architectural stability: zero-init gates and slot decay
+### Architectural stability: ReZero gates and slot decay
 
-The regularizers proved the workspace CAN learn selective attention (write entropy dropped from 2.75 to 0.224), but the model collapsed at step 450 — the sharpening exceeded what external constraints could stably support. Analysis revealed the root cause: the workspace has a **feedback loop with gain** (read from x → update slots → write back to x), and this loop is amplifying rather than contractive. External constraints (spectral norm, slot norm, regularizers) cap individual components but don't make the loop itself stable.
+The workspace has a **feedback loop with gain** (read from x → update slots →
+write back to x). Without architectural constraints, this loop amplifies rather
+than contracts, causing gradient explosion once the gates open enough for the
+workspace to contribute meaningfully.
 
-Two architectural changes make the workspace stable by construction — a "tennis ball in a bucket" rather than a knife edge:
+The current design (architecture v2) makes the workspace stable by
+construction:
 
-7. **Zero-initialized gates** (`gate_init: -2`): Gate parameters are initialized to -2, giving sigmoid(-2) ≈ 0.12. The workspace starts with a small but non-trivial contribution — the feedback loop is mostly inactive. The gates gradually open as the model learns that the workspace is useful. A gate-specific LR group (10x workspace LR) ensures the gates reach sigmoid(0) = 0.5 within ~1,000 steps, fitting the 3,000-step training budget. This is the same principle as zero-initialization in LoRA, tuned for a shorter training horizon.
+- **ReZero gates** (scalar, init=0.0, no sigmoid): The workspace starts as a
+  true identity (gate=0 means zero contribution). The gate grows linearly
+  through gradient descent — no sigmoid saturation, no fixed schedule. This
+  gives the backbone time to learn a good representation before the workspace
+  starts contributing. The gate-specific LR group (10x workspace LR) ensures
+  the gates reach useful values within the training budget. See item 2 in the
+  stabilization section above.
 
-8. **Slot decay** (`slot_decay_init: 1.0`): The slot update changes from `slots = norm(slots + gate * read_out)` to `slots = norm(decay * slots + gate * read_out)` where `decay` is a learned scalar initialized at 1.0. The decay makes the slot update contractive: old information naturally fades unless the read gate actively reinforces it. The feedback loop now has a restoring force — if attention gets too sharp and overwrites a slot, the decay pulls it back toward the learned slot embedding.
+- **Slot decay** (`slot_decay_init: 1.0`): The slot update is
+  `slots = norm(decay * slots + gate * read_out)` where `decay` is a learned
+  scalar. This makes the slot update contractive — old information fades unless
+  actively reinforced, providing a restoring force against attention
+  sharpening. See item 10 in the stabilization section above.
 
-Together, these make the workspace start stable (near-zero gates) and stay stable (decaying slots). The external constraints become less critical because the architecture itself is contractive rather than amplifying. Config: `gate_init` (default -2), `slot_decay_init` (default 1.0) in the YAML configs.
+The previous design used sigmoid gates with `gate_init: -2` (sigmoid(-2) ≈
+0.12). This was replaced by ReZero gates because: (1) the sigmoid's derivative
+saturates at sigmoid'(-2) ≈ 0.11, making gates slow to adapt, and (2) starting
+at 0.12 contribution was too high — the workspace's gradient amplification
+caused divergence at gate values of 0.20–0.25, before the gates had learned
+useful routing. ReZero starts at exactly 0 and grows linearly, giving maximum
+warmup time.
 
 ---
 
@@ -394,9 +507,14 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `recurrent_core` | false | Whether layers `core_start` to `core_end` are looped K times |
 | `core_start` | 6 | First layer of the recurrent core |
 | `core_end` | 10 | Last layer of the recurrent core (exclusive) |
-| `k_train_max` | 6 | Max K during training (sampled uniformly from {1…k_train_max}) |
-| `k_inference` | 6 | K at inference (sweep this for R2) |
+| `k_train_max` | 6 | Max K during training (sampled uniformly from {1…k_train_max}). Restored to 6 after slot-state gradient scaling fix. |
+| `k_inference` | 3 | K at inference (sweep this for R2) |
 | `dropout` | 0.0 | Dropout rate |
+| `spectral_norm_bound` | 5.0 | Spectral norm cap for workspace weights (power iteration, 10 steps) |
+| `backbone_spectral_norm_bound` | 2.0 | Spectral norm cap for backbone qkv/out_proj weights |
+| `freeze_gamma` | true | Freeze retention gamma (don't train it) — eliminates O(T²) gradient instability |
+| `gate_init` | 0.0 | ReZero gate init value (0.0 = true identity). No longer uses sigmoid. |
+| `slot_decay_init` | 1.0 | Initial value for slot decay scalar (1.0 = no decay) |
 
 ### Training fields
 
@@ -409,7 +527,8 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `seq_len` | 128 | Sequence length |
 | `warmup_steps` | 200 | LR warmup steps |
 | `weight_decay` | 0.1 | AdamW weight decay |
-| `grad_clip` | 1.0 | Gradient clipping max norm |
+| `grad_clip` | 1.0 | Gradient clipping max norm (backbone parameters) |
+| `ws_grad_clip` | 0.5 | Gradient clipping max norm for workspace parameters (ws_*). When set, clipping is component-wise: workspace and backbone are clipped independently. |
 | `depth_range` | [2, 8] | Training depth range (inclusive) |
 | `eval_interval` | 500 | Steps between evaluations |
 | `log_interval` | 50 | Steps between log prints |
@@ -434,7 +553,7 @@ Three Blackhole chips train cells in parallel (devices 0, 1, 2). All cells run f
 | Cell | Device | Time/step | Est. total (10000 steps) | Architecture |
 |------|--------|-----------|--------------------------|--------------|
 | A | 0 | ~4.1s | ~11.4 hours | Hybrid (no workspace, no recurrence) |
-| B | 1 | ~4.2s | ~11.7 hours | Hybrid + workspace |
+| B | 1 | ~4.2s | ~11.7 hours | Hybrid + workspace (QK-Norm + ReZero) |
 | C | 2 | ~11.3s | ~31.3 hours | Full (workspace + recurrent core, K_max=6) |
 
 Cell C is ~2.7x slower due to the recurrent core looping K_max=6 times per step.
@@ -462,17 +581,46 @@ The project has moved to Tenstorrent hardware. The PyTorch path (`train.py`, `mo
 
 ## Current experimental status (as of August 2026)
 
-Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). All three cells launched in parallel on August 2, 2026, with custom fused kernels (RoPE, scale+decay, gate backward) and the Mamba-3 retention layer.
+Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). The project directories were renamed from `mamba-poc`/`mamba-mvp` to `workspace-poc`/`workspace-mvp` to reflect that the architecture has evolved beyond Mamba. The model is now called **Jasper** — a workspace-augmented retention network with recurrent core.
 
-> **Note:** The results below use the current cell naming (A/B/C). The former pure-Mamba2 (old A) and Mamba2+attention at lr=6e-4 (old B) cells were deprecated and removed after they plateaued — old A at ~35% overall (0% Task 1), old B at 60% overall (0% Task 1). The remaining cells were renamed: old E→A, old C→B, old D→C. The Mamba-2 selective scan was replaced with a decayed linear attention (retention) layer — see `mamba3_layer.py` and `retention_reference.py`.
+### Synthetic training (workspace-poc/)
 
-### Training progress
+Cell A (backbone-only control) and Cell B (workspace, no recurrence) completed training. Cell B early-stopped at step 9404. Cell C (full architecture: workspace + recurrent core with attention residuals) is currently training with the chain gradient scaling fix.
 
-| Cell | Device | Step | Loss | LR | Status |
-|------|--------|------|------|-----|--------|
-| A | 0 | ~100 | 1.57 | 1e-4 (warming up) | Training (no-workspace control) |
-| B | 1 | ~100 | 1.56 | 1e-4 (warming up) | Training (workspace) |
-| C | 2 | ~50 | 2.27 | 5e-5 (warming up) | Training (full architecture) |
+Two Cell C variants are running:
+
+| Variant | Config | Status | Notes |
+|---------|--------|--------|-------|
+| **AR (primary)** | `cell_c_attn_residual.yaml` | Training on device 2 | Attention residual core, K=6, 1/K chain scaling |
+| K3 (deprioritized) | `cell_c_attn_residual_k3.yaml` | Training on device 3 | Adds short conv + per-channel decay; ~60% slower |
+
+The K3 variant is deprioritized due to overhead from host-side gamma gradient transfers. The AR version is the primary config for both synthetic and text training.
+
+### Text POC (workspace-mvp/)
+
+A text training pipeline has been set up in `workspace-mvp/` to test Jasper on real language data. It uses TinyStories (~480M tokens, GPT-2 BPE tokenization) with the same Cell C AR architecture. The model is 29.8M params (10.5M architecture + 19.3M embedding for the 50K vocab).
+
+Smoke-tested (200 steps): loss 10.92 → 9.24, perplexity ~50K → 10,595, grad norm stable at 1.2-2.9. Ready for full training launch.
+
+See AGENTS.md for full details on the text POC setup.
+
+### Architecture v2 (2026-08-02)
+
+The workspace gradient instability was investigated across four training runs.
+Each run diverged at the same point: when workspace gates opened to ~0.20–0.25.
+Checkpoint analysis revealed the root cause was **entropy collapse** in the
+workspace cross-attention (QK^T condition numbers of 40,000–112,000). Three
+architectural changes address this:
+
+1. **QK Normalization**: L2-normalize Q and K before attention scores, with
+   learnable scale. Bounds logits by construction. (Henry et al., 2020)
+2. **ReZero gates**: Scalar gates init=0, no sigmoid. Workspace starts as
+   identity. (Bachlechner et al., 2020)
+3. **Component-wise gradient clipping**: Workspace clipped at 0.5, backbone at
+   1.0, independently. (Yang et al., 2022)
+
+See the "Training stabilization" section above for full details, and AGENTS.md
+for the complete history of gradient instability fixes.
 
 ### Architecture changes since the original plan
 
@@ -485,9 +633,15 @@ Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-n
 
 3. **Early stopping**: EMA-smoothed loss plateau detection with patience=1000 (10% of max_steps) and min_delta=1e-3 (0.1% relative improvement). Tuned for the effective batch size of 384 (micro_batch=8 × accum_steps=48).
 
+4. **Architecture v2 stabilization**: QK-Norm + ReZero gates + component-wise gradient clipping (see above). Previous fixes (backbone spectral norm, gamma freezing) remain in place. K restored to 6 after slot-state gradient scaling fix.
+
+5. **Slot-state gradient scaling** (2026-08-03): The 1/sqrt(K) blend scaling normalizes residual stream (x) gradients across K iterations, but the slot state chain bypassed it — `grad_slots_in` from each iteration's workspace backward chained to the previous iteration without scaling, causing exponential gradient amplification. First attempt: scale by 1/sqrt(K) (per-iteration gain `A/K + 1 - 1/sqrt(K)`, requires A ≤ sqrt(K)). K=3 diverged at step ~1150, K=6 at step ~750. Current fix: scale by 1/K (per-iteration gain `A/K² + 1 - 1/sqrt(K)`, much more robust). The x residual blend stays at 1/sqrt(K) (correct for additive accumulation); only the multiplicative slot chain uses the more conservative 1/K.
+
 ### What we're watching for
 
+- **Cell C stability past step 1550**: All previous runs diverged between step 750–1550. The current run has the chain gradient scaling fix. Step 1550 is the critical threshold.
 - **Cell A vs Cell B**: The clean workspace comparison (same LR=2e-4, A has no workspace). If B beats A on Task 1, the workspace is doing real work.
-- **Cell C convergence**: The full architecture (workspace + recurrence) is ~2.7x slower per step. Will it converge within the training budget?
+- **Cell C convergence**: The full architecture (workspace + recurrence) is ~2x slower per step. Will it converge within the training budget?
+- **Text POC convergence**: Does Jasper learn coherent language on TinyStories? If so, the workspace + recurrent core works on real text, not just synthetic tasks.
 - **Cell C K-sweep (R2)**: Does increasing K at inference improve accuracy on hard problems?
 - **Selective ablation (R4)**: Does replacing workspace slots with their mean collapse Tasks 1–2 while leaving Task 3 intact?

@@ -7,6 +7,15 @@ PyTorch autograd.
 
 Key difference: ttnn.linear(x, W) computes x @ W, while PyTorch F.linear(x, W)
 computes x @ W^T. The manual backward replicates the TT convention.
+
+NOTE: This test validates the OLD workspace architecture (sigmoid gates, no
+QK-Norm) against the pure-PyTorch model.py. The TT workspace (model_ttnn.py)
+has been updated to architecture v2 (QK-Norm + ReZero gates), but model.py
+has NOT been updated — it is the deprecated PyTorch path. This test will fail
+if run against the current TT workspace because the forward/backward math no
+longer matches. To update this test, model.py's WorkspaceModule would need to
+be updated to match the TT architecture v2 (QK-Norm, ReZero gates, learnable
+qk_scale). This is not done because the PyTorch path is deprecated.
 """
 
 import torch

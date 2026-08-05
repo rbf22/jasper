@@ -139,16 +139,22 @@ def build_model_config(cfg: dict) -> ModelConfig:
         recurrent_core=cfg.get("recurrent_core", False),
         core_start=cfg.get("core_start", 6),
         core_end=cfg.get("core_end", 10),
-        k_train_max=cfg.get("k_train_max", 6),
+        k_train_max=cfg.get("k_train_max", 3),
         k_inference=cfg.get("k_inference", 6),
+        attention_residual_core=cfg.get("attention_residual_core", False),
         use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
         spectral_norm_bound=cfg.get("spectral_norm_bound", 5.0),
+        backbone_spectral_norm_bound=cfg.get("backbone_spectral_norm_bound", 2.0),
+        freeze_gamma=cfg.get("freeze_gamma", False),
         ws_entropy_weight=cfg.get("ws_entropy_weight", 0.0),
         ws_diversity_weight=cfg.get("ws_diversity_weight", 0.0),
-        gate_init=cfg.get("gate_init", -2.0),
+        gate_init=cfg.get("gate_init", 0.0),
         slot_decay_init=cfg.get("slot_decay_init", 1.0),
         slot_permutation=cfg.get("slot_permutation", False),
         gate_schedule_steps=cfg.get("gate_schedule_steps", 0),
+        short_conv=cfg.get("short_conv", False),
+        short_conv_kernel=cfg.get("short_conv_kernel", 3),
+        per_channel_decay=cfg.get("per_channel_decay", False),
     )
 
 
@@ -441,41 +447,124 @@ def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
 # Gradient clipping and accumulation
 # ---------------------------------------------------------------------------
 
-def clip_grad_norm(grads: dict, max_norm: float) -> float:
-    """Clip gradient norm in-place on device. Returns the original norm.
+def clip_grad_norm(grads: dict, max_norm: float, gamma_scale: float = 128.0,
+                   ws_max_norm: float = None) -> float:
+    """Clip gradient norm in-place on device. Returns the original (pre-clip) norm.
 
-    Computes sum of squares on device, accumulates in a single device scalar
-    (only one host sync at the end), then scales gradients on device if needed.
+    Component-wise gradient clipping (Yang et al., 2022):
+    When ws_max_norm is provided, gradients are split into two groups:
+      - Workspace params (names starting with "ws_"): clipped to ws_max_norm
+      - Backbone params (everything else): clipped to max_norm
+    Each group's norm is computed and clipped independently. This prevents
+    workspace gradient spikes from dominating the global clip and starving
+    the backbone of learning signal.
+
+    When ws_max_norm is None, falls back to global clipping (all params to max_norm).
+
+    Gamma parameters (retention decay) are included in the backbone group with
+    a scale correction: their gradients are divided by gamma_scale (T) before
+    contributing to the norm.  This accounts for the structural O(T^2) gradient
+    scale mismatch vs O(T) for weight matrices.
+
+    The returned norm is the global norm (all params combined, with gamma/T
+    correction), so the skip-on-spike threshold is comparable across runs.
     """
     if not grads:
         return 0.0
 
     device = next(iter(grads.values())).device()
 
-    # Accumulate total norm squared on device — avoid per-tensor host sync
-    total_norm_sq_tt = ttnn.from_torch(
-        torch.tensor([0.0], dtype=torch.bfloat16),
+    gamma_scale_tt = ttnn.from_torch(
+        torch.tensor([1.0 / gamma_scale], dtype=torch.bfloat16),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
     )
 
-    for tt_grad in grads.values():
-        sq = ttnn.mul(tt_grad, tt_grad)  # element-wise square (on device)
-        norm_sq = ttnn.sum(sq)  # scalar on device
-        total_norm_sq_tt = ttnn.add(total_norm_sq_tt, norm_sq)  # accumulate on device
+    # Split grads into workspace and backbone groups
+    ws_grads = {}
+    bb_grads = {}
+    for name, tt_grad in grads.items():
+        if name.startswith("ws_"):
+            ws_grads[name] = tt_grad
+        else:
+            bb_grads[name] = tt_grad
 
-    # Single host sync to get the total norm
-    total_norm_sq = ttnn.to_torch(total_norm_sq_tt).item()
-    total_norm = math.sqrt(total_norm_sq)
-
-    if total_norm > max_norm and total_norm > 0:
-        scale = max_norm / (total_norm + 1e-6)
-        scale_tt = ttnn.from_torch(
-            torch.tensor([scale], dtype=torch.bfloat16),
+    # Compute norm for each group
+    def compute_group_norm_sq(group_grads):
+        """Compute sum of squared norms on device, return scalar tensor."""
+        norm_sq_tt = ttnn.from_torch(
+            torch.tensor([0.0], dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
-        for name in grads:
-            grads[name] = ttnn.mul(grads[name], scale_tt)
+        for name, tt_grad in group_grads.items():
+            if name.endswith("_gamma"):
+                g_scaled = ttnn.mul(tt_grad, gamma_scale_tt)
+                sq = ttnn.mul(g_scaled, g_scaled)
+            else:
+                sq = ttnn.mul(tt_grad, tt_grad)
+            norm_sq = ttnn.sum(sq)
+            norm_sq_tt = ttnn.add(norm_sq_tt, norm_sq)
+        return norm_sq_tt
 
+    def clip_group(group_grads, group_max_norm, group_norm_sq_tt):
+        """Clip a group's gradients in-place. Returns pre-clip norm."""
+        if not group_grads:
+            return 0.0
+        group_norm_sq = ttnn.to_torch(group_norm_sq_tt).item()
+        group_norm = math.sqrt(group_norm_sq)
+        if group_norm > group_max_norm and group_norm > 0:
+            scale = group_max_norm / (group_norm + 1e-6)
+            scale_tt = ttnn.from_torch(
+                torch.tensor([scale], dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
+            for name in group_grads:
+                group_grads[name] = ttnn.mul(group_grads[name], scale_tt)
+        return group_norm
+
+    # Compute norms for both groups
+    bb_norm_sq_tt = compute_group_norm_sq(bb_grads)
+    ws_norm_sq_tt = compute_group_norm_sq(ws_grads) if ws_grads else None
+
+    # Clip each group independently
+    bb_norm = clip_group(bb_grads, max_norm, bb_norm_sq_tt)
+    if ws_max_norm is not None and ws_grads:
+        ws_norm = clip_group(ws_grads, ws_max_norm, ws_norm_sq_tt)
+    else:
+        # No separate workspace clip — clip with backbone
+        ws_norm = 0.0
+        if ws_grads:
+            # Add ws grads to backbone group for global clip
+            for name, tt_grad in ws_grads.items():
+                sq = ttnn.mul(tt_grad, tt_grad)
+                norm_sq = ttnn.sum(sq)
+                bb_norm_sq_tt = ttnn.add(bb_norm_sq_tt, norm_sq)
+            # Recompute and clip combined
+            total_norm_sq = ttnn.to_torch(bb_norm_sq_tt).item()
+            total_norm = math.sqrt(total_norm_sq)
+            if total_norm > max_norm and total_norm > 0:
+                scale = max_norm / (total_norm + 1e-6)
+                scale_tt = ttnn.from_torch(
+                    torch.tensor([scale], dtype=torch.bfloat16),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+                )
+                for name in bb_grads:
+                    bb_grads[name] = ttnn.mul(bb_grads[name], scale_tt)
+                for name in ws_grads:
+                    ws_grads[name] = ttnn.mul(ws_grads[name], scale_tt)
+            bb_norm = total_norm
+
+    # Merge clipped grads back
+    for name in ws_grads:
+        grads[name] = ws_grads[name]
+    for name in bb_grads:
+        grads[name] = bb_grads[name]
+
+    # Return global norm (for skip-on-spike threshold)
+    if ws_norm_sq_tt is not None:
+        total_norm_sq_tt = ttnn.add(bb_norm_sq_tt, ws_norm_sq_tt)
+        total_norm = math.sqrt(ttnn.to_torch(total_norm_sq_tt).item())
+    else:
+        total_norm = bb_norm
     return total_norm
 
 
@@ -585,7 +674,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     warmup_steps = cfg.get("warmup_steps", 200)
     weight_decay = cfg.get("weight_decay", 0.1)
     grad_clip = cfg.get("grad_clip", 1.0)
-    grad_norm_spike_threshold = cfg.get("grad_norm_spike_threshold", 500.0)
+    ws_grad_clip = cfg.get("ws_grad_clip", 0.5)
+    grad_norm_spike_threshold = cfg.get("grad_norm_spike_threshold", 5000.0)
     depth_range = tuple(cfg.get("depth_range", [2, 8]))
     seed = cfg.get("seed", 42)
     eval_interval = cfg.get("eval_interval", 500)
@@ -673,18 +763,18 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     print(f"  seq_len={seq_len}, tokens_per_batch={tokens_per_batch}", flush=True)
     print(f"  effective_tokens/step={effective_tokens}", flush=True)
     print(f"  lr={base_lr}, warmup={warmup_steps}, weight_decay={weight_decay}, "
-          f"grad_clip={grad_clip}, grad_spike={grad_norm_spike_threshold}", flush=True)
+          f"grad_clip={grad_clip}, ws_grad_clip={ws_grad_clip}, grad_spike={grad_norm_spike_threshold}", flush=True)
     print(f"  max_steps={max_steps}", flush=True)
     if profile:
         print(f"  Profiling: ENABLED", flush=True)
 
     # Gate schedule config
     gate_schedule_steps = cfg.get("gate_schedule_steps", 0)
-    gate_init_val = cfg.get("gate_init", -2.0)
+    gate_init_val = cfg.get("gate_init", 0.0)
     if gate_schedule_steps > 0 and model_config.use_workspace:
         print(f"  Gate schedule: anneal from {gate_init_val} to 0.0 over {gate_schedule_steps} steps", flush=True)
 
-    print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10} {'Entropy':>10} {'Diversity':>10}", flush=True)
+    print(f"\n{'Step':>6} {'Loss':>10} {'LR':>10} {'Time':>8} {'tokens/s':>10} {'GradNorm':>10} {'Entropy':>10} {'Diversity':>10} {'gz_gr':>8} {'gz_gw':>8} {'gam_slot':>8}", flush=True)
 
     # Early stopping: stop if smoothed loss hasn't improved for plateau_patience steps.
     # Uses an EMA of the loss to avoid noise from individual steps, and requires
@@ -790,24 +880,22 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         else:
             tt_grads = host_grads_to_tt(accum_grads, device)
 
-        # Gradient clipping
+        # Gradient clipping (component-wise: workspace vs backbone)
         grad_norm = 0.0
         if grad_clip > 0:
             if profile:
                 with profiler.time_section("grad_clip"):
-                    grad_norm = clip_grad_norm(tt_grads, grad_clip)
+                    grad_norm = clip_grad_norm(tt_grads, grad_clip, ws_max_norm=ws_grad_clip)
             else:
-                grad_norm = clip_grad_norm(tt_grads, grad_clip)
+                grad_norm = clip_grad_norm(tt_grads, grad_clip, ws_max_norm=ws_grad_clip)
 
         # Skip-on-spike: if the pre-clip gradient norm exceeds a threshold,
-        # skip the optimizer step entirely.  This prevents gradient explosion
-        # from corrupting the model — when one parameter (e.g. retention gamma)
-        # dominates the gradient norm, clipping scales ALL gradients by 1/norm,
-        # starving every other parameter of update signal.  Skipping the step
-        # preserves the model state and lets the next batch's (hopefully smaller)
-        # gradient make progress.  The default threshold of 500 is high enough
-        # to tolerate Cell A's natural grad norm (~245-395 from token embeddings)
-        # while catching genuine explosions (Cell B/C reached 25,000+ and 10^14).
+        # skip the optimizer step entirely.  This prevents explosion from
+        # corrupting the model.  The norm now includes gamma/T (scale-corrected),
+        # so genuine gamma explosions will also trigger the skip.  The threshold
+        # of 5000 is high enough to tolerate Cell B's naturally sharp loss
+        # landscape (non-gamma grad norm ~500-1000) while catching genuine
+        # explosions (25,000+ and 10^14 observed in preliminary runs).
         skip_step = grad_norm_spike_threshold > 0 and grad_norm > grad_norm_spike_threshold
         if skip_step:
             print(f"  *** SKIP step {step}: grad_norm {grad_norm:.1f} > "
@@ -839,18 +927,38 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 }
                 optimizer.sync_master_from_model(model, names=_ws_norm_names)
 
+            # Spectral-normalize backbone qkv/out_proj weights after each step.
+            # The workspace feedback loop causes exponential spectral norm growth
+            # in backbone weights (layer_4 qkv reached 3.29 by step 500 in Cell B
+            # vs 1.35 in Cell A).  Capping at backbone_spectral_norm_bound (3.0)
+            # breaks the feedback loop while allowing healthy growth.
+            model.spectral_normalize_backbone_weights()
+            # Re-sync fp32 master for all backbone qkv/out_proj weights
+            _backbone_norm_names = set()
+            for i, wrapped in enumerate(model.layers):
+                inner = wrapped.layer
+                if hasattr(inner, 'qkv_weight'):
+                    _backbone_norm_names.add(f"layer_{i}_qkv_weight")
+                if hasattr(inner, 'out_proj_weight'):
+                    _backbone_norm_names.add(f"layer_{i}_out_proj_weight")
+            if _backbone_norm_names:
+                optimizer.sync_master_from_model(model, names=_backbone_norm_names)
+
             # Clamp retention layer log-gamma to <= -0.02 (gamma <= 0.98).
             # When gamma > 1.0, the decay matrix D[t,s] = gamma^(t-s) becomes
             # exponentially growing, causing gradient explosion.  Even gamma = 1.0
             # is unstable — the O(T^2) gamma gradient dominates the clip.  The
             # -0.02 clamp ensures D decays (D[127]=0.077), reducing the gradient
             # ~10x.  This is a mathematical stability constraint, not regularization.
-            model.clamp_retention_gammas()
-            # Re-sync fp32 master for any gammas that were clamped
-            _gamma_names = {f"layer_{i}_gamma" for i in range(len(model.layers))
-                            if hasattr(model.layers[i].layer, 'gamma')}
-            if _gamma_names:
-                optimizer.sync_master_from_model(model, names=_gamma_names)
+            # Skipped when freeze_gamma is set — gamma is not optimizer-managed
+            # and stays at its init value (~0.95), so clamping is unnecessary.
+            if not model_config.freeze_gamma:
+                model.clamp_retention_gammas()
+                # Re-sync fp32 master for any gammas that were clamped
+                _gamma_names = {f"layer_{i}_gamma" for i in range(len(model.layers))
+                                if hasattr(model.layers[i].layer, 'gamma')}
+                if _gamma_names:
+                    optimizer.sync_master_from_model(model, names=_gamma_names)
 
         t_step_end = time.time()
         step_time = t_step_end - t_step_start
@@ -859,9 +967,14 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         tokens_per_sec = effective_tokens / step_time
 
         if step < 50 or step % log_interval == 0 or step == max_steps - 1:
+            ws_stats = model.get_workspace_stats()
+            if ws_stats is not None:
+                gate_str = f"{ws_stats['read_gate']:>8.4f} {ws_stats['write_gate']:>8.4f} {ws_stats['slot_decay']:>8.4f}"
+            else:
+                gate_str = f"{'-':>8} {'-':>8} {'-':>8}"
             print(f"{step:>6} {step_loss:>10.4f} {current_lr:>10.6f} "
                   f"{step_time:>7.2f}s {tokens_per_sec:>10.0f} {grad_norm:>10.4f} "
-                  f"{step_entropy:>10.4f} {step_diversity:>10.4f}", flush=True)
+                  f"{step_entropy:>10.4f} {step_diversity:>10.4f} {gate_str}", flush=True)
 
         # Early stopping: track EMA of loss, stop if no improvement for plateau_patience steps.
         # Skip during warmup (LR is ramping, loss behavior is not representative).

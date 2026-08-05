@@ -3,6 +3,13 @@
 #
 # Renamed from the old "Cell C" (2026-07-31, once the pytorch-Mamba2
 # cells A/B were deprecated and removed — see AGENTS.md).
+#
+# Architecture v2 (2026-08-02): QK-Norm + ReZero gates + component-wise clipping
+# - QK Normalization on workspace cross-attention (bounds logits, prevents
+#   entropy collapse — Henry et al. 2020, now standard in OLMo 2 / Gemma 3)
+# - ReZero gates (scalar, init=0, no sigmoid — Bachlechner et al. 2020)
+# - Component-wise gradient clipping: workspace clipped at ws_grad_clip,
+#   backbone at grad_clip (Yang et al. 2022)
 cell: B
 d_model: 384
 n_layers: 13
@@ -13,6 +20,8 @@ use_workspace: true
 n_workspace_slots: 16
 recurrent_core: false
 spectral_norm_bound: 5.0
+backbone_spectral_norm_bound: 2.0
+freeze_gamma: true
 # Attention entropy/diversity regularizers: DISABLED.
 # Measured harmful. With weight 0.01 the B run reached answer-token loss 0.55
 # (best ever) but evaluated at 11.7% overall / 25% Task 2 — vs 33% / 85% for the
@@ -24,25 +33,30 @@ spectral_norm_bound: 5.0
 # input-dependence metric (see diagnose_workspace.py).
 ws_entropy_weight: 0.0
 ws_diversity_weight: 0.0
-gate_init: -2.0
+# gate_init is no longer used — ReZero gates start at 0.0 (hardcoded).
+# Kept for backward compatibility with checkpoint loading.
+gate_init: 0.0
 slot_decay_init: 1.0
 
 # Training
 lr: 2.0e-4
 # Per-parameter LR groups: workspace gets 0.25x base LR (5e-5) to prevent
 # gradient explosion at warmup peak. Gates get 10x base LR (2e-3) so they
-# open fast enough to contribute within the training budget — without this,
-# sigmoid'(-5) ≈ 0.007 suppresses the gradient and the gates barely move.
-# Backbone stays at 2e-4 to match Cell A.
+# open fast enough to contribute within the training budget.
+# With ReZero gates (no sigmoid), the gradient is not suppressed by sigmoid'
+# so gates may grow faster — the 10x LR may need reduction. Start with it
+# and monitor gate values.
 lr_groups:
   ws_read_gate: 10.0
   ws_write_gate: 10.0
+  ws_read_qk_scale: 1.0
+  ws_write_qk_scale: 1.0
   ws_: 0.25
-  # Retention gamma gets 0.01x LR.  The gamma gradient is a sum over T*T
-  # terms (O(T^2) = 16K terms), while weight matrix gradients are O(T) sums.
-  # This ~128x gradient scale mismatch causes gamma to dominate the gradient
-  # clip, starving all other parameters.  The 0.01x LR compensates for this
-  # scale difference, allowing gamma to update at a comparable effective rate.
+  # Retention gamma is frozen (freeze_gamma: true) — the O(T^2) gamma gradient
+  # is structurally unstable with the workspace.  Gamma barely moves during
+  # training (drift < 0.03 from init), so freezing it at ~0.95 loses nothing
+  # while eliminating the gradient explosion.  The LR group below is a no-op
+  # when gamma is frozen, kept for documentation.
   "suffix:_gamma": 0.01
 max_steps: 10000
 tokens_per_batch: 50000
@@ -50,6 +64,10 @@ seq_len: 128
 warmup_steps: 200
 weight_decay: 0.1
 grad_clip: 1.0
+# Component-wise gradient clipping: workspace params clipped at 0.5,
+# backbone at grad_clip (1.0). Prevents workspace gradient spikes from
+# dominating the global clip and starving the backbone of learning signal.
+ws_grad_clip: 0.5
 z_loss_coef: 1.0e-4
 depth_range: [2, 8]
 eval_interval: 500
@@ -71,7 +89,7 @@ micro_batch_size: 0
 # Wandb
 wandb: false
 wandb_project: mamba-workspace-poc
-run_name: cellB-tt-seed1
+run_name: cellB-tt-qknorm-rezero
 
 # Checkpointing — local only (no Google Drive on QB2)
 ckpt_dir: checkpoints
