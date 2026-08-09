@@ -56,7 +56,9 @@ class ModelConfig:
     use_gradient_checkpointing: bool = True
     spectral_norm_bound: float = 5.0
     backbone_spectral_norm_bound: float = 2.0  # cap on qkv/out_proj spectral norms
+    chain_scale_safety: float = 1.0  # extra safety factor for recurrent core gradient chain (1/K*safety)
     freeze_gamma: bool = True            # freeze retention gamma (don't train it) — eliminates O(T²) gradient instability
+    freeze_slot_decay: bool = False      # freeze slot_decay (prevents slot chain growth towards 1.0)
     ws_entropy_weight: float = 0.0       # weight for attention entropy regularizer (DISABLED — measured harmful)
     ws_diversity_weight: float = 0.0     # weight for slot diversity regularizer (DISABLED — measured harmful)
     gate_init: float = 0.0              # ReZero gate init (0.0 = true identity, no sigmoid). Previously -2.0 for sigmoid gates.
@@ -2064,17 +2066,23 @@ class TTRetentionLayer:
 
 
 class TTGatedResidualLayer:
-    """Gated pre-norm residual wrapper: x + sigmoid(gate) * layer(norm(x)).
+    """ReZero pre-norm residual wrapper: x + gate * layer(norm(x)).
 
-    Matches the PyTorch GatedResidualLayer in model.py.
-    gate init 0 -> sigmoid(0) = 0.5, a damped residual at initialization.
+    ReZero gate: scalar (no sigmoid), starts at 0.0 (true identity at init).
+    The layer contributes nothing at initialization, and the gate grows
+    naturally through gradient descent. This gives the backbone time to
+    learn a good representation before the layer starts contributing, and
+    keeps the gradient self-amplification at 1.0 per layer at init (vs
+    sigmoid(0)=0.5 which gives 1 + 0.5*sigma per layer).
+
+    (Bachlechner et al., 2020 — same ReZero approach used for workspace gates.)
     """
 
     def __init__(self, layer, d_model: int, device):
         self.layer = layer
         self.norm = TTRMSNorm(d_model, device)
         self.device = device
-        # gate init 0 -> sigmoid(0) = 0.5
+        # ReZero: gate init 0.0 (true identity, no sigmoid)
         self.gate = ttnn.from_torch(
             torch.zeros(1, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
@@ -2083,10 +2091,8 @@ class TTGatedResidualLayer:
     def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
         normed = self.norm.forward(x)
         inner = self.layer.forward(normed)
-        # x + sigmoid(gate) * inner
-        gate_val = ttnn.sigmoid(self.gate)  # (1,)
-        # Broadcast gate to match inner shape
-        gated_inner = ttnn.mul(gate_val, inner)  # (B, T, d_model)
+        # ReZero: x + gate * inner (no sigmoid)
+        gated_inner = ttnn.mul(self.gate, inner)  # (B, T, d_model)
         out = ttnn.add(x, gated_inner)
         # Cache for backward
         self._cached_x = x
@@ -2094,7 +2100,7 @@ class TTGatedResidualLayer:
         return out
 
     def backward(self, grad_out: "ttnn.Tensor") -> Tuple["ttnn.Tensor", Dict[str, "ttnn.Tensor"]]:
-        """Backward through gated residual.
+        """Backward through ReZero residual.
 
         grad_out: (B, T, d_model)
         Returns: (grad_x, grads_dict) where grads_dict includes layer grads,
@@ -2102,32 +2108,19 @@ class TTGatedResidualLayer:
         """
         device = self.device
 
-        # Forward was: y = x + sigmoid(gate) * layer(norm(x))
-        # grad_x = grad_out (residual) + sigmoid(gate) * grad_inner
-        # grad_gate = grad_out * inner * sigmoid'(gate)
-        # grad_inner = grad_out * sigmoid(gate)
+        # Forward was: y = x + gate * layer(norm(x))
+        # grad_x = grad_out (residual) + gate * grad_inner
+        # grad_gate = sum(grad_out * inner)  (no sigmoid derivative)
+        # grad_inner = grad_out * gate
         # grad_norm_input = layer.backward(grad_inner) -> grad_x_from_inner
         # Then grad_x = grad_out + grad_x_from_inner (through norm)
 
-        # We need the inner output (layer output) — it's in the layer cache as "out"
-        # Actually, the layer forward returns out but doesn't cache it separately
-        # We can recompute it or get it from the cache
-        # The layer's last output is what was returned by layer.forward()
-        # Let's recompute it from the cache
-        # Actually, we need to cache it in the gated residual forward
+        # grad_inner = grad_out * gate (ReZero: direct scalar, no sigmoid)
+        grad_inner = ttnn.mul(grad_out, self.gate)
 
-        # grad_inner = grad_out * sigmoid(gate)
-        gate_val = ttnn.sigmoid(self.gate)
-        grad_inner = ttnn.mul(grad_out, gate_val)
-
-        # grad_gate = sum(grad_out * inner * sigmoid'(gate))
-        # sigmoid'(gate) = sigmoid(gate) * (1 - sigmoid(gate))
-        # We need inner — cache it in forward
+        # grad_gate = sum(grad_out * inner) — no sigmoid derivative
         inner = self._cached_inner
-        grad_out_inner = ttnn.mul(grad_out, inner)
-        ones = ttnn.from_torch(torch.ones(1, dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        sig_prime = ttnn.mul(gate_val, ttnn.sub(ones, gate_val))
-        grad_gate_val = ttnn.mul(grad_out_inner, sig_prime)
+        grad_gate_val = ttnn.mul(grad_out, inner)
         # Gate is a scalar — sum over all dimensions on device
         grad_gate = ttnn.sum(grad_gate_val, dim=0)
         grad_gate = ttnn.sum(grad_gate, dim=0)
@@ -2176,7 +2169,8 @@ class TTWorkspaceModule:
     Both passes use ReZero gates (scalar, init=0) and RMSNorm.
     QK Normalization is applied to both cross-attention passes to prevent
     entropy collapse and bound attention logits regardless of weight magnitudes.
-    No causal masking (bidirectional cross-attention). No RoPE.
+    Causal masking is applied to both passes (Perceiver-IO style) to prevent
+    future-token leakage in autoregressive settings. No RoPE.
     """
 
     def __init__(self, config: ModelConfig, device):
@@ -2277,6 +2271,46 @@ class TTWorkspaceModule:
         inv_norm = ttnn.rsqrt(norm_sq)                   # (B, H, L, d_h) broadcast
         return ttnn.mul(x, inv_norm)
 
+    def _build_causal_masks(self, T: int, m: int, B: int, H: int, device):
+        """Build causal masks for workspace cross-attention.
+
+        The workspace has two cross-attention passes that must respect causality
+        in an autoregressive setting:
+
+        1. Read pass: slots (m) attend over sequence positions (T).
+           Slot i can only attend to positions [0, (i+1)*T//m - 1].
+           This gives each slot a growing receptive field — early slots see
+           only early tokens, later slots see more. This prevents slots from
+           reading future tokens (including the answer).
+
+        2. Write pass: sequence positions (T) attend over slots (m).
+           Position t can only attend to slots [0, (t+1)*m//T].
+           This ensures position t only reads from slots whose receptive field
+           includes positions <= t, preventing future information from flowing
+           back into earlier positions through the workspace.
+
+        Returns:
+            read_mask: (m, T) — 1.0 where attention is allowed, 0.0 where masked
+            write_mask: (T, m) — 1.0 where attention is allowed, 0.0 where masked
+        """
+        # Read mask: slot i -> positions [0, (i+1)*T//m - 1]
+        read_mask_host = torch.zeros(m, T, dtype=torch.bfloat16)
+        for i in range(m):
+            cutoff = min((i + 1) * T // m, T)
+            read_mask_host[i, :cutoff] = 1.0
+
+        # Write mask: position t -> slots [0, (t+1)*m//T]
+        write_mask_host = torch.zeros(T, m, dtype=torch.bfloat16)
+        for t in range(T):
+            cutoff = min((t + 1) * m // T + 1, m)
+            write_mask_host[t, :cutoff] = 1.0
+
+        read_mask = ttnn.from_torch(read_mask_host, dtype=ttnn.bfloat16,
+                                     layout=ttnn.TILE_LAYOUT, device=device)
+        write_mask = ttnn.from_torch(write_mask_host, dtype=ttnn.bfloat16,
+                                      layout=ttnn.TILE_LAYOUT, device=device)
+        return read_mask, write_mask
+
     def _l2_normalize_backward(self, grad_normed, x, B, H, L):
         """Backward through L2 normalization.
 
@@ -2342,8 +2376,15 @@ class TTWorkspaceModule:
         rq_norm = self._l2_normalize_heads(rq, B, H, m)   # (B, H, m, d_h)
         rk_norm = self._l2_normalize_heads(rk, B, H, T)   # (B, H, T, d_h)
 
+        # Build causal masks for cross-attention (prevents future-token leakage)
+        read_mask, write_mask = self._build_causal_masks(T, m, B, H, device)
+
         read_scores = ttnn.matmul(rq_norm, ttnn.transpose(rk_norm, -2, -1))  # (B, H, m, T)
         read_scores = ttnn.mul(read_scores, self.read_qk_scale)  # learnable scale
+        # Apply causal mask: set masked positions to -1e4 before softmax
+        neg_inf_read = ttnn.full((B, H, m, T), -1e4, dtype=ttnn.bfloat16,
+                                  layout=ttnn.TILE_LAYOUT, device=device)
+        read_scores = ttnn.where(read_mask, read_scores, neg_inf_read)
         read_attn = ttnn.softmax(read_scores, dim=-1)               # (B, H, m, T)
         read_out_4d = ttnn.matmul(read_attn, rv)                    # (B, H, m, d_h)
         read_out = self._reshape_from_heads(read_out_4d, B, m)      # (B, m, D)
@@ -2367,6 +2408,10 @@ class TTWorkspaceModule:
 
         write_scores = ttnn.matmul(wq_norm, ttnn.transpose(wk_norm, -2, -1))  # (B, H, T, m)
         write_scores = ttnn.mul(write_scores, self.write_qk_scale)  # learnable scale
+        # Apply causal mask: set masked positions to -1e4 before softmax
+        neg_inf_write = ttnn.full((B, H, T, m), -1e4, dtype=ttnn.bfloat16,
+                                   layout=ttnn.TILE_LAYOUT, device=device)
+        write_scores = ttnn.where(write_mask, write_scores, neg_inf_write)
         write_attn = ttnn.softmax(write_scores, dim=-1)              # (B, H, T, m)
         write_out_4d = ttnn.matmul(write_attn, wv)                   # (B, H, T, d_h)
         write_out = self._reshape_from_heads(write_out_4d, B, T)     # (B, T, D)
@@ -2392,6 +2437,7 @@ class TTWorkspaceModule:
             "x_pre_norm": x_pre_norm,
             "B": B, "T": T, "m": m,
             "slot_perm": slot_perm,
+            "read_mask": read_mask, "write_mask": write_mask,
         }
 
         # Accumulate for regularizers (entropy + diversity)
@@ -2447,6 +2493,15 @@ class TTWorkspaceModule:
         # --- Backward through write_attn = softmax(write_scores * write_qk_scale) ---
         # softmax_backward gives d(L)/d(scores) where scores = scores_pre * qk_scale
         grad_write_scores = self._softmax_backward(grad_write_attn, c["write_attn"], B, H, T, m)
+
+        # Zero out gradients at causally masked positions (same as attention layer).
+        # After softmax, masked positions have attn=0, so the softmax backward
+        # already produces ~0 there, but we zero explicitly to avoid spurious
+        # gradients from bf16 rounding (matches TTAttentionLayer backward pattern).
+        write_mask = c["write_mask"]
+        zeros_write = ttnn.zeros((B, H, T, m), dtype=ttnn.bfloat16,
+                                  layout=ttnn.TILE_LAYOUT, device=device)
+        grad_write_scores = ttnn.where(write_mask, grad_write_scores, zeros_write)
 
         # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling
         wq = c["wq"]
@@ -2525,6 +2580,12 @@ class TTWorkspaceModule:
         # --- Backward through read_attn = softmax(read_scores * read_qk_scale) ---
         # softmax_backward gives d(L)/d(scores) where scores = scores_pre * qk_scale
         grad_read_scores = self._softmax_backward(grad_read_attn, c["read_attn"], B, H, m, T)
+
+        # Zero out gradients at causally masked positions (same as attention layer).
+        read_mask = c["read_mask"]
+        zeros_read = ttnn.zeros((B, H, m, T), dtype=ttnn.bfloat16,
+                                 layout=ttnn.TILE_LAYOUT, device=device)
+        grad_read_scores = ttnn.where(read_mask, grad_read_scores, zeros_read)
 
         # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling
         rk = c["rk"]
@@ -2760,12 +2821,19 @@ class AttentionResidual:
         self.k_max = k_max  # max number of iterations (for mask precomputation)
 
         # Learned query vector: (d_model,) → stored as (1, d_model) for tiling
+        # Init scale 1/sqrt(d_model) so ||query|| ≈ 1 (unit norm)
         query_init = torch.randn(1, d_model, dtype=torch.bfloat16) / math.sqrt(d_model)
         self.query = ttnn.from_torch(query_init, dtype=ttnn.bfloat16,
                                       layout=ttnn.TILE_LAYOUT, device=device)
 
-        # Learnable scale: init 1/sqrt(d_model) (standard attention scale)
-        scale_init = 1.0 / math.sqrt(d_model)
+        # Learnable scale: init 1.0 (not 1/sqrt(d_model)).
+        # With 1/sqrt(D)=0.051, softmax scores are nearly uniform (max
+        # difference ~0.003), so softmax backward gradients are ~0 and the
+        # AR parameters never learn — confirmed frozen across 1600 steps.
+        # With scale=1.0, the scores have meaningful spread (||x||≈1,
+        # ||query||≈1, so scores ~O(1)), giving the softmax real gradient
+        # signal to differentiate between iterations.
+        scale_init = 1.0
         self.scale = ttnn.from_torch(torch.tensor([scale_init], dtype=torch.bfloat16),
                                       dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
@@ -3099,7 +3167,8 @@ class TTMambaWorkspaceModel:
                 self._core_x_outputs = [x]  # x_0 = pre-core output
 
                 import math
-                slot_scale = 1.0 / K if K > 0 else 0.0
+                chain_safety = config.chain_scale_safety
+                slot_scale = 1.0 / (K * chain_safety) if K > 0 else 0.0
 
                 for iteration in range(k_max):
                     active = (iteration < K)
@@ -3170,7 +3239,7 @@ class TTMambaWorkspaceModel:
                 # iterations. Using 1/K for the slot chain makes the per-iteration
                 # gain A/K² + 1 - 1/sqrt(K), which is ≤1 when A ≤ K*sqrt(K)/K = sqrt(K)
                 # — much more robust than 1/sqrt(K) which requires A ≤ sqrt(K).
-                slot_scale = 1.0 / K if K > 0 else 0.0
+                slot_scale = 1.0 / (K * config.chain_scale_safety) if K > 0 else 0.0
 
                 for iteration in range(k_max):
                     active = 1.0 if iteration < K else 0.0
@@ -3568,7 +3637,7 @@ class TTMambaWorkspaceModel:
                     if grad_x is None:
                         grad_x = ar_grad_x
                     else:
-                        # Scale chained gradient by 1/K (slot_scale_tt = 1/K
+                        # Scale chained gradient by 1/(K*safety) (slot_scale_tt
                         # for active iterations) before adding AR gradient
                         grad_x = ttnn.add(ttnn.mul(slot_scale_tt, grad_x), ar_grad_x)
 
@@ -3784,6 +3853,9 @@ class TTMambaWorkspaceModel:
         if self.config.freeze_gamma:
             all_grads = {k: v for k, v in all_grads.items()
                          if not k.endswith("_gamma")}
+        if self.config.freeze_slot_decay:
+            all_grads = {k: v for k, v in all_grads.items()
+                         if k != "ws_slot_decay"}
 
         return all_grads
 
@@ -3798,6 +3870,9 @@ class TTMambaWorkspaceModel:
                 params[f"layer_{i}_{k}"] = v
         if self.workspace is not None:
             for k, v in self.workspace.get_params().items():
+                # Skip slot_decay if frozen
+                if self.config.freeze_slot_decay and k == "slot_decay":
+                    continue
                 params[f"ws_{k}"] = v
         if self.attn_residual is not None:
             for k, v in self.attn_residual.get_params().items():

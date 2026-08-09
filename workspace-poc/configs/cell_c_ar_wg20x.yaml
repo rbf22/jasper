@@ -52,17 +52,16 @@ slot_decay_init: 1.0
 # Training
 lr: 2.0e-4
 # Per-parameter LR groups: workspace gets 0.25x base LR.
-# Gates get 10x base LR — matching Cell B's successful config. The 3x used
-# in run 3 starved the workspace (gates only reached 0.10 vs Cell B's 0.66,
-# loss plateaued at 1.36 vs Cell B's 0.035). Now that the optimizer bug is
-# fixed and the AR is actually learning, it should compensate for faster
-# gate growth.
-# Attention residual params get 10x base LR — the AR must learn fast
-# enough to down-weight unstable iterations before gates open. With
-# scale init=1.0 (not 1/sqrt(D)), the softmax has real gradient signal.
+# Read gate gets 10x base LR (healthy in run 4, reached 0.64).
+# Write gate gets 20x base LR — run 4 showed write gate lagging (-0.31 vs
+# Cell B's -0.79). The write gate must open faster so slots actually change
+# between iterations, giving the AR something to differentiate. Without this,
+# the AR converges to uniform averaging and the workspace contribution is
+# diluted by K=6.
+# Attention residual params get 10x base LR.
 lr_groups:
   ws_read_gate: 10.0
-  ws_write_gate: 10.0
+  ws_write_gate: 20.0
   ws_read_qk_scale: 1.0
   ws_write_qk_scale: 1.0
   ws_ar_query: 10.0
@@ -86,7 +85,7 @@ checkpoint_interval: 100
 seed: 42
 
 # Early stopping
-plateau_patience: 1000
+plateau_patience: 3000
 plateau_min_delta: 1.0e-3
 
 # TT-specific

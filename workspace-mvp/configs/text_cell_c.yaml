@@ -27,7 +27,9 @@ k_train_max: 6
 k_inference: 6
 spectral_norm_bound: 5.0
 backbone_spectral_norm_bound: 2.0
+chain_scale_safety: 1.0
 freeze_gamma: true
+freeze_slot_decay: true
 ws_entropy_weight: 0.0
 ws_diversity_weight: 0.0
 gate_init: 0.0

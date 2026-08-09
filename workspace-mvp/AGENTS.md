@@ -42,8 +42,24 @@ Same Jasper architecture as `workspace-poc/` Cell C AR:
 - Retention layers (decayed linear attention) for non-attention positions
 - Attention at layers 5 and 10
 - Workspace with 16 slots, QK-Norm, ReZero gates
+- **Causal masking on workspace cross-attention** (2026-08-08 fix) —
+  the workspace's read/write passes now use Perceiver-IO style causal
+  masks to prevent future-token leakage. See `workspace-poc/AGENTS.md`
+  for details. This is critical for both synthetic tasks (answer leakage)
+  and text (standard LM causality).
 - Recurrent core (K=6) with attention residuals
+- **ReZero gates on all layers** (workspace + backbone) — backbone gates
+  were changed from sigmoid to ReZero on 2026-08-06, fixing the root cause
+  of all Cell C training divergences (see `workspace-poc/AGENTS.md`)
+- `freeze_slot_decay: true` — slot decay frozen at 1.0 to prevent slot
+  chain growth
+- `chain_scale_safety: 1.0` — 1/K chain gradient scaling (83% margin with
+  ReZero gates, no extra safety factor needed)
 - 10.5M architecture params + 19.3M embedding = **29.8M total**
+
+The model code is symlinked from `workspace-poc/`, so all architecture
+fixes apply automatically. Only the config (`configs/text_cell_c.yaml`)
+needs to be kept in sync with new config fields.
 
 ## Key differences from synthetic training
 

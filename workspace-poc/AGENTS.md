@@ -270,6 +270,41 @@ Three architectural changes based on literature review:
    the global clip and starving the backbone of learning signal.
    (Yang et al., 2022 — EMNLP 2022)
 
+### Causal masking fix (2026-08-08)
+
+**Critical bug fix.** The workspace's cross-attention was bidirectional (no
+causal mask), which allowed future tokens — including the answer — to leak
+into earlier positions through the workspace's read/write passes. This meant
+the model could learn to copy the answer from future positions rather than
+computing it from the prompt. A reviewer correctly identified this as
+"learning where the answer is, not how to do math."
+
+The fix applies Perceiver-IO style causal masking to both cross-attention
+passes (`_build_causal_masks` in `TTWorkspaceModule`):
+
+1. **Read pass** (slots attend over sequence): Slot `i` can only attend to
+   positions `[0, (i+1)*T//m - 1]`. Each slot gets a growing receptive field
+   — early slots see only early tokens, later slots see more.
+
+2. **Write pass** (sequence attends over slots): Position `t` can only
+   attend to slots `[0, (t+1)*m//T]`. This ensures position `t` only reads
+   from slots whose receptive field includes positions `≤ t`.
+
+Both masks are applied before softmax (setting masked positions to -1e4),
+and gradients at masked positions are zeroed in the backward pass (matching
+the `TTAttentionLayer` pattern). The backward pass is verified against
+PyTorch autograd in `test_ws_qknorm_gradcheck.py` (float64, all gradients
+match to <1e-13 relative error).
+
+**All previous workspace-containing results (Cell B, Cell C) are invalid**
+— they were trained with the leakage. Cell B's loss 0.083 vs Cell A's 0.931
+may have been largely or entirely due to answer leakage, not genuine
+reasoning. All workspace cells must be retrained from scratch with this fix.
+
+The same fix is applied to the PyTorch reference model (`model.py`
+`WorkspaceModule`) and the text POC (`workspace-mvp/` uses the same
+symlinked `model_ttnn.py`).
+
 ### New workspace parameters
 
 The workspace module now has 2 additional parameters:
@@ -426,6 +461,70 @@ slot chain's existing `1/K` scaling.
 
 Verified: 200-step test shows grad norm stable at 5.7-9.1 (no climbing),
 loss decreasing 4.94 → 1.28. Full 10K-step run launched on device 2.
+
+### Backbone ReZero gate fix (2026-08-06) — ROOT CAUSE of all divergences
+
+The AR chain scaling fix (1/K) delayed divergence from step ~1050 to ~2650,
+but the model still diverged. Three subsequent fix attempts all failed:
+1. `backbone_spectral_norm_bound: 2.0 → 1.5` — diverged at step 2800 (worse:
+   out_proj grew to 1.5, making A=5.96 vs original 5.0)
+2. `chain_scale_safety: 1.5` (1/(K*1.5) = 1/9 scaling) — diverged at step
+   2636 (faster: the step-2600 checkpoint was already in the unstable regime)
+
+**Root cause**: The `TTGatedResidualLayer` (wrapping all backbone layers,
+including core layers 6-9) used **sigmoid gates** with init=0, giving
+`sigmoid(0) = 0.5`. This means each backbone layer contributes 50% of its
+output to the residual stream at initialization.
+
+The v2 architecture fix (2026-08-02) changed the *workspace* gates to
+ReZero but **missed the backbone layer gates** — they still used sigmoid.
+
+With sigmoid gates at 0.5, each core layer's gradient self-amplification is:
+```
+layer_gain = 1 + sigmoid(gate) × σ_layer = 1 + 0.5 × 1.07 = 1.535
+```
+Over 4 core layers: `A_layers = 1.535⁴ = 5.55`
+With workspace contribution: `A_coupled ≈ 5.77`
+With K=6 and 1/K scaling: `A/K = 0.962` — **only 4% stability margin**
+
+The system starts training *at the stability boundary*. Any weight growth
+pushes A > K, causing divergence. This explains:
+- Why divergence always happened around step 1000-2650 (weights grow slowly)
+- Why lowering the spectral norm bound made it worse (out_proj grew to fill
+  the new bound, increasing A)
+- Why the chain safety factor didn't help (the checkpoint was already past
+  the boundary)
+- Why all runs diverged at `gz_gr ≈ 0.68-0.77` (read gate opening increases
+  the workspace's cross-amplification, pushing A_coupled over K)
+
+**Fix**: Changed `TTGatedResidualLayer` from sigmoid to ReZero (no sigmoid,
+gate init=0.0). At init, each backbone layer is pure identity (contributes
+nothing), giving:
+```
+layer_gain = 1 + 0.0 × σ_layer = 1.0
+A_layers = 1.0⁴ = 1.0
+A_coupled ≈ 1.04
+A/K = 0.173 — 83% margin
+```
+Gates grow slowly through gradient descent. Even at gate=0.3 (60% of
+sigmoid's 0.5), the margin is still 47%.
+
+Also added `freeze_slot_decay: true` to prevent the slot_decay parameter
+from growing above 1.0 (which would make the slot chain divergent).
+
+Config changes in `configs/cell_c_attn_residual.yaml`:
+- `chain_scale_safety: 1.0` (reverted from 1.5 — not needed with ReZero)
+- `freeze_slot_decay: true` (new — prevents slot chain growth)
+
+Code changes in `model_ttnn.py`:
+- `TTGatedResidualLayer.forward`: `sigmoid(self.gate)` → `self.gate`
+- `TTGatedResidualLayer.backward`: removed sigmoid derivative, grad is
+  now `grad_out * inner` (not `grad_out * inner * sigmoid'(gate)`)
+- `ModelConfig.freeze_slot_decay`: new field, drops `ws_slot_decay`
+  gradients and skips `slot_decay` in `get_params()` when true
+
+Training restarted from scratch (step 0) — the step-2600 checkpoint has
+sigmoid-gate weights that don't transfer to ReZero.
 
 ### Checkpoint backups from previous runs
 

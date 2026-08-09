@@ -6,14 +6,14 @@ Jasper is a research project building toward a ~1B-parameter reasoning model tha
 
 This repo contains two things:
 
-1. **A desktop-scale proof-of-concept** (`mamba-poc/`) — four parameter-matched model variants trained on synthetic reasoning tasks in under a week for ~$20–30. This experiment produces a go/no-go decision before any real cloud spend.
+1. **A desktop-scale proof-of-concept** (`workspace-poc/`) — four parameter-matched model variants trained on synthetic reasoning tasks on Tenstorrent hardware. This experiment produces a go/no-go decision before any real cloud spend.
 2. **Three planning documents** (root `.md` files) — the full architecture specification, the POC plan, and the infrastructure setup guide for scaling up if the POC passes.
 
 ---
 
 ## The thesis in one paragraph
 
-Reasoning-critical machinery in language models appears to be small (Anthropic's J-space: a compact, privileged internal workspace carrying most multi-step reasoning). Iterative refinement can substitute for parameter count (TRM's recursive revision loop, Geiping et al.'s recurrent-depth transformers). Meanwhile, the binding constraint for in-browser deployment is not parameter count but KV-cache memory growth over long reasoning traces. So the target is a model with an explicitly engineered workspace, a recurrent core that trades loop iterations for depth, and traces short enough that the KV cache stays within mobile-browser memory budgets. A hybrid Mamba-attention backbone makes memory flat in both sequence length and loop count — the SSM's compressed state plays the workspace role natively.
+Reasoning-critical machinery in language models appears to be small (Anthropic's J-space: a compact, privileged internal workspace carrying most multi-step reasoning). Iterative refinement can substitute for parameter count (TRM's recursive revision loop, Geiping et al.'s recurrent-depth transformers). Meanwhile, the binding constraint for in-browser deployment is not parameter count but KV-cache memory growth over long reasoning traces. So the target is a model with an explicitly engineered workspace, a recurrent core that trades loop iterations for depth, and traces short enough that the KV cache stays within mobile-browser memory budgets. A retention backbone (RetNet-style decayed linear attention) makes memory flat in sequence length, while the recurrent core trades loop iterations for depth without growing the KV cache.
 
 ---
 
@@ -25,37 +25,39 @@ jasper/
 ├── workspace-recurrent-1b-plan.md     ← the full 1B architecture spec & cost assessment
 ├── desktop-mamba-workspace-poc.md     ← the desktop POC experiment plan
 ├── infra-setup-guide.md               ← infrastructure ladder (Mac → Kaggle → RunPod → Lambda)
-└── mamba-poc/                         ← the code
-    ├── README.md                      ← practical guide to the code (start here for running things)
-    ├── data.py                        ← 3 synthetic task generators + verifiers + unit tests
-    ├── model.py                       ← 4 model cells behind config flags
-    ├── train.py                       ← training loop with checkpointing, wandb, auto-resume
-    ├── probe.py                       ← R2/R3/R4 analysis (K sweep, linear probes, ablation)
-    ├── configs/
-    │   ├── cell_a.yaml                ← pure Mamba2 (SSM floor)
-    │   ├── cell_b.yaml                ← hybrid baseline (Mamba2 + attention)
-    │   ├── cell_c.yaml                ← hybrid + workspace
-    │   └── cell_d.yaml                ← hybrid + workspace + recurrent core (full architecture)
-    ├── kaggle_notebook.ipynb          ← Kaggle T4 runner for cells B and D
-    ├── requirements.txt
-    └── checkpoints/                   ← saved during training (gitignored)
+├── kimi-k3-relevance-notes.md         ← Kimi K3 architecture analysis (informs the AR core design)
+├── workspace-poc/                     ← synthetic task training (the code)
+│   ├── README.md                      ← practical guide to the code (start here for running things)
+│   ├── AGENTS.md                      ← project notes, architecture history, debugging guide
+│   ├── data.py                        ← 3 synthetic task generators + verifiers + unit tests
+│   ├── model_ttnn.py                  ← Jasper model (ttnn, bfloat16) — the active implementation
+│   ├── train_ttnn.py                  ← Tenstorrent-native training loop
+│   ├── eval_ttnn.py                   ← checkpoint evaluation (per-task, per-depth accuracy)
+│   ├── probe.py                       ← R2/R3/R4 analysis (K sweep, linear probes, ablation)
+│   ├── configs/
+│   │   ├── cell_a_tt.yaml             ← hybrid baseline (no workspace, no recurrence)
+│   │   ├── cell_b_tt.yaml             ← hybrid + workspace (no recurrence)
+│   │   ├── cell_c_tt.yaml             ← hybrid + workspace + recurrent core (fixed blend)
+│   │   └── cell_c_attn_residual.yaml  ← Cell C with attention residual core (primary config)
+│   ├── kernels/                       ← custom tt-metal compute kernels (RoPE, scale+decay, gate bwd)
+│   └── checkpoints/                   ← saved during training (gitignored)
+├── workspace-mvp/                     ← text POC (TinyStories, shared model code via symlinks)
+└── paper.tex                          ← paper draft
 ```
 
 ---
 
 ## The model cells
 
-The POC trains five parameter-matched variants (~25–30M params each) on synthetic tasks with controllable reasoning depth. Cells A–D form an ablation ladder — each adds one component, so the marginal contribution of each is isolated. Cell E is a learning-rate control.
+The POC trains three parameter-matched variants (~10.5M params each) on synthetic tasks with controllable reasoning depth. Cells A–C form an ablation ladder — each adds one component, so the marginal contribution of each is isolated.
 
 | Cell | Architecture | Layers | What it tests |
 |------|-------------|--------|---------------|
-| **A** | Pure Mamba2 | 14 | SSM floor — establishes the baseline, especially on state-tracking (Task 2) where linear SSMs are known to struggle |
-| **B** | Hybrid (Mamba2 + attention) | 12 Mamba2 + 2 attention at positions 5, 10 | The real baseline the workspace must beat — hybridization recovers retrieval capability |
-| **C** | Hybrid + workspace | 11 Mamba2 + 2 attention + perceiver workspace (16 slots) | Does an engineered workspace help without recurrence? |
-| **D** | Hybrid + workspace + recurrent core | 11 Mamba2 + 2 attention + workspace + layers 6–9 looped K times | The full architecture — does recurrence + workspace beat the hybrid baseline? |
-| **E** | Hybrid (same as B) with lower LR | 12 Mamba2 + 2 attention | Learning-rate control — B architecture with C/D's LR (2e-4), isolating the workspace effect from the LR effect |
+| **A** | Hybrid (retention + 2 attention at positions 5, 10), no workspace | 13 | The no-workspace control — isolates workspace effect |
+| **B** | Hybrid + workspace (retention + 2 attention + 16-slot perceiver workspace with QK-Norm + ReZero gates) | 13 | Does an engineered workspace help without recurrence? |
+| **C** | Full architecture (hybrid + workspace + layers 6–9 looped K=6 times with attention residuals) | 13 | The go/no-go cell — does recurrence + workspace beat the hybrid baseline? |
 
-Cell D is the go/no-go cell. If it doesn't beat Cell B, the architecture bet is dead at zero cloud cost. Cell E disambiguates: if C beats E on Task 1, the workspace is doing real work (not just the lower learning rate).
+Cell C is the go/no-go cell. If it doesn't beat Cell B, the architecture bet is dead at zero cloud cost. Cell C uses an **attention residual core** (Kimi K3-style) that stores all K iteration outputs and computes learned softmax attention over them, replacing the fixed blend that caused gradient amplification in earlier runs.
 
 ---
 
@@ -89,28 +91,27 @@ These are the measurements that constitute proof, in ascending order of importan
 ## Quick start
 
 ```bash
-# Set up environment (Mac / MPS)
-python3 -m venv mamba-poc
-source mamba-poc/bin/activate
-pip install -r mamba-poc/requirements.txt
+# Tenstorrent Quietbox 2 (primary development environment)
+source /home/rfenwick/Documents/jasper/.tt-venv/bin/activate
 
 # Run unit tests on the data generators
-python mamba-poc/data.py
+python workspace-poc/data.py
 
-# Check parameter counts for all four cells
-python mamba-poc/model.py
-
-# Smoke test (5M params, ~10 min, Task 1 depth-4 only)
-python mamba-poc/train.py --config mamba-poc/configs/cell_d.yaml --smoke-test
+# Smoke test (3 steps, verifies forward+backward+checkpoint)
+cd workspace-poc
+python train_ttnn.py --config configs/cell_c_attn_residual.yaml --steps 3 \
+    --micro_batch 4 --accum_steps 1 --checkpoint_dir /tmp/test --device 0
 
 # Train a cell for real
-python mamba-poc/train.py --config mamba-poc/configs/cell_d.yaml
+python train_ttnn.py --config configs/cell_c_attn_residual.yaml \
+    --device 0 --checkpoint_dir checkpoints/ar_rezero
 
 # Run analysis (R2 K-sweep, R3 probes, R4 ablation) on a trained checkpoint
-python mamba-poc/probe.py --checkpoint mamba-poc/checkpoints/cellD_latest.pt --config mamba-poc/configs/cell_d.yaml --all
+python probe.py --checkpoint checkpoints/ar_rezero/cell_C_final.pt \
+    --config configs/cell_c_attn_residual.yaml --all
 ```
 
-See `mamba-poc/README.md` for the full code guide.
+See `workspace-poc/README.md` for the full code guide and `workspace-poc/AGENTS.md` for the architecture history and debugging notes.
 
 ---
 
@@ -133,7 +134,9 @@ A caution: synthetic-task wins at 30M have a real history of not transferring to
 | The full 1B architecture spec, training pipeline, and cost assessment | [`workspace-recurrent-1b-plan.md`](workspace-recurrent-1b-plan.md) |
 | The desktop POC experiment design (tasks, cells, measurements, timeline) | [`desktop-mamba-workspace-poc.md`](desktop-mamba-workspace-poc.md) |
 | How to set up infrastructure (Mac → Kaggle → RunPod → Lambda) | [`infra-setup-guide.md`](infra-setup-guide.md) |
-| How the code works and how to run it | [`mamba-poc/README.md`](mamba-poc/README.md) |
+| How the code works and how to run it | [`workspace-poc/README.md`](workspace-poc/README.md) |
+| Architecture history, debugging guide, and gradient instability fixes | [`workspace-poc/AGENTS.md`](workspace-poc/AGENTS.md) |
+| Kimi K3 architecture analysis (informs the attention residual core) | [`kimi-k3-relevance-notes.md`](kimi-k3-relevance-notes.md) |
 
 ---
 
@@ -142,7 +145,10 @@ A caution: synthetic-task wins at 30M have a real history of not transferring to
 - Geiping et al., "Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach" (2025)
 - Jolicoeur-Martineau, "Less is More: Recursive Reasoning with Tiny Networks" (TRM, 2025)
 - Anthropic, "A global workspace in language models" (2026)
+- Bachlechner et al., "ReZero is All You Need: Fast Convergence at Large Depth" (2020)
+- Sun et al., "Retentive Network: A Successor to Transformer for Large Language Models" (RetNet, 2023)
+- Moonshot AI, "Kimi K3" (2026) — attention residual core design
+- Henry et al., "Query-Key Normalization for Transformers" (2020)
+- Yang et al., "Component-wise Gradient Clipping" (EMNLP 2022)
 - Wang et al., "M1: Towards Scalable Test-Time Compute with Mamba Reasoning Models" (2025)
-- NVIDIA Nemotron-H / Nano 2 / Nemotron 3 reports (2025–26)
-- DeepScaleR (2025)
 - Google DeepMind, "Relaxed Recursive Transformers" (2024)

@@ -145,7 +145,9 @@ def build_model_config(cfg: dict) -> ModelConfig:
         use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
         spectral_norm_bound=cfg.get("spectral_norm_bound", 5.0),
         backbone_spectral_norm_bound=cfg.get("backbone_spectral_norm_bound", 2.0),
+        chain_scale_safety=cfg.get("chain_scale_safety", 1.0),
         freeze_gamma=cfg.get("freeze_gamma", False),
+        freeze_slot_decay=cfg.get("freeze_slot_decay", False),
         ws_entropy_weight=cfg.get("ws_entropy_weight", 0.0),
         ws_diversity_weight=cfg.get("ws_diversity_weight", 0.0),
         gate_init=cfg.get("gate_init", 0.0),
@@ -187,7 +189,7 @@ class TTAdamW:
     """
 
     def __init__(self, params: dict, lr=6e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
-                 lr_groups: dict = None):
+                 lr_groups: dict = None, wd_groups: dict = None):
         self.base_lr = lr
         self.lr = lr
         self.beta1, self.beta2 = betas
@@ -201,6 +203,9 @@ class TTAdamW:
         #           otherwise it matches name.startswith(key) (backward compat)
         self.lr_groups = lr_groups or {}
         self.param_lr_mult = {}  # name -> multiplier (resolved at init)
+        # Per-parameter weight decay groups: same matching as lr_groups
+        self.wd_groups = wd_groups or {}
+        self.param_wd = {}  # name -> weight decay (resolved at init)
         for name in params:
             mult = 1.0
             for key, prefix_mult in self.lr_groups.items():
@@ -213,6 +218,18 @@ class TTAdamW:
                     mult = prefix_mult
                     break
             self.param_lr_mult[name] = mult
+            # Resolve weight decay: default to global, override with group match
+            wd = self.weight_decay
+            for key, group_wd in self.wd_groups.items():
+                if key.startswith("suffix:"):
+                    suffix = key[7:]
+                    if name.endswith(suffix):
+                        wd = group_wd
+                        break
+                elif name.startswith(key):
+                    wd = group_wd
+                    break
+            self.param_wd[name] = wd
 
         self.param_names = list(params.keys())
         self.device = None  # set from first param
@@ -264,7 +281,8 @@ class TTAdamW:
                 grad = ttnn.typecast(grad, ttnn.float32)
 
             lr = self.get_param_lr(name)
-            b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
+            b1, b2, eps = self.beta1, self.beta2, self.eps
+            wd = self.param_wd.get(name, self.weight_decay)
 
             # m = b1*m + (1-b1)*g
             m = ttnn.add(ttnn.mul(m, b1), ttnn.mul(grad, 1.0 - b1))
@@ -307,6 +325,9 @@ class TTAdamW:
             layer_idx = int(parts[1])
             param_name = parts[2]
             model.layers[layer_idx].set_params({param_name: param})
+        elif name in ("ws_ar_query", "ws_ar_scale") and model.attn_residual is not None:
+            ar_param_name = name[3:]  # strip "ws_" prefix
+            model.attn_residual.set_params({ar_param_name: param})
         elif name.startswith("ws_"):
             ws_param_name = name[3:]  # strip "ws_" prefix
             model.workspace.set_params({ws_param_name: param})
@@ -599,13 +620,31 @@ def host_grads_to_tt(acc_grads: dict, device) -> dict:
 # LR warmup
 # ---------------------------------------------------------------------------
 
-def get_lr(step: int, base_lr: float, warmup_steps: int) -> float:
-    """Linear warmup from 0 to base_lr over warmup_steps, then constant."""
+def get_lr(step: int, base_lr: float, warmup_steps: int,
+           cosine_decay_steps: int = 0, cosine_min_ratio: float = 0.1) -> float:
+    """Linear warmup from 0 to base_lr over warmup_steps, then optional cosine decay.
+
+    If cosine_decay_steps > 0, after warmup the LR follows a cosine schedule
+    from base_lr down to base_lr * cosine_min_ratio over cosine_decay_steps,
+    then stays at the minimum for the remainder.
+    """
     if warmup_steps <= 0:
+        effective_step = step
+    elif step < warmup_steps:
+        return base_lr * step / warmup_steps
+    else:
+        effective_step = step - warmup_steps
+
+    if cosine_decay_steps <= 0:
         return base_lr
-    if step >= warmup_steps:
-        return base_lr
-    return base_lr * step / warmup_steps
+
+    if effective_step >= cosine_decay_steps:
+        return base_lr * cosine_min_ratio
+
+    import math
+    progress = effective_step / cosine_decay_steps
+    cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * (cosine_min_ratio + (1.0 - cosine_min_ratio) * cosine_factor)
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +712,11 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     base_lr = cfg.get("lr", 6e-4)
     warmup_steps = cfg.get("warmup_steps", 200)
     weight_decay = cfg.get("weight_decay", 0.1)
+    # Cosine LR schedule (optional): decays LR from base to base*min_ratio
+    # over cosine_decay_steps after warmup. Prevents gates from growing
+    # unboundedly after convergence.
+    cosine_decay_steps = cfg.get("cosine_decay_steps", 0)
+    cosine_min_ratio = cfg.get("cosine_min_ratio", 0.1)
     grad_clip = cfg.get("grad_clip", 1.0)
     ws_grad_clip = cfg.get("ws_grad_clip", 0.5)
     grad_norm_spike_threshold = cfg.get("grad_norm_spike_threshold", 5000.0)
@@ -728,8 +772,9 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     # Per-parameter LR groups: allows different LR for workspace vs backbone
     # Config format: lr_groups: {"ws_": 0.25}  → workspace params get 0.25x base LR
     lr_groups = cfg.get("lr_groups", None)
+    wd_groups = cfg.get("wd_groups", None)
     optimizer = TTAdamW(model.get_params(), lr=base_lr, weight_decay=weight_decay,
-                        lr_groups=lr_groups)
+                        lr_groups=lr_groups, wd_groups=wd_groups)
     if lr_groups:
         ws_mult = lr_groups.get("ws_", 1.0)
         ws_lr = base_lr * ws_mult
@@ -796,8 +841,9 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     for step in range(start_step, max_steps):
         t_step_start = time.time()
 
-        # Update LR (warmup)
-        current_lr = get_lr(step, base_lr, warmup_steps)
+        # Update LR (warmup + optional cosine decay)
+        current_lr = get_lr(step, base_lr, warmup_steps,
+                            cosine_decay_steps, cosine_min_ratio)
         optimizer.set_lr(current_lr)
 
         # Gate schedule: force gates open before forward pass

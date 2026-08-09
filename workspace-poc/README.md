@@ -36,7 +36,7 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | `test_gate_bwd.py` | Standalone test for the fused gate backward kernel. |
 | `test_ws_backward_cpu.py` | CPU gradient check for the workspace backward pass. Verifies all gradients (input, weights, slots, gates) against PyTorch autograd to within float32 precision. |
 | `test_ws_backward.py` | Device-side gradient check (earlier attempt, superseded by the CPU version). |
-| `configs/cell_{a,b,c}_tt.yaml` | YAML configs for each model cell, including Tenstorrent-specific settings. Cell A is the no-workspace control; B adds workspace; C adds recurrent core. |
+| `configs/cell_{a,b,c}_tt.yaml` | YAML configs for each model cell, including Tenstorrent-specific settings. Cell A is the no-workspace control; B adds workspace; C adds recurrent core. `cell_c_attn_residual.yaml` is the primary Cell C config (attention residual core). |
 | `run_all_cells_parallel.sh` | Launches all three cells in parallel on separate Blackhole chips (one cell per device). |
 | `tt_runner.py` | Sequential training runner for a single Blackhole chip. Supports `--cell`, `--status`, `--clean`, `--smoke` modes. |
 | `colab_notebook.ipynb` | Google Colab T4 notebook for running cells A and C (the go/no-go pair) on free GPU time. (Deprecated — project moved to TT.) |
@@ -95,9 +95,11 @@ All cells are ~25–30M parameters, `d_model=384`, vocabulary ~128 (character-le
 |------|-------------|--------------|------------|
 | **A** | Hybrid (Mamba-3 + 2 attention at positions 5, 10), no workspace | `use_attention=true, use_workspace=false, recurrent_core=false` | The no-workspace control — isolates workspace effect |
 | **B** | Hybrid + workspace (Mamba-3 + 2 attention + 16-slot perceiver workspace with QK-Norm + ReZero gates) | `use_attention=true, use_workspace=true, recurrent_core=false` | Does an engineered workspace help without recurrence? |
-| **C** | Full architecture (hybrid + workspace + layers 6–9 looped K=6 times) | `use_attention=true, use_workspace=true, recurrent_core=true` | The go/no-go cell |
+| **C** | Full architecture (hybrid + workspace + layers 6–9 looped K=6 times with attention residuals) | `use_attention=true, use_workspace=true, recurrent_core=true, attention_residual_core=true` | The go/no-go cell |
 
-Cell C's recurrent core (layers 6–9) is applied K times per forward pass. During training, K is sampled uniformly from {1…6} per batch. At inference, K can be swept (the `k_inference` config field or `--k_override` in code). K was temporarily reduced from 6 to 3 to limit gradient amplification, then restored to 6 after fixing the slot-state gradient scaling (see "Slot-state gradient scaling" below).
+Cell C's recurrent core (layers 6–9) is applied K times per forward pass. During training, K is sampled uniformly from {1…6} per batch. At inference, K can be swept (the `k_inference` config field or `--k_override` in code). K was temporarily reduced from 6 to 3 to limit gradient amplification, then restored to 6 after fixing the slot-state gradient scaling (see "Training stabilization" below).
+
+The primary Cell C config is `cell_c_attn_residual.yaml`, which uses an **attention residual core** (Kimi K3-style) instead of the fixed blend. This stores all K iteration outputs and computes learned softmax attention over them, bounding output magnitude and providing consistent gradient magnitude across iterations. See "Attention Residual Core" below.
 
 Cell B removes one Mamba layer (13 vs 14) to compensate for the ~2M workspace parameters, keeping cells parameter-matched.
 
@@ -153,11 +155,12 @@ Three architectural changes, all based on published techniques:
    events. (Henry et al., 2020 — now standard in OLMo 2, Gemma 3, Qwen 3)
 
 2. **ReZero gates** (replaces sigmoid gates): Scalar gates initialized to 0.0
-   (true identity at init), no sigmoid. The workspace starts as a no-op and
-   grows naturally through gradient descent. This gives the backbone time to
-   learn a good representation before the workspace starts contributing, and
-   avoids the sigmoid's gradient saturation that made gates slow to adapt.
-   (Bachlechner et al., 2020 — "ReZero is All You Need")
+   (true identity at init), no sigmoid. Both the workspace gates and the
+   backbone layer gates use ReZero. The workspace and backbone both start as
+   no-ops and grow naturally through gradient descent. This gives the backbone
+   time to learn a good representation before the workspace starts contributing,
+   and keeps the gradient self-amplification at 1.0 per layer at init (vs
+   sigmoid(0)=0.5 which gives 1 + 0.5×σ per layer). (Bachlechner et al., 2020)
 
 3. **Component-wise gradient clipping** (`clip_grad_norm` in `train_ttnn.py`):
    Workspace parameters (ws_*) are clipped at `ws_grad_clip` (0.5), backbone
@@ -165,6 +168,57 @@ Three architectural changes, all based on published techniques:
    independently. This prevents workspace gradient spikes from dominating the
    global clip and starving the backbone of learning signal.
    (Yang et al., 2022 — EMNLP 2022)
+
+#### Attention Residual Core (2026-08-04, Kimi K3-style)
+
+The fixed blend core (`x = (1-a)*x + a*x_new` applied K times) creates a
+multiplicative gradient path that amplifies across iterations. The fix
+replaces it with **Attention Residuals**: store all K iteration outputs
+(plus the pre-core input x_0) and compute softmax attention over them with
+a learned query vector:
+
+```
+scores_k = sum_d(x_k * query) * scale       → (B, T) per k
+alpha = softmax([scores_0, ..., scores_K])   → (B, T, K+1)
+x_final = sum_k alpha_k * x_k                → (B, T, d_model)
+```
+
+This bounds output magnitude (softmax normalizes) and gives each iteration
+direct gradient from the attention (bounded by softmax weights), rather than
+through a chain of blend operations. The `AttentionResidual` class has two
+learnable parameters: `ar_query` (1, d_model) and `ar_scale` (scalar).
+
+Config: `attention_residual_core: true` in the YAML.
+
+#### Chain gradient scaling (2026-08-04)
+
+Even with the AR core, the slot state chain and the shared core layer
+gradients compound across K iterations. The chained gradient from each
+iteration is scaled by `1/(K × chain_scale_safety)` before adding the AR
+gradient. With `chain_scale_safety: 1.0` (current), the per-iteration chain
+gain is `A/K`, stable for A < K. The AR gradient itself is not scaled (it's
+bounded by softmax).
+
+#### Backbone ReZero gate fix (2026-08-06) — root cause of all divergences
+
+The v2 fix changed the *workspace* gates to ReZero but **missed the backbone
+layer gates** — they still used sigmoid with init=0, giving `sigmoid(0) = 0.5`.
+This meant each backbone layer contributed 50% of its output at init, creating
+a gradient self-amplification of `1 + 0.5 × σ_layer` per layer. Over 4 core
+layers: `A_layers = 5.55`, `A_coupled ≈ 5.77`, `A/K = 0.96` — only 4% stability
+margin. The system started training at the stability boundary and diverged
+as soon as weights grew.
+
+**Fix**: Changed `TTGatedResidualLayer` from sigmoid to ReZero (no sigmoid,
+gate init=0.0). At init, each backbone layer is pure identity — amplification
+= 1.0 per layer, `A_coupled ≈ 1.04`, `A/K = 0.17` — 83% margin. Gates grow
+slowly through gradient descent. Even at gate=0.3 (60% of sigmoid's 0.5), the
+margin is still 47%.
+
+Also added `freeze_slot_decay: true` to prevent the slot_decay parameter from
+growing above 1.0 (which would make the slot chain divergent).
+
+See AGENTS.md for the complete history of gradient instability fixes.
 
 #### Additional stabilizers (from earlier runs, still in place)
 
@@ -201,35 +255,52 @@ Three architectural changes, all based on published techniques:
    from init), so freezing it loses nothing while eliminating that gradient
    path. (RetNet keeps γ fixed for the same reason — Sun et al., 2023)
 
-10. **Slot decay** (`slot_decay_init: 1.0`): The slot update includes a learned
-    decay scalar: `slots = norm(decay * slots + gate * read_out)`. This makes
-    the slot update contractive — old information fades unless actively
-    reinforced, providing a restoring force against attention sharpening.
+10. **Slot decay** (`slot_decay_init: 1.0`, `freeze_slot_decay: true`): The slot
+    update includes a decay scalar: `slots = norm(decay * slots + gate * read_out)`.
+    This makes the slot update contractive — old information fades unless actively
+    reinforced, providing a restoring force against attention sharpening. The
+    decay is frozen at init to prevent it from growing above 1.0 (which would
+    make the slot chain divergent).
+
+11. **Chain gradient scaling** (`chain_scale_safety: 1.0`): The chained gradient
+    from each recurrent core iteration is scaled by `1/(K × chain_scale_safety)`
+    before adding the AR gradient. With ReZero backbone gates, the per-iteration
+    amplification A starts at ~1.0, giving A/K = 0.17 at init — 83% margin. No
+    extra safety factor is needed.
 
 #### History of gradient instability
 
 The workspace's two-pass cross-attention (read + write) creates a
-multiplicative gradient amplification path. Across four rounds of fixes, the
-instability pattern was consistent: training is stable until gates open to
-~0.20–0.25, then gradient norms spike and divergence follows.
+multiplicative gradient amplification path. Across multiple rounds of fixes,
+the instability pattern was consistent: training is stable for a while, then
+gradient norms spike and divergence follows. Each fix addressed a layer of
+the problem, peeling back to the next underlying cause.
 
-| Run | Fix | Cell B diverges | Cell C diverges | Gate at divergence |
-|-----|-----|-----------------|-----------------|-------------------|
-| 1 | None (bound=3.0, gamma trainable) | step ~2300 | step ~700 | ~0.15 |
-| 2 | bb_bound=2.0, gamma clip | step ~1800 | step ~700 | ~0.22 |
-| 3 | bb_bound=2.0, gamma frozen | step ~1700 | step ~900 | ~0.21 |
-| 4 | Same as 3 (re-run) | step ~1400 | step ~900 | ~0.21 |
+| Run | Fix | Cell C diverges | Root cause |
+|-----|-----|-----------------|------------|
+| 1 | None (bound=3.0, gamma trainable) | step ~700 | Gamma gradient explosion |
+| 2 | bb_bound=2.0, gamma clip | step ~700 | Same — gamma still unstable |
+| 3 | bb_bound=2.0, gamma frozen | step ~900 | Entropy collapse in QK^T |
+| 4 | Same as 3 (re-run) | step ~900 | Same |
+| v2 | QK-Norm + ReZero (workspace) + comp clipping | step ~1000 | Fixed blend chain amplification |
+| AR | Attention residual core | step ~1050 | Gradient double-counting in AR backward |
+| AR-fix | AR double-counting fix | step ~1550 | Unscaled AR chain gradient |
+| 1/K | Chain gradient scaling (1/K) | step ~2650 | Sigmoid backbone gates (A/K=0.96, 4% margin) |
+| bound1.5 | backbone_spectral_norm_bound 2.0→1.5 | step ~2800 | Worse — out_proj grew to 1.5, A=5.96 |
+| safety1.5 | chain_scale_safety 1.0→1.5 | step ~2636 | Checkpoint already in unstable regime |
+| **ReZero** | **Backbone sigmoid→ReZero gates** | **stable (training)** | **A/K=0.17, 83% margin — root cause fixed** |
 
-**Root cause** (identified from checkpoint analysis): The workspace QK^T had
-condition numbers of 40,000–112,000 (entropy collapse). Spectral norm bounds
-on weights didn't help because they don't bound the *product* QK^T. When gates
-opened to ~0.20, individual batches produced gradient spikes through the
-cross-attention paths, which corrupted the AdamW EMA state, causing
-cascading divergence. Architecture v2 (QK-Norm + ReZero + component-wise
-clipping) addresses this structurally — QK-Norm bounds the logits by
-construction, ReZero gives the backbone time to stabilize before the workspace
-contributes, and component-wise clipping prevents workspace spikes from
-affecting the backbone.
+**Root cause** (identified 2026-08-06): The backbone layer gates used sigmoid
+with init=0, giving `sigmoid(0) = 0.5`. This meant each of the 4 core layers
+contributed 50% of its output at init, creating a gradient self-amplification
+of `1 + 0.5 × σ_layer ≈ 1.535` per layer. Over 4 layers: `A_layers = 5.55`,
+`A_coupled ≈ 5.77`, `A/K = 0.96` — only 4% stability margin. The system started
+training at the stability boundary and diverged as soon as weights grew.
+
+The v2 fix (2026-08-02) changed the *workspace* gates to ReZero but missed the
+backbone layer gates. The backbone ReZero fix (2026-08-06) completes the v2
+architecture: all gates (workspace + backbone) now use ReZero, giving A/K = 0.17
+(83% margin) at init. See AGENTS.md for the complete fix history.
 
 ### Attention regularizers (entropy + diversity) — IMPLEMENTED, MEASURED HARMFUL, DISABLED
 
@@ -265,35 +336,32 @@ Both are computed via host-side PyTorch autograd on the cached attention and slo
 
 ### Architectural stability: ReZero gates and slot decay
 
-The workspace has a **feedback loop with gain** (read from x → update slots →
-write back to x). Without architectural constraints, this loop amplifies rather
-than contracts, causing gradient explosion once the gates open enough for the
-workspace to contribute meaningfully.
+Both the workspace and the backbone layers use **ReZero gates** (scalar,
+init=0.0, no sigmoid). This makes the entire model start as a pure identity
+at initialization — no layer contributes anything until its gate grows through
+gradient descent. This is critical for the recurrent core: with sigmoid gates
+(sigmoid(0)=0.5), the 4 core layers create a gradient self-amplification of
+~5.5x per iteration, leaving only 4% stability margin under 1/K chain scaling.
+With ReZero gates (gate=0), the amplification is 1.0x — 83% margin.
 
-The current design (architecture v2) makes the workspace stable by
-construction:
+- **ReZero gates** (scalar, init=0.0, no sigmoid): Both workspace gates
+  (read_gate, write_gate) and backbone layer gates use ReZero. The gates grow
+  linearly through gradient descent — no sigmoid saturation, no fixed schedule.
+  The gate-specific LR group (10x workspace LR for workspace gates, 1.0x for
+  backbone gates) ensures the gates reach useful values within the training
+  budget.
 
-- **ReZero gates** (scalar, init=0.0, no sigmoid): The workspace starts as a
-  true identity (gate=0 means zero contribution). The gate grows linearly
-  through gradient descent — no sigmoid saturation, no fixed schedule. This
-  gives the backbone time to learn a good representation before the workspace
-  starts contributing. The gate-specific LR group (10x workspace LR) ensures
-  the gates reach useful values within the training budget. See item 2 in the
-  stabilization section above.
-
-- **Slot decay** (`slot_decay_init: 1.0`): The slot update is
-  `slots = norm(decay * slots + gate * read_out)` where `decay` is a learned
+- **Slot decay** (`slot_decay_init: 1.0`, `freeze_slot_decay: true`): The slot
+  update is `slots = norm(decay * slots + gate * read_out)` where `decay` is a
   scalar. This makes the slot update contractive — old information fades unless
-  actively reinforced, providing a restoring force against attention
-  sharpening. See item 10 in the stabilization section above.
+  actively reinforced. The decay is frozen at init to prevent it from growing
+  above 1.0, which would make the slot chain divergent.
 
 The previous design used sigmoid gates with `gate_init: -2` (sigmoid(-2) ≈
-0.12). This was replaced by ReZero gates because: (1) the sigmoid's derivative
-saturates at sigmoid'(-2) ≈ 0.11, making gates slow to adapt, and (2) starting
-at 0.12 contribution was too high — the workspace's gradient amplification
-caused divergence at gate values of 0.20–0.25, before the gates had learned
-useful routing. ReZero starts at exactly 0 and grows linearly, giving maximum
-warmup time.
+0.12) for the workspace and `gate_init: 0` (sigmoid(0) = 0.5) for the backbone.
+The workspace gates were changed to ReZero in the v2 fix (2026-08-02), but the
+backbone gates were not — this was the root cause of all subsequent Cell C
+divergences, identified and fixed on 2026-08-06.
 
 ---
 
@@ -512,9 +580,12 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `dropout` | 0.0 | Dropout rate |
 | `spectral_norm_bound` | 5.0 | Spectral norm cap for workspace weights (power iteration, 10 steps) |
 | `backbone_spectral_norm_bound` | 2.0 | Spectral norm cap for backbone qkv/out_proj weights |
+| `chain_scale_safety` | 1.0 | Extra safety factor for recurrent core gradient chain (1/(K×safety)). With ReZero backbone gates, 1.0 gives 83% margin. |
 | `freeze_gamma` | true | Freeze retention gamma (don't train it) — eliminates O(T²) gradient instability |
+| `freeze_slot_decay` | true | Freeze slot_decay at init — prevents slot chain growth above 1.0 |
 | `gate_init` | 0.0 | ReZero gate init value (0.0 = true identity). No longer uses sigmoid. |
 | `slot_decay_init` | 1.0 | Initial value for slot decay scalar (1.0 = no decay) |
+| `attention_residual_core` | false | Use attention residual core (Kimi K3-style) instead of fixed blend for recurrent core |
 
 ### Training fields
 
@@ -581,50 +652,36 @@ The project has moved to Tenstorrent hardware. The PyTorch path (`train.py`, `mo
 
 ## Current experimental status (as of August 2026)
 
-Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). The project directories were renamed from `mamba-poc`/`mamba-mvp` to `workspace-poc`/`workspace-mvp` to reflect that the architecture has evolved beyond Mamba. The model is now called **Jasper** — a workspace-augmented retention network with recurrent core.
+Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). The model is **Jasper** — a workspace-augmented retention network with recurrent core.
 
 ### Synthetic training (workspace-poc/)
 
-Cell A (backbone-only control) and Cell B (workspace, no recurrence) completed training. Cell B early-stopped at step 9404. Cell C (full architecture: workspace + recurrent core with attention residuals) is currently training with the chain gradient scaling fix.
+Cell A (backbone-only control) and Cell B (workspace, no recurrence) completed training. Cell B early-stopped at step 9404. Cell C (full architecture: workspace + recurrent core with attention residuals) is currently training with the backbone ReZero gate fix.
 
-Two Cell C variants are running:
+**Cell C training history**: Cell C went through multiple rounds of gradient instability fixes (see "History of gradient instability" above). The root cause was identified on 2026-08-06: backbone layer gates used sigmoid (sigmoid(0)=0.5) instead of ReZero, giving only 4% stability margin. The fix (backbone sigmoid→ReZero) gives 83% margin. Training was restarted from scratch with the fix.
 
-| Variant | Config | Status | Notes |
-|---------|--------|--------|-------|
-| **AR (primary)** | `cell_c_attn_residual.yaml` | Training on device 2 | Attention residual core, K=6, 1/K chain scaling |
-| K3 (deprioritized) | `cell_c_attn_residual_k3.yaml` | Training on device 3 | Adds short conv + per-channel decay; ~60% slower |
+**Current run** (`cell_c_attn_residual.yaml`, `checkpoints/ar_rezero/`):
 
-The K3 variant is deprioritized due to overhead from host-side gamma gradient transfers. The AR version is the primary config for both synthetic and text training.
+| Step | Loss | Grad norm | gz_gr | gz_gw | Notes |
+|------|------|-----------|-------|-------|-------|
+| 0 | 7.48 | 8.86 | 0.000 | 0.000 | All gates at 0 (ReZero init) |
+| 50 | 7.08 | 8.97 | -0.013 | 0.013 | Gates growing slowly |
+| 100 | 1.91 | 2.81 | -0.049 | 0.047 | Loss dropping fast as gates open |
+| 200 | 1.46 | 1.23 | -0.056 | 0.051 | Stable, grad norm flat |
+
+All previous runs showed grad norm oscillation by step 200. This run is stable — the ReZero fix appears to have resolved the root cause.
 
 ### Text POC (workspace-mvp/)
 
 A text training pipeline has been set up in `workspace-mvp/` to test Jasper on real language data. It uses TinyStories (~480M tokens, GPT-2 BPE tokenization) with the same Cell C AR architecture. The model is 29.8M params (10.5M architecture + 19.3M embedding for the 50K vocab).
 
-Smoke-tested (200 steps): loss 10.92 → 9.24, perplexity ~50K → 10,595, grad norm stable at 1.2-2.9. Ready for full training launch.
+Smoke-tested (200 steps): loss 10.92 → 9.24, perplexity ~50K → 10,595, grad norm stable at 1.2-2.9. Ready for full training launch after the synthetic Cell C run validates the architecture.
 
 See AGENTS.md for full details on the text POC setup.
 
-### Architecture v2 (2026-08-02)
-
-The workspace gradient instability was investigated across four training runs.
-Each run diverged at the same point: when workspace gates opened to ~0.20–0.25.
-Checkpoint analysis revealed the root cause was **entropy collapse** in the
-workspace cross-attention (QK^T condition numbers of 40,000–112,000). Three
-architectural changes address this:
-
-1. **QK Normalization**: L2-normalize Q and K before attention scores, with
-   learnable scale. Bounds logits by construction. (Henry et al., 2020)
-2. **ReZero gates**: Scalar gates init=0, no sigmoid. Workspace starts as
-   identity. (Bachlechner et al., 2020)
-3. **Component-wise gradient clipping**: Workspace clipped at 0.5, backbone at
-   1.0, independently. (Yang et al., 2022)
-
-See the "Training stabilization" section above for full details, and AGENTS.md
-for the complete history of gradient instability fixes.
-
 ### Architecture changes since the original plan
 
-1. **Mamba-2 → Mamba-3 (retention)**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. See `mamba3_layer.py`.
+1. **Mamba-2 → Retention (Mamba-3)**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. See `mamba3_layer.py`.
 
 2. **Custom fused kernels**: Three custom tt-metal kernels eliminate intermediate DRAM writes and reduce op dispatch overhead:
    - **Fused RoPE**: Full rotation (rot1 = x1*cos - x2*sin, rot2 = x1*sin + x2*cos) in a single kernel pass. Uses split-RoPE optimization to avoid expensive sub-tile concat/slice when d_half=48 is not tile-aligned.
@@ -633,13 +690,17 @@ for the complete history of gradient instability fixes.
 
 3. **Early stopping**: EMA-smoothed loss plateau detection with patience=1000 (10% of max_steps) and min_delta=1e-3 (0.1% relative improvement). Tuned for the effective batch size of 384 (micro_batch=8 × accum_steps=48).
 
-4. **Architecture v2 stabilization**: QK-Norm + ReZero gates + component-wise gradient clipping (see above). Previous fixes (backbone spectral norm, gamma freezing) remain in place. K restored to 6 after slot-state gradient scaling fix.
+4. **Architecture v2 stabilization**: QK-Norm + ReZero gates (workspace + backbone) + component-wise gradient clipping. Previous fixes (backbone spectral norm, gamma freezing, slot decay freezing) remain in place. K restored to 6 after slot-state gradient scaling fix.
 
-5. **Slot-state gradient scaling** (2026-08-03): The 1/sqrt(K) blend scaling normalizes residual stream (x) gradients across K iterations, but the slot state chain bypassed it — `grad_slots_in` from each iteration's workspace backward chained to the previous iteration without scaling, causing exponential gradient amplification. First attempt: scale by 1/sqrt(K) (per-iteration gain `A/K + 1 - 1/sqrt(K)`, requires A ≤ sqrt(K)). K=3 diverged at step ~1150, K=6 at step ~750. Current fix: scale by 1/K (per-iteration gain `A/K² + 1 - 1/sqrt(K)`, much more robust). The x residual blend stays at 1/sqrt(K) (correct for additive accumulation); only the multiplicative slot chain uses the more conservative 1/K.
+5. **Attention residual core** (2026-08-04): Replaced the fixed blend (`x = (1-a)*x + a*x_new`) with learned softmax attention over all K iteration outputs (Kimi K3-style). This bounds output magnitude and provides consistent gradient magnitude across iterations.
+
+6. **Chain gradient scaling** (2026-08-04): The chained gradient from each recurrent core iteration is scaled by 1/(K×safety) before adding the AR gradient. With ReZero backbone gates, safety=1.0 gives 83% stability margin.
+
+7. **Backbone ReZero gate fix** (2026-08-06): The root cause of all Cell C divergences. Backbone layer gates were changed from sigmoid (sigmoid(0)=0.5, 4% margin) to ReZero (gate=0, 83% margin). Also added `freeze_slot_decay: true` to prevent slot chain growth.
 
 ### What we're watching for
 
-- **Cell C stability past step 1550**: All previous runs diverged between step 750–1550. The current run has the chain gradient scaling fix. Step 1550 is the critical threshold.
+- **Cell C stability past step 2650**: All previous runs diverged between step 750–2650. The current run (with backbone ReZero fix) must pass step 2650 to be considered stable. Early signs are positive (grad norm flat at step 200).
 - **Cell A vs Cell B**: The clean workspace comparison (same LR=2e-4, A has no workspace). If B beats A on Task 1, the workspace is doing real work.
 - **Cell C convergence**: The full architecture (workspace + recurrence) is ~2x slower per step. Will it converge within the training budget?
 - **Text POC convergence**: Does Jasper learn coherent language on TinyStories? If so, the workspace + recurrent core works on real text, not just synthetic tasks.

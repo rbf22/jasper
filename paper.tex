@@ -192,6 +192,9 @@ Hidden states attend over the updated slots:
 
 where $g_w$ is a ReZero gate (scalar, initialized to 0) and $s_w$ is the write-pass QK scale. The slot state $\mathbf{S}'$ is persistent: it is carried forward to the next workspace application and, in the recurrent core, across loop iterations. SlotNorm (RMSNorm applied to the slot dimension) prevents unbounded growth of slot activations across iterations.
 
+\paragraph{Causal masking.}
+Both cross-attention passes use causal masking (Perceiver-IO style \citep{jaegle2022perceiverio}) to prevent future-token leakage in autoregressive settings. Without causal masking, the workspace's bidirectional cross-attention would allow the model to read future tokens (including the answer) through the slots, creating a shortcut that bypasses reasoning entirely. The read pass restricts slot $i$ to positions $[0, (i{+}1)\lfloor T/m \rfloor - 1]$, giving each slot a growing receptive field. The write pass restricts position $t$ to slots $[0, (t{+}1)\lfloor m/T \rfloor]$, ensuring each position only reads from slots whose receptive field includes positions $\leq t$. This preserves the workspace's memory function while respecting causality.
+
 \paragraph{Slot parameter normalization.}
 The learned slot parameters $\mathbf{S}$ are subject to a positive feedback loop: large slots produce sharp attention distributions, which produce large gradients, which cause the slots to grow further. To break this loop, the slot parameters are normalized to unit RMS after each optimizer step:
 \begin{equation}
@@ -398,10 +401,10 @@ R3 and R4 are what make this a \emph{\jspace{} proof} rather than just another a
 
 The current training run (August 2026) uses the retention-based backbone on Tenstorrent Blackhole hardware with the three-cell ablation ladder (A, B, C). Cells A and B have completed via early stopping; Cell C is training with the attention residual core.
 
-\paragraph{Cells A and B: completed.}
-Cell A (backbone-only control, 10.08M parameters) early-stopped at step 7608 with a best loss of 0.931. Cell B (backbone + workspace, 10.53M parameters) early-stopped at step 9404 with a best loss of 0.083. Both trained stably throughout with no gradient explosions. Cell B's ReZero gates opened to $g_r \approx 0.66$, $g_w \approx -0.79$ by the end of training, confirming that the workspace was actively contributing (the negative write gate means the workspace learned to subtract from the residual, not just add). The slot decay settled at $\gamma_s \approx 0.92$, providing the expected restoring force.
+\textbf{Important:} All results reported below for Cells B and C were obtained \emph{before} the causal masking fix (see \Cref{sec:workspace}). The workspace's cross-attention was bidirectional, allowing future-token leakage. These results are therefore invalid and are retained only for historical context. Retraining with the fix is in progress.
 
-The dramatic loss difference (0.93 vs 0.08) reflects the task mix: Cell A has no workspace and cannot do multi-hop chain reasoning (Task 1), so its loss is dominated by those failures. Cell B's workspace provides the memory structure to solve Task 1, driving its loss near zero. This is the B-vs-A signal: the workspace helps even without recurrence.
+\paragraph{Cells A and B: completed (results invalid for Cell B).}
+Cell A (backbone-only control, 10.08M parameters) early-stopped at step 7608 with a best loss of 0.931. Cell A has no workspace and is unaffected by the causal masking bug. Cell B (backbone + workspace, 10.53M parameters) early-stopped at step 9404 with a best loss of 0.083. \emph{Cell B's results are invalid}: the bidirectional workspace allowed answer tokens to leak into the prediction positions, so the low loss may reflect answer copying rather than genuine reasoning. Cell B is being retrained with the causal masking fix.
 
 \paragraph{Cell C: in progress.}
 Cell C (full architecture with attention residual core, 10.53M parameters) is training with $K_{\max}=6$ iterations. As of this writing, it is at step 400 of 10{,}000 with loss 1.10, descending steadily from the initial $\sim$4.80. Gradient norms are stable at 1.0--1.4 with no climbing pattern. The ReZero gates are opening ($g_r \approx 0.43$, $g_w \approx -0.25$). Cell C runs at $\sim$8.5\,s per step ($\sim$2$\times$ slower than A/B due to the $K=6$ recurrent core), for an estimated total of $\sim$24 hours.
@@ -583,6 +586,11 @@ Moonshot AI.
 Yutao~Sun, Li~Dong, Shaohan~Huang, Shuming~Ma, Yuqing~Xia, Jilong~Xue, Zhangyin~Feng, and Furu~Wei.
 \newblock Retentive network: A successor to transformer for large language models.
 \newblock \emph{arXiv preprint arXiv:2307.08621}, 2024. [Microsoft]
+
+\bibitem[Jaegle et~al.(2022)]{jaegle2022perceiverio}
+Andrew~Jaegle, Sebastian~Borgeaud, Jean-Baptiste~Alayrac, Carl~Doersch, Catalin~Ionescu, David~Ding, Skanda~Koppula, et~al.
+\newblock Perceiver IO: A general architecture for structured inputs \& outputs.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2022.
 
 \end{thebibliography}
 

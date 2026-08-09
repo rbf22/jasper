@@ -103,6 +103,20 @@ class RefWorkspaceV2(torch.nn.Module):
         inv_rms = torch.rsqrt(x_sq_mean + self.eps)
         return x * inv_rms * weight
 
+    def _build_causal_masks(self, T, m, device, dtype):
+        """Build causal masks for workspace cross-attention (Perceiver-IO style)."""
+        read_mask = torch.zeros(m, T, device=device, dtype=dtype)
+        for i in range(m):
+            cutoff = min((i + 1) * T // m, T)
+            read_mask[i, :cutoff] = 1.0
+
+        write_mask = torch.zeros(T, m, device=device, dtype=dtype)
+        for t in range(T):
+            cutoff = min((t + 1) * m // T + 1, m)
+            write_mask[t, :cutoff] = 1.0
+
+        return read_mask, write_mask
+
     def forward(self, x, slot_state=None):
         """x: (B, T, D), slot_state: (B, m, D) or None -> (x_out, slots_out)"""
         B, T, D = x.shape
@@ -113,6 +127,9 @@ class RefWorkspaceV2(torch.nn.Module):
             slots = self.slots.unsqueeze(0).expand(B, m, D).clone()
         else:
             slots = slot_state
+
+        # Build causal masks
+        read_mask, write_mask = self._build_causal_masks(T, m, x.device, x.dtype)
 
         # --- Read: slots attend over hidden states ---
         # TT: y = x @ W_tt, so we use matmul (not F.linear)
@@ -125,6 +142,8 @@ class RefWorkspaceV2(torch.nn.Module):
         rk_norm = self._l2_normalize(rk)
 
         read_scores = (rq_norm @ rk_norm.transpose(-2, -1)) * self.read_qk_scale  # (B, H, m, T)
+        # Apply causal mask
+        read_scores = read_scores.masked_fill(read_mask == 0, float('-inf'))
         read_attn = torch.softmax(read_scores, dim=-1)
         read_out_4d = read_attn @ rv                                # (B, H, m, d_h)
         read_out = self._reshape_from_heads(read_out_4d, B, m)     # (B, m, D)
@@ -145,6 +164,8 @@ class RefWorkspaceV2(torch.nn.Module):
         wk_norm = self._l2_normalize(wk)
 
         write_scores = (wq_norm @ wk_norm.transpose(-2, -1)) * self.write_qk_scale  # (B, H, T, m)
+        # Apply causal mask
+        write_scores = write_scores.masked_fill(write_mask == 0, float('-inf'))
         write_attn = torch.softmax(write_scores, dim=-1)
         write_out_4d = write_attn @ wv                             # (B, H, T, d_h)
         write_out = self._reshape_from_heads(write_out_4d, B, T)  # (B, T, D)
@@ -213,6 +234,9 @@ def manual_workspace_v2_backward(grad_x_out, grad_slots_out, ws, x, slot_state=N
     H, d_h, m = ws.H, ws.d_h, ws.m
     eps = ws.eps
 
+    # Build causal masks (must match forward exactly)
+    read_mask, write_mask = ws._build_causal_masks(T, m, x.device, x.dtype)
+
     # === Recompute forward (cache values needed for backward) ===
     if slot_state is None:
         slots_in = ws.slots.unsqueeze(0).expand(B, m, D).clone()
@@ -227,6 +251,8 @@ def manual_workspace_v2_backward(grad_x_out, grad_slots_out, ws, x, slot_state=N
     rk_norm = ws._l2_normalize(rk)
     read_scores_pre = rq_norm @ rk_norm.transpose(-2, -1)  # before scale
     read_scores = read_scores_pre * ws.read_qk_scale
+    # Apply causal mask
+    read_scores = read_scores.masked_fill(read_mask == 0, float('-inf'))
     read_attn = torch.softmax(read_scores, dim=-1)
     read_out_4d = read_attn @ rv
     read_out = ws._reshape_from_heads(read_out_4d, B, m)
@@ -244,6 +270,8 @@ def manual_workspace_v2_backward(grad_x_out, grad_slots_out, ws, x, slot_state=N
     wk_norm = ws._l2_normalize(wk)
     write_scores_pre = wq_norm @ wk_norm.transpose(-2, -1)
     write_scores = write_scores_pre * ws.write_qk_scale
+    # Apply causal mask
+    write_scores = write_scores.masked_fill(write_mask == 0, float('-inf'))
     write_attn = torch.softmax(write_scores, dim=-1)
     write_out_4d = write_attn @ wv
     write_out = ws._reshape_from_heads(write_out_4d, B, T)
@@ -272,6 +300,8 @@ def manual_workspace_v2_backward(grad_x_out, grad_slots_out, ws, x, slot_state=N
 
     # --- write_attn = softmax(write_scores * write_qk_scale) ---
     grad_write_scores = manual_softmax_backward(grad_write_attn, write_attn, dim=-1)
+    # Zero out gradients at causally masked positions
+    grad_write_scores = grad_write_scores * write_mask
     grad_write_scores = grad_write_scores * ws.write_qk_scale
 
     # grad_write_qk_scale = sum(grad_attn * scores_pre)
@@ -392,6 +422,9 @@ def manual_workspace_v2_backward(grad_x_out, grad_slots_out, ws, x, slot_state=N
     # --- read_attn = softmax(read_scores * read_qk_scale) ---
     grad_read_scores = manual_softmax_backward(grad_read_attn, read_attn, dim=-1)
     grad_read_scores_for_qk = manual_softmax_backward(grad_read_attn, read_attn, dim=-1)
+    # Zero out gradients at causally masked positions
+    grad_read_scores = grad_read_scores * read_mask
+    grad_read_scores_for_qk = grad_read_scores_for_qk * read_mask
     grad_read_scores = grad_read_scores * ws.read_qk_scale
     grad_read_qk_scale = (grad_read_scores_for_qk * read_scores_pre).sum()
 

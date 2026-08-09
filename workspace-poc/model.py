@@ -294,6 +294,9 @@ class WorkspaceModule(nn.Module):
       1. Slots read from hidden states (slots attend over sequence)
       2. Hidden states write back from slots (sequence attends over slots)
 
+    Both passes use causal masking (Perceiver-IO style) to prevent future-token
+    leakage in autoregressive settings.
+
     This is the 'engineered J-space' — a compact, persistent scratchpad.
     """
 
@@ -372,6 +375,29 @@ class WorkspaceModule(nn.Module):
                 scale = min(1.0, bound / sigma.item())
                 module.weight.data.mul_(scale)
 
+    def _build_causal_masks(self, T: int, m: int, device, dtype):
+        """Build causal masks for workspace cross-attention (Perceiver-IO style).
+
+        Read pass: slot i attends to positions [0, (i+1)*T//m - 1].
+        Write pass: position t attends to slots [0, (t+1)*m//T].
+
+        This prevents future tokens (including the answer) from leaking into
+        earlier positions through the workspace's bidirectional cross-attention.
+        """
+        # Read mask: (m, T)
+        read_mask = torch.zeros(m, T, device=device, dtype=dtype)
+        for i in range(m):
+            cutoff = min((i + 1) * T // m, T)
+            read_mask[i, :cutoff] = 1.0
+
+        # Write mask: (T, m)
+        write_mask = torch.zeros(T, m, device=device, dtype=dtype)
+        for t in range(T):
+            cutoff = min((t + 1) * m // T + 1, m)
+            write_mask[t, :cutoff] = 1.0
+
+        return read_mask, write_mask
+
     def forward(self, x: torch.Tensor, slot_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: (B, T, D) — hidden states
@@ -386,12 +412,17 @@ class WorkspaceModule(nn.Module):
         else:
             slots = slot_state
 
+        # Build causal masks for cross-attention
+        read_mask, write_mask = self._build_causal_masks(T, self.n_slots, x.device, x.dtype)
+
         # --- Read: slots attend over hidden states ---
         rq = self.read_q(slots).view(B, self.n_slots, self.n_heads, self.d_head).transpose(1, 2)
         rk = self.read_k(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         rv = self.read_v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
         read_attn = torch.matmul(rq, rk.transpose(-2, -1)) * self.scale  # (B, n_heads, m, T)
+        # Apply causal mask: set masked positions to -inf before softmax
+        read_attn = read_attn.masked_fill(read_mask == 0, float('-inf'))
         read_attn = F.softmax(read_attn, dim=-1)
         read_out = torch.matmul(read_attn, rv)  # (B, n_heads, m, d_head)
         read_out = read_out.transpose(1, 2).contiguous().view(B, self.n_slots, D)
@@ -403,6 +434,8 @@ class WorkspaceModule(nn.Module):
         wv = self.write_v(slots).view(B, self.n_slots, self.n_heads, self.d_head).transpose(1, 2)
 
         write_attn = torch.matmul(wq, wk.transpose(-2, -1)) * self.scale  # (B, n_heads, T, m)
+        # Apply causal mask: set masked positions to -inf before softmax
+        write_attn = write_attn.masked_fill(write_mask == 0, float('-inf'))
         write_attn = F.softmax(write_attn, dim=-1)
         write_out = torch.matmul(write_attn, wv)  # (B, n_heads, T, d_head)
         write_out = write_out.transpose(1, 2).contiguous().view(B, T, D)
