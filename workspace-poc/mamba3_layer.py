@@ -1255,6 +1255,24 @@ class TTMamba3Layer:
         _t7 = _t("fwd_diag_corr")
         # Computes: qkv_diag = gamma * (Q @ K^T) @ V for each (B,T,H)
         # Fused into a single generic_op call — 32-45x faster than ttnn ops.
+        #
+        # NOTE on gamma vs. shifted_gamma (don't "fix" this to match
+        # mamba3_reference.py's variable name without re-deriving the math —
+        # they're equivalent, not a mismatch):
+        # mamba3_reference.py computes attention INCLUSIVE of the diagonal
+        # (s <= t) with K scaled by `factor = gamma + shifted_gamma`, so the
+        # diagonal term it picks up is `factor_t * Q_t.K_t`, then it
+        # subtracts a `shifted_gamma_t * Q_t.K_t` correction to net out to
+        # the true diagonal contribution `gamma_t * Q_t.K_t`.
+        # This tt-nn implementation instead computes `out_attn` STRICTLY
+        # causal (s < t only, diagonal zeroed — see `_full_tt_attention`'s
+        # "strict causal mask"), so the diagonal contributes 0 from the
+        # attention matmul, and this correction ADDS the true diagonal term
+        # `gamma_t * Q_t.K_t` directly. Both paths land on the same net
+        # result (`gamma_t * Q_t.K_t` at the diagonal); verified numerically
+        # to agree to float64 precision. Using `shifted_gamma` here instead
+        # would double-subtract/omit the diagonal term and be wrong for
+        # *this* (strictly-causal) decomposition.
         V_proj_thrp = ttnn.permute(V_proj, [0, 1, 3, 2, 4])  # (B,T,H,R,P)
 
         qkv_diag = self._fused_diag_corr_forward(

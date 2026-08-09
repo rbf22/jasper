@@ -112,7 +112,7 @@ class RefWorkspaceV2(torch.nn.Module):
 
         write_mask = torch.zeros(T, m, device=device, dtype=dtype)
         for t in range(T):
-            cutoff = min((t + 1) * m // T + 1, m)
+            cutoff = max(min((t + 1) * m // T, m), 1)
             write_mask[t, :cutoff] = 1.0
 
         return read_mask, write_mask

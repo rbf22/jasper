@@ -379,10 +379,15 @@ class WorkspaceModule(nn.Module):
         """Build causal masks for workspace cross-attention (Perceiver-IO style).
 
         Read pass: slot i attends to positions [0, (i+1)*T//m - 1].
-        Write pass: position t attends to slots [0, (t+1)*m//T].
+        Write pass: position t attends to slots [0, (t+1)*m//T - 1], clamped to
+        at least slot 0 so no row is fully masked.
 
         This prevents future tokens (including the answer) from leaking into
         earlier positions through the workspace's bidirectional cross-attention.
+        Note: for the first chunk (t < ceil(T/m) - 1), slot 0 hasn't finished
+        reading yet, so those positions unavoidably see a slot whose receptive
+        field extends slightly past t (bounded by one chunk width) — the
+        alternative is an all-masked row, which would NaN the softmax.
         """
         # Read mask: (m, T)
         read_mask = torch.zeros(m, T, device=device, dtype=dtype)
@@ -393,7 +398,7 @@ class WorkspaceModule(nn.Module):
         # Write mask: (T, m)
         write_mask = torch.zeros(T, m, device=device, dtype=dtype)
         for t in range(T):
-            cutoff = min((t + 1) * m // T + 1, m)
+            cutoff = max(min((t + 1) * m // T, m), 1)
             write_mask[t, :cutoff] = 1.0
 
         return read_mask, write_mask

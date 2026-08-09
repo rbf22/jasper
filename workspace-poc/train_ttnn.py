@@ -198,9 +198,15 @@ class TTAdamW:
         self.step_count = 0
 
         # Per-parameter LR groups: prefix -> multiplier
-        # Matching: if the key starts with "prefix:" it matches name.startswith(key)
-        #           if the key starts with "suffix:" it matches name.endswith(key[7:])
-        #           otherwise it matches name.startswith(key) (backward compat)
+        # Matching: if the key starts with "suffix:" it matches name.endswith(key[7:]);
+        #           otherwise it matches name.startswith(key). There is no "prefix:"
+        #           form — bare keys already mean prefix match.
+        # NOTE: group keys are checked in dict iteration order (= config file
+        # order, insertion order in Python 3.7+) and the FIRST match wins
+        # (`break`). If a param name matches multiple keys (e.g. both a
+        # specific "ws_read_gate" entry and a catch-all "ws_" prefix), put
+        # the more specific key earlier in the config's lr_groups/wd_groups
+        # mapping, or it'll silently get the catch-all's multiplier instead.
         self.lr_groups = lr_groups or {}
         self.param_lr_mult = {}  # name -> multiplier (resolved at init)
         # Per-parameter weight decay groups: same matching as lr_groups
@@ -298,6 +304,19 @@ class TTAdamW:
             update = ttnn.div(m_hat, ttnn.add(ttnn.sqrt(v_hat), eps))
             param = ttnn.sub(param, ttnn.mul(update, lr))
             # weight decay
+            # NOTE: unless a config sets `wd_groups` to override it, `wd` here
+            # is the single global `weight_decay` applied to EVERY parameter,
+            # including 1D norm weights, ReZero gates (read_gate/write_gate/
+            # backbone gate, all init 0 and meant to grow via gradient
+            # descent), and slot_decay/gamma. This differs from the common
+            # transformer convention of excluding norms/biases/scalars from
+            # weight decay. It hasn't been identified as a bug (current
+            # experiments were run this way and gates do grow in practice —
+            # see gz_gr/gz_gw in training logs), but if gates seem to
+            # struggle to grow or plateau near 0, weight decay pulling them
+            # back is a place to check first. Use `wd_groups` in the config
+            # (e.g. `wd_groups: {"suffix:_gate": 0.0}`) to exclude specific
+            # params instead of changing this default.
             param = ttnn.mul(param, 1.0 - lr * wd)
 
             # Store updated optimizer state (fp32)
@@ -797,6 +816,15 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     # Data
     vocab = Vocab()
     rng = random.Random(seed)
+    # KNOWN LIMITATION: checkpoints do not save/restore `rng`'s state (see
+    # save_checkpoint/load_checkpoint in model_ttnn.py), so resuming from a
+    # checkpoint re-seeds `rng` from scratch rather than continuing its
+    # sequence. This means the exact data batches and recurrent-core K
+    # values sampled after a resume will NOT match an uninterrupted run,
+    # even though both use the same `seed`. Not a correctness bug (training
+    # is still valid), just not bit-for-bit reproducible across a
+    # stop/resume boundary. Fixing this would mean threading `rng.getstate()`
+    # through save_checkpoint/load_checkpoint's optimizer_state dict.
 
     # Checkpoint directory
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -875,9 +903,13 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 )
 
             # Forward — sample K for recurrent core (Cell C)
+            # Uses the seeded `rng` (not the global `random` module, which is
+            # never seeded here) so that --seed actually makes the K schedule
+            # reproducible across runs/resumes, consistent with sample_batch()
+            # above.
             k_value = None
             if model_config.recurrent_core:
-                k_value = random.randint(1, model_config.k_train_max)
+                k_value = rng.randint(1, model_config.k_train_max)
 
             if profile:
                 with profiler.time_section("forward"):

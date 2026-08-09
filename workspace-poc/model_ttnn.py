@@ -1038,8 +1038,12 @@ class TTAttentionLayer:
         grad_scores = ttnn.where(mask_causal, grad_scores, zeros_4d)
 
         # --- Backward through scores = QK^T * scale ---
+        # Chain rule: d(L)/d(QK^T) = d(L)/d(scores) * scale (this multiplies
+        # BY scale, it does not "undo" it — scale has no learnable params
+        # here so there's no separate grad_scale term to compute, unlike the
+        # workspace's learnable qk_scale in TTWorkspaceModule).
         scale_tt = c["scale_tt"]
-        grad_scores = ttnn.mul(grad_scores, scale_tt)  # undo scale
+        grad_scores = ttnn.mul(grad_scores, scale_tt)
 
         # grad_q_rope = grad_scores @ k_rope — (B, H, T, d_head)
         k_rope = c["k_rope"]
@@ -2284,10 +2288,15 @@ class TTWorkspaceModule:
            reading future tokens (including the answer).
 
         2. Write pass: sequence positions (T) attend over slots (m).
-           Position t can only attend to slots [0, (t+1)*m//T].
+           Position t can only attend to slots [0, (t+1)*m//T - 1], clamped to
+           at least slot 0 so no row is fully masked.
            This ensures position t only reads from slots whose receptive field
            includes positions <= t, preventing future information from flowing
-           back into earlier positions through the workspace.
+           back into earlier positions through the workspace. (For the first
+           chunk, t < ceil(T/m) - 1, slot 0 hasn't finished reading yet, so
+           those positions unavoidably see a slot whose receptive field
+           extends slightly past t, bounded by one chunk width — the
+           alternative is an all-masked row, which would NaN the softmax.)
 
         Returns:
             read_mask: (m, T) — 1.0 where attention is allowed, 0.0 where masked
@@ -2299,10 +2308,10 @@ class TTWorkspaceModule:
             cutoff = min((i + 1) * T // m, T)
             read_mask_host[i, :cutoff] = 1.0
 
-        # Write mask: position t -> slots [0, (t+1)*m//T]
+        # Write mask: position t -> slots [0, (t+1)*m//T - 1] (clamped to >= 1 slot)
         write_mask_host = torch.zeros(T, m, dtype=torch.bfloat16)
         for t in range(T):
-            cutoff = min((t + 1) * m // T + 1, m)
+            cutoff = max(min((t + 1) * m // T, m), 1)
             write_mask_host[t, :cutoff] = 1.0
 
         read_mask = ttnn.from_torch(read_mask_host, dtype=ttnn.bfloat16,
@@ -2503,12 +2512,20 @@ class TTWorkspaceModule:
                                   layout=ttnn.TILE_LAYOUT, device=device)
         grad_write_scores = ttnn.where(write_mask, grad_write_scores, zeros_write)
 
-        # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling
+        # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling.
+        # IMPORTANT: order matters here. grad_write_scores below is still
+        # d(L)/d(scores) (pre-qk_scale) at this point; the next line
+        # overwrites it in place with d(L)/d(scores_pre) = d(L)/d(scores) *
+        # qk_scale, so grad_qk_scale MUST be computed first or it silently
+        # uses the wrong (already-scaled) gradient.
         wq = c["wq"]
         wk = c["wk"]
         wq_norm = self._l2_normalize_heads(wq, B, H, T)
         wk_norm = self._l2_normalize_heads(wk, B, H, m)
         write_scores_pre = ttnn.matmul(wq_norm, ttnn.transpose(wk_norm, -2, -1))
+        # write_qk_scale is a scalar param: ttnn.sum with no `dim` reduces
+        # over ALL dims (B,H,T,m) -> scalar, per ttnn.sum's documented
+        # default behavior (unlike torch.sum this is NOT a no-op/identity).
         grad_write_qk_scale = ttnn.sum(ttnn.mul(grad_write_scores, write_scores_pre))
 
         # Now scale: d(L)/d(scores_pre) = d(L)/d(scores) * qk_scale
@@ -2587,12 +2604,15 @@ class TTWorkspaceModule:
                                  layout=ttnn.TILE_LAYOUT, device=device)
         grad_read_scores = ttnn.where(read_mask, grad_read_scores, zeros_read)
 
-        # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling
+        # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE
+        # scaling (see the identical note in the write-pass backward above:
+        # order matters, grad_read_scores gets overwritten in-place below).
         rk = c["rk"]
         rq = c["rq"]
         rq_norm = self._l2_normalize_heads(rq, B, H, m)
         rk_norm = self._l2_normalize_heads(rk, B, H, T)
         read_scores_pre = ttnn.matmul(rq_norm, ttnn.transpose(rk_norm, -2, -1))
+        # ttnn.sum with no `dim` reduces over ALL dims -> scalar (read_qk_scale is a scalar param).
         grad_read_qk_scale = ttnn.sum(ttnn.mul(grad_read_scores, read_scores_pre))
 
         # Now scale: d(L)/d(scores_pre) = d(L)/d(scores) * qk_scale
@@ -2767,15 +2787,13 @@ class TTWorkspaceModule:
             setattr(self, name, W_normalized)
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
-        key_map = {
-            "slots": "slots", "read_q_weight": "read_q_weight", "read_k_weight": "read_k_weight",
-            "read_v_weight": "read_v_weight", "read_out_weight": "read_out_weight",
-            "write_q_weight": "write_q_weight", "write_k_weight": "write_k_weight",
-            "write_v_weight": "write_v_weight", "write_out_weight": "write_out_weight",
-            "ws_norm_weight": "norm", "ws_slot_norm_weight": "slot_norm",
-            "read_gate": "read_gate", "write_gate": "write_gate",
-            "slot_decay": "slot_decay",
-        }
+        # NOTE: params are matched to attributes generically via `hasattr` —
+        # there is no explicit name allowlist here, so this stays in sync
+        # with get_params() automatically as fields are added (e.g.
+        # read_qk_scale/write_qk_scale). Only "ws_norm_weight" and
+        # "ws_slot_norm_weight" need special-casing because they map to a
+        # nested RMSNorm submodule's `.weight` rather than a same-named
+        # attribute on self.
         for k, v in params.items():
             if k == "ws_norm_weight":
                 self.norm.weight = v
@@ -2843,22 +2861,24 @@ class AttentionResidual:
     def _mask_scores(self, scores_list, K_active, B, T):
         """Apply mask to scores: set inactive iteration scores to -1e4.
 
-        scores_list: list of (B, T) tensors, length k_max+1
+        scores_list: list of (B, T, 1) tensors, length k_max+1
         K_active: number of active iterations (scores 0..K_active are kept)
-        Returns: list of masked (B, T) scores
+        Returns: list of masked (B, T, 1) scores
         """
         device = self.device
         masked = []
-        neg_inf = ttnn.from_torch(
-            torch.tensor([-1e4], dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-        )
         for k, score in enumerate(scores_list):
             if k <= K_active:
                 masked.append(score)
             else:
-                # Replace with -1e4 so softmax gives ~0 weight
-                masked.append(ttnn.mul(ttnn.zeros_like(score), neg_inf))
+                # Replace with -1e4 so softmax gives ~0 weight.
+                # NOTE: this must be an actual -1e4 constant, not
+                # `zeros_like(score) * -1e4` (== 0, not -1e4) — that silent
+                # bug let masked/inactive iterations receive non-negligible
+                # softmax weight instead of being suppressed.
+                shape = [int(d) for d in score.shape]
+                masked.append(ttnn.full(shape, -1e4, dtype=ttnn.bfloat16,
+                                         layout=ttnn.TILE_LAYOUT, device=device))
         return masked
 
     def forward(self, x_outputs, K_active) -> "ttnn.Tensor":
