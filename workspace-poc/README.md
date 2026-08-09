@@ -17,16 +17,13 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | File | What it does |
 |------|-------------|
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
-| `model.py` | The full PyTorch model (`MambaWorkspaceModel`) with three cell configurations behind config flags. Contains the pure-PyTorch Mamba2 SSD layer, multi-head attention with RoPE, perceiver-style workspace module, and the recurrent core loop. (Deprecated — `model_ttnn.py` is the active Jasper implementation.) |
+| `model.py` | PyTorch reference model (`MambaWorkspaceModel`/`WorkspaceModule`) — no longer used for full training (`model_ttnn.py` is the active Jasper implementation), but kept as the CPU-side correctness reference for `test_ws_backward_cpu.py`. |
 | `model_ttnn.py` | Jasper model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes the TTWorkspaceModule (perceiver-style workspace with QK-Norm and ReZero gates), custom fused kernels for RoPE, scale+decay, and gate backward, and the retention layer. |
 | `mamba3_layer.py` | Fixed Mamba-3 layer (replaces Mamba-2's selective scan with decayed linear attention). Used unconditionally for all non-attention layers. |
 | `retention_reference.py` | PyTorch reference implementation of the retention layer (decayed linear attention + RoPE). Used for parity testing. |
-| `train.py` | Training loop (PyTorch) with fresh data every batch, 15-min checkpointing with auto-resume, wandb logging, cosine LR schedule, and CLI args for cell selection. (Deprecated — use `train_ttnn.py`.) |
 | `train_ttnn.py` | Tenstorrent-native training loop. Runs on Blackhole chips via `ttnn`, bfloat16-native computation. Used for the current Quietbox 2 experiments. |
 | `eval_ttnn.py` | Checkpoint evaluation script for Tenstorrent. Loads a `.pt` checkpoint, runs the model on generated eval examples, reports accuracy per task and per depth. Supports JSON output for automated tracking. |
 | `eval_loop.py` | Automated eval monitoring loop. Polls for new checkpoints every 5 minutes, runs `eval_ttnn.py` on each, saves JSON results, and detects plateaus (3 consecutive evals with <1% Task 1 improvement). |
-| `probe.py` | Analysis scripts for R2 (K sweep — test-time compute scaling), R3 (linear probes on workspace slots — decodability), and R4 (selective workspace ablation — J-space signature). |
-| `profile_retention.py` | Per-op profiler for the retention layer. Measures wall-clock time of each operation in forward and backward passes. |
 | `monitor_training.sh` | Background monitor script. Reports training status every 10 minutes to `logs/monitor.log`. |
 | `kernels/` | Custom tt-metal compute kernels: `rope4d_{reader,compute,writer}.cpp` (fused RoPE), `scale_decay_{reader,compute,writer}.cpp` (fused scale+decay), `gate_bwd_{reader,compute,writer}.cpp` (fused gate backward). |
 | `test_retention_parity.py` | Parity test: tt-nn forward + backward vs. PyTorch reference autograd. Run with `--tile-aligned` for tile-aligned shapes. |
@@ -40,11 +37,22 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | `run_all_cells_parallel.sh` | Launches all three cells in parallel on separate Blackhole chips (one cell per device). |
 | `tt_runner.py` | Sequential training runner for a single Blackhole chip. Supports `--cell`, `--status`, `--clean`, `--smoke` modes. |
 | `colab_notebook.ipynb` | Google Colab T4 notebook for running cells A and C (the go/no-go pair) on free GPU time. (Deprecated — project moved to TT.) |
-| `colab_runner.py` | Sequential training runner for Colab (single T4 GPU). (Deprecated — project moved to TT.) |
-| `vast_runner.py` | Parallel training runner for Vast.ai (dual GPU). (Deprecated — project moved to TT.) |
 | `requirements.txt` | Python dependencies. |
 | `checkpoints/` | Saved during training (gitignored). `cell_{X}_step{N}.pt` per cell per checkpoint interval. |
 | `logs/` | Training logs (`cell_{a,b,c}.log`) and monitor log (`monitor.log`). |
+
+**Removed (2026-08-09 cleanup):** `train.py`/`probe.py` (old PyTorch training + R2/R3/R4 analysis
+pipeline, superseded by `train_ttnn.py`/`eval_ttnn.py` — note the R2/R3/R4 workspace-slot-probing
+analysis currently has no `ttnn` equivalent, so that capability would need to be reimplemented
+against `model_ttnn.py` if needed again), `colab_runner.py`/`vast_runner.py` (deprecated GPU
+runners), `diagnose_explosion.py`/`diagnose_workspace.py`/`monitor_dynamics.py`/
+`profile_retention.py`/`profile_ttnn.py` (one-off debugging/profiling scripts for gradient
+instability issues that are now fixed and documented in `AGENTS.md`), and `loader.py` (an
+unrelated, misplaced Tenstorrent Forge model-loader file with no references in this project).
+Also removed: orphaned `run_A/`, `run_B/`, `run_C/` directories (symlinks pointing at the
+pre-rename `mamba-poc/` path, which no longer exists), a stray venv accidentally created inside
+this directory, and superseded checkpoints (`causal_fix_b/`, `causal_fix_c/`, and loose
+pre-retention-layer `cell_{A,B,C}_step*.pt` files).
 
 ---
 
@@ -370,18 +378,15 @@ divergences, identified and fixed on 2026-08-06.
 Two metrics replace the discarded entropy objective. Both exist because entropy and
 free-generation accuracy each conflated things we needed to tell apart.
 
-### 1. Attention input-dependence (`diagnose_workspace.py`)
+### 1. Attention input-dependence (formerly `diagnose_workspace.py`, removed 2026-08-09)
 
-Probes the model with N=16 distinct inputs of **identical token length** (so attention
-tensors align), then for each `(head, position)` holds the index fixed and measures how
+`diagnose_workspace.py` was a one-off debugging script for the gradient-instability
+investigation (2026-08-02) and has been removed now that those issues are fixed (see
+`AGENTS.md`). Its methodology is documented here in case it's needed again — it probed
+the model with N=16 distinct inputs of **identical token length** (so attention
+tensors align), then for each `(head, position)` held the index fixed and measured how
 far each input's attention distribution sits from the across-input mean, in **total
 variation distance** (`0.5 * L1`, range [0,1]).
-
-```bash
-python diagnose_workspace.py --config configs/cell_b_tt.yaml --device 0 \
-    --checkpoint run_B/checkpoints/cell_B_step500.pt --n-probe 16 \
-    --json-output diag.json
-```
 
 | Reading | Meaning |
 |---|---|
@@ -466,11 +471,6 @@ Prints parameter counts for all cells. Useful to verify they're roughly matched 
 
 ### 4. Train a cell
 
-**PyTorch (Mac / NVIDIA):**
-```bash
-python train.py --config configs/cell_c_tt.yaml
-```
-
 **Tenstorrent (Quietbox 2):**
 ```bash
 # The TT venv is at the repo root
@@ -519,32 +519,22 @@ python eval_ttnn.py --config configs/cell_b_tt.yaml --device 0 \
     --depths 2 4 6 8 --json-output run_B/eval_results/step_100.json
 ```
 
-### 6. Run analysis (R2, R3, R4)
+### 6. Run analysis (R2, R3, R4) — removed, needs reimplementation
 
-After training Cell C:
+`probe.py` (the R2/R3/R4 analysis tool) was removed on 2026-08-09 along with the old
+PyTorch (`train.py`) pipeline it depended on. It has no `ttnn`/`model_ttnn.py` equivalent
+yet. The analyses it used to run, documented here for reference if reimplementing against
+`model_ttnn.py`:
 
-```bash
-python probe.py --checkpoint checkpoints/cellC_latest.pt --config configs/cell_c_tt.yaml --all
-```
-
-Or run individual analyses:
-
-```bash
-# R2: K sweep — accuracy vs inference K (1, 2, 4, 6, 8, 12, 16) at each depth
-python probe.py --checkpoint checkpoints/cellC_latest.pt --config configs/cell_c_tt.yaml --r2
-
-# R3: Linear probes — can you decode intermediate variable values from workspace slots?
-python probe.py --checkpoint checkpoints/cellC_latest.pt --config configs/cell_c_tt.yaml --r3
-
-# R4: Selective ablation — replace workspace slots with mean, measure task-specific collapse
-python probe.py --checkpoint checkpoints/cellC_latest.pt --config configs/cell_c_tt.yaml --r4
-```
-
-**R2** sweeps K from 1 to 16 and reports accuracy per task and per depth. Success: accuracy on deep problems increases monotonically with K.
-
-**R3** trains linear probes (97-class classifier, mod 97) on workspace slot states to decode the queried variable's value. Reports probe accuracy at each K. Success: workspace probes substantially exceed residual-stream probes from Cell A, and decodability rises across loop iterations.
-
-**R4** computes the mean workspace slot state across training examples, then replaces live slots with this mean at inference. Reports accuracy drop per task. Success (J-space signature): Tasks 1–2 drop ≥30 points, Task 3 drops ≤5 points.
+- **R2** (K sweep): accuracy vs. inference K (1, 2, 4, 6, 8, 12, 16) at each depth. Success:
+  accuracy on deep problems increases monotonically with K.
+- **R3** (linear probes): trains linear probes (97-class classifier, mod 97) on workspace
+  slot states to decode the queried variable's value. Success: workspace probes
+  substantially exceed residual-stream probes from Cell A, and decodability rises across
+  loop iterations.
+- **R4** (selective ablation): computes the mean workspace slot state across training
+  examples, then replaces live slots with this mean at inference. Success (J-space
+  signature): Tasks 1–2 drop ≥30 points, Task 3 drops ≤5 points.
 
 ### 7. Google Colab (free GPU)
 
@@ -636,7 +626,10 @@ Cell C is ~2.7x slower due to the recurrent core looping K_max=6 times per step.
 
 ### Mac / NVIDIA / Colab (deprecated)
 
-The project has moved to Tenstorrent hardware. The PyTorch path (`train.py`, `model.py`) still works on Mac/NVIDIA but is no longer the primary training path. See [infra-setup-guide.md](../infra-setup-guide.md) for legacy platform setup.
+The project has moved to Tenstorrent hardware. The old PyTorch training path (`train.py`) was
+removed on 2026-08-09; `model.py` remains only as a CPU-side correctness reference for
+`test_ws_backward_cpu.py`, not a runnable training path. See
+[infra-setup-guide.md](../infra-setup-guide.md) for legacy platform notes.
 
 ---
 
