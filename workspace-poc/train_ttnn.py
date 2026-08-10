@@ -154,6 +154,7 @@ def build_model_config(cfg: dict) -> ModelConfig:
         slot_decay_init=cfg.get("slot_decay_init", 1.0),
         slot_permutation=cfg.get("slot_permutation", False),
         gate_schedule_steps=cfg.get("gate_schedule_steps", 0),
+        gate_clamp_bound=cfg.get("gate_clamp_bound", 0.0),
         short_conv=cfg.get("short_conv", False),
         short_conv_kernel=cfg.get("short_conv_kernel", 3),
         per_channel_decay=cfg.get("per_channel_decay", False),
@@ -1037,6 +1038,17 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                                 if hasattr(model.layers[i].layer, 'gamma')}
                 if _gamma_names:
                     optimizer.sync_master_from_model(model, names=_gamma_names)
+
+            # Clamp workspace ReZero gates to [-gate_clamp_bound, gate_clamp_bound].
+            # When gates grow large negative (causal masking makes the workspace's
+            # past-only contribution noise → model suppresses it), the pre-norm
+            # residual cancels, making RMS very small. RMSNorm backward divides
+            # by RMS, amplifying the gradient by 1/RMS → gradient explosion.
+            # No-op when gate_clamp_bound is 0.0 (default / backward compat).
+            model.clamp_workspace_gates()
+            if model_config.gate_clamp_bound > 0 and model.workspace is not None:
+                optimizer.sync_master_from_model(
+                    model, names={"ws_read_gate", "ws_write_gate"})
 
         t_step_end = time.time()
         step_time = t_step_end - t_step_start

@@ -17,7 +17,7 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | File | What it does |
 |------|-------------|
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
-| `model.py` | PyTorch reference model (`MambaWorkspaceModel`/`WorkspaceModule`) — no longer used for full training (`model_ttnn.py` is the active Jasper implementation), but kept as the CPU-side correctness reference for `test_ws_backward_cpu.py`. |
+| `model.py` | PyTorch reference model (`MambaWorkspaceModel`/`WorkspaceModule`) — no longer used for full training (`model_ttnn.py` is the active Jasper implementation), but kept as the CPU-side correctness reference for the workspace backward pass. |
 | `model_ttnn.py` | Jasper model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes the TTWorkspaceModule (perceiver-style workspace with QK-Norm and ReZero gates), custom fused kernels for RoPE, scale+decay, and gate backward, and the retention layer. |
 | `mamba3_layer.py` | Fixed Mamba-3 layer (replaces Mamba-2's selective scan with decayed linear attention). Used unconditionally for all non-attention layers. |
 | `retention_reference.py` | PyTorch reference implementation of the retention layer (decayed linear attention + RoPE). Used for parity testing. |
@@ -31,8 +31,11 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | `test_fused_rope_single.py` | Standalone test for the fused RoPE kernel (forward + backward). |
 | `test_scale_decay.py` | Standalone test for the fused scale+decay kernel. |
 | `test_gate_bwd.py` | Standalone test for the fused gate backward kernel. |
-| `test_ws_backward_cpu.py` | CPU gradient check for the workspace backward pass. Verifies all gradients (input, weights, slots, gates) against PyTorch autograd to within float32 precision. |
-| `test_ws_backward.py` | Device-side gradient check (earlier attempt, superseded by the CPU version). |
+| `test_ws_qknorm_gradcheck.py` | Float64 autograd gradcheck for the workspace cross-attention backward (including causal masks). All gradients match to <1e-13 relative error. |
+| `test_gate_clamp.py` | Unit test for the gate value clamping logic (verifies values outside [-0.3, 0.3] are clamped, values inside unchanged). |
+| `test_data.py` | Pytest tests for `data.py` synthetic task generators and verifiers (arithmetic, copy, reverse, sort). CPU-only, listed in `pytest.ini`. |
+| `test_text_data.py` | Pytest tests for `text_data.py` GPT-2 BPE tokenizer, TinyStories dataset loading, packed-stream label generation. CPU-only, listed in `pytest.ini`. |
+| `test_ws_backward.py` | Device-side gradient check (earlier attempt, superseded by `test_ws_qknorm_gradcheck.py`). |
 | `configs/cell_{a,b,c}_tt.yaml` | YAML configs for each model cell, including Tenstorrent-specific settings. Cell A is the no-workspace control; B adds workspace; C adds recurrent core. `cell_c_attn_residual.yaml` is the primary Cell C config (attention residual core). |
 | `run_all_cells_parallel.sh` | Launches all three cells in parallel on separate Blackhole chips (one cell per device). |
 | `tt_runner.py` | Sequential training runner for a single Blackhole chip. Supports `--cell`, `--status`, `--clean`, `--smoke` modes. |
@@ -458,9 +461,13 @@ source /home/ttuser/Documents/jasper/.tt-venv/bin/activate
 ### 2. Unit tests
 
 ```bash
+# CPU-only pytest tests (no ttnn device required):
+/home/rfenwick/Documents/jasper/.tt-venv/bin/pytest test_data.py test_text_data.py -v
+
+# Inline tests in data.py:
 python data.py
 ```
-Runs roundtrip tests on all three task generators and the vocabulary. Should print "All tests passed!"
+The pytest suite covers synthetic task generators (`test_data.py`) and the text data pipeline (`test_text_data.py`). `data.py` also has inline roundtrip tests that print "All tests passed!"
 
 ### 3. Parameter count check
 
@@ -575,6 +582,7 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `freeze_slot_decay` | true | Freeze slot_decay at init — prevents slot chain growth above 1.0 |
 | `gate_init` | 0.0 | ReZero gate init value (0.0 = true identity). No longer uses sigmoid. |
 | `slot_decay_init` | 1.0 | Initial value for slot decay scalar (1.0 = no decay) |
+| `gate_clamp_bound` | 0.0 | Clamp ReZero gates to [-bound, bound] after each optimizer step. 0.0 = no clamping. Set to 0.3 in all current configs as a safety net against RMSNorm cancellation. |
 | `attention_residual_core` | false | Use attention residual core (Kimi K3-style) instead of fixed blend for recurrent core |
 
 ### Training fields
@@ -627,8 +635,8 @@ Cell C is ~2.7x slower due to the recurrent core looping K_max=6 times per step.
 ### Mac / NVIDIA / Colab (deprecated)
 
 The project has moved to Tenstorrent hardware. The old PyTorch training path (`train.py`) was
-removed on 2026-08-09; `model.py` remains only as a CPU-side correctness reference for
-`test_ws_backward_cpu.py`, not a runnable training path. See
+removed on 2026-08-09; `model.py` remains only as a CPU-side correctness reference,
+not a runnable training path. See
 [infra-setup-guide.md](../infra-setup-guide.md) for legacy platform notes.
 
 ---
@@ -691,9 +699,14 @@ See AGENTS.md for full details on the text POC setup.
 
 7. **Backbone ReZero gate fix** (2026-08-06): The root cause of all Cell C divergences. Backbone layer gates were changed from sigmoid (sigmoid(0)=0.5, 4% margin) to ReZero (gate=0, 83% margin). Also added `freeze_slot_decay: true` to prevent slot chain growth.
 
+8. **Causal masking fix** (2026-08-08): The workspace's cross-attention was bidirectional, allowing future tokens (including answers) to leak into earlier positions. Applied Perceiver-IO style causal masks to both read and write passes. All previous workspace-containing results are invalid and must be retrained.
+
+9. **Gate clamping fix** (2026-08-09): After causal masking, Cell B diverged at step ~2384 due to ReZero gate overgrowth — the read gate grew to -0.43, causing RMSNorm cancellation and gradient explosion. Fix: clamp gates to [-0.3, 0.3] after each optimizer step (`gate_clamp_bound: 0.3`) and reduce gate LR from 10x to 3x (Cell B only). Also added `freeze_slot_decay: true` to Cell B (matching Cell C). The `gate_clamp_bound` safety net is set in all configs.
+
 ### What we're watching for
 
-- **Cell C stability past step 2650**: All previous runs diverged between step 750–2650. The current run (with backbone ReZero fix) must pass step 2650 to be considered stable. Early signs are positive (grad norm flat at step 200).
+- **Cell C stability**: Cell C has passed all known divergence thresholds (750, 900, 1000, 1050, 1550, 2650) and is at step 1950+ with stable loss and grad norm. The backbone ReZero fix + gate clamping safety net appear to have resolved the root causes.
+- **Cell B with gate clamping**: Cell B (with `gate_clamp_bound: 0.3`, reduced gate LR 3x, `freeze_slot_decay: true`) is at step 600+ with gates growing 3x slower than the diverged run and no spikes.
 - **Cell A vs Cell B**: The clean workspace comparison (same LR=2e-4, A has no workspace). If B beats A on Task 1, the workspace is doing real work.
 - **Cell C convergence**: The full architecture (workspace + recurrence) is ~2x slower per step. Will it converge within the training budget?
 - **Text POC convergence**: Does Jasper learn coherent language on TinyStories? If so, the workspace + recurrent core works on real text, not just synthetic tasks.

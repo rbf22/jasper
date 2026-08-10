@@ -1,0 +1,317 @@
+# Jasper Test Traceability Map
+# Code-as-Data (CaD) Framework — Bi-Directional Traceability
+#
+# Maps every test to the functions/modules it verifies, and every key
+# function to its tests. This prevents "ghost code" — untested functions
+# that serve no clear purpose — and makes coverage gaps immediately visible.
+#
+# Format: YAML (machine-readable, human-editable)
+# Update rule: When adding a test, add its traceability entry here.
+#              When adding a function, check if it needs test coverage.
+
+manifest_version: 1
+project: jasper
+
+# ---------------------------------------------------------------------------
+# Test -> Function mapping
+# ---------------------------------------------------------------------------
+
+tests:
+  # --- data.py tests (CPU-only, pytest) ---
+  - file: workspace-poc/test_data.py
+    framework: pytest
+    hardware: false
+    covers:
+      - function: data.py:Vocab.encode
+      - function: data.py:Vocab.decode
+      - function: data.py:gen_task1
+      - function: data.py:verify_task1
+      - function: data.py:eval_expr
+      - function: data.py:gen_task2
+      - function: data.py:verify_task2
+      - function: data.py:gen_task3
+      - function: data.py:verify_task3
+      - function: data.py:sample_batch
+      - function: data.py:generate_eval_set
+      - function: data.py:TASK_GENERATORS
+      - function: data.py:TASK_VERIFIERS
+      - function: data.py:TASK_MIX
+    test_count: 40
+
+  # --- text_data.py tests (CPU-only, pytest) ---
+  - file: workspace-mvp/test_text_data.py
+    framework: pytest
+    hardware: false
+    covers:
+      - function: text_data.py:BPETokenizer.encode
+      - function: text_data.py:BPETokenizer.decode
+      - function: text_data.py:TextDataset._tokenize_file
+      - function: text_data.py:TextDataset.__init__
+      - function: text_data.py:sample_text_batch
+      - function: text_data.py:make_eval_batches
+    test_count: 29
+
+  # --- Mamba-3 layer parity (requires TT device) ---
+  - file: workspace-poc/test_mamba3_parity.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: mamba3_layer.py:TTMamba3Layer.forward
+      - function: mamba3_layer.py:TTMamba3Layer.backward
+      - function: mamba3_layer.py:mamba3_reference.py (PyTorch ref)
+    stages:
+      - stage: 0
+        name: gradcheck
+        description: "float64 gradcheck of PyTorch reference + causality assertion"
+      - stage: 1
+        name: forward_parity
+        description: "tt-nn forward vs reference forward"
+      - stage: 2
+        name: backward_parity
+        description: "tt-nn backward vs reference autograd (per parameter)"
+
+  # --- Retention layer parity (requires TT device) ---
+  - file: workspace-poc/test_retention_parity.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: model_ttnn.py:TTRetentionLayer.forward
+      - function: model_ttnn.py:TTRetentionLayer.backward
+
+  # --- Workspace backward gradcheck (CPU-only, float64) ---
+  - file: workspace-poc/test_ws_qknorm_gradcheck.py
+    framework: standalone
+    hardware: false
+    covers:
+      - function: model_ttnn.py:TTWorkspaceModule.forward
+      - function: model_ttnn.py:TTWorkspaceModule.backward
+      - function: model_ttnn.py:TTWorkspaceModule._build_causal_masks
+
+  # --- Gate clamping (requires TT device) ---
+  - file: workspace-poc/test_gate_clamp.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: model_ttnn.py:TTMambaWorkspaceModel.clamp_workspace_gates
+      - function: model_ttnn.py:ModelConfig.gate_clamp_bound
+
+  # --- Fused RoPE kernel (requires TT device) ---
+  - file: workspace-poc/test_fused_rope.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: model_ttnn.py:TTRetentionLayer._fused_rope_4d
+
+  - file: workspace-poc/test_fused_rope_single.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: model_ttnn.py:TTRetentionLayer._fused_rope
+
+  # --- Fused gate backward (requires TT device) ---
+  - file: workspace-poc/test_gate_bwd.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: model_ttnn.py:TTRetentionLayer._fused_gate_backward
+
+  # --- Fused scale+decay (requires TT device) ---
+  - file: workspace-poc/test_scale_decay.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: model_ttnn.py:TTRetentionLayer._fused_scale_decay
+
+  # --- Scatter loss (requires TT device) ---
+  - file: workspace-mvp/test_scatter_loss.py
+    framework: standalone
+    hardware: true
+    covers:
+      - function: train_text.py:cross_entropy_loss_scatter
+      - function: train_text.py:cross_entropy_loss_host
+
+# ---------------------------------------------------------------------------
+# Function -> Test mapping (reverse index)
+# ---------------------------------------------------------------------------
+
+functions:
+  # --- data.py ---
+  - function: data.py:Vocab.encode
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:Vocab.decode
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:gen_task1
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:verify_task1
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:gen_task2
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:verify_task2
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:gen_task3
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:verify_task3
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:sample_batch
+    tested_by: [test_data.py]
+    coverage: full
+
+  - function: data.py:generate_eval_set
+    tested_by: [test_data.py]
+    coverage: full
+
+  # --- text_data.py ---
+  - function: text_data.py:BPETokenizer.encode
+    tested_by: [test_text_data.py]
+    coverage: full
+
+  - function: text_data.py:BPETokenizer.decode
+    tested_by: [test_text_data.py]
+    coverage: full
+
+  - function: text_data.py:TextDataset
+    tested_by: [test_text_data.py]
+    coverage: full
+
+  - function: text_data.py:sample_text_batch
+    tested_by: [test_text_data.py]
+    coverage: full
+
+  - function: text_data.py:make_eval_batches
+    tested_by: [test_text_data.py]
+    coverage: full
+
+  # --- model_ttnn.py ---
+  - function: model_ttnn.py:TTWorkspaceModule.forward
+    tested_by: [test_ws_qknorm_gradcheck.py]
+    coverage: full
+
+  - function: model_ttnn.py:TTWorkspaceModule.backward
+    tested_by: [test_ws_qknorm_gradcheck.py]
+    coverage: full
+
+  - function: model_ttnn.py:TTMambaWorkspaceModel.clamp_workspace_gates
+    tested_by: [test_gate_clamp.py]
+    coverage: full
+
+  - function: model_ttnn.py:TTRetentionLayer.forward
+    tested_by: [test_retention_parity.py]
+    coverage: full
+
+  - function: model_ttnn.py:TTRetentionLayer.backward
+    tested_by: [test_retention_parity.py]
+    coverage: full
+
+  # --- mamba3_layer.py ---
+  - function: mamba3_layer.py:TTMamba3Layer.forward
+    tested_by: [test_mamba3_parity.py]
+    coverage: full
+
+  - function: mamba3_layer.py:TTMamba3Layer.backward
+    tested_by: [test_mamba3_parity.py]
+    coverage: full
+
+  # --- UNTESTED functions (coverage gaps) ---
+  - function: train_ttnn.py:TTAdamW.step
+    tested_by: []
+    coverage: none
+    note: "Only smoke-tested via 3-step training runs"
+
+  - function: train_ttnn.py:clip_grad_norm
+    tested_by: []
+    coverage: none
+    note: "Only smoke-tested"
+
+  - function: train_ttnn.py:build_model_config
+    tested_by: []
+    coverage: none
+    note: "Config parsing untested"
+
+  - function: model_ttnn.py:TTMambaWorkspaceModel.forward
+    tested_by: []
+    coverage: smoke_only
+    note: "3-step smoke tests only, no integration test"
+
+  - function: model_ttnn.py:TTMambaWorkspaceModel.backward
+    tested_by: []
+    coverage: smoke_only
+    note: "3-step smoke tests only"
+
+  - function: model_ttnn.py:TTAttentionLayer.forward
+    tested_by: []
+    coverage: none
+    note: "No parity test for attention layer"
+
+  - function: model_ttnn.py:TTAttentionLayer.backward
+    tested_by: []
+    coverage: none
+    note: "No parity test for attention layer backward"
+
+  - function: eval_ttnn.py:evaluate
+    tested_by: []
+    coverage: none
+
+  - function: eval_text.py:evaluate
+    tested_by: []
+    coverage: none
+
+# ---------------------------------------------------------------------------
+# Semantic Decorator Reference
+# ---------------------------------------------------------------------------
+
+decorators:
+  - tag: "@Pure"
+    description: "Function has no side effects. Output depends only on inputs."
+    applicable_to: [function, method]
+
+  - tag: "@Idempotent"
+    description: "Calling the function multiple times with same args produces same result."
+    applicable_to: [function, method]
+
+  - tag: "@Mutates[state_name]"
+    description: "Function modifies the named state (e.g., @Mutates[model_params])."
+    applicable_to: [function, method]
+
+  - tag: "@Requires[precondition]"
+    description: "Function requires a precondition to be true (e.g., @Requires[device_initialized])."
+    applicable_to: [function, method]
+
+  - tag: "@Ensures[postcondition]"
+    description: "Function guarantees a postcondition (e.g., @Ensures[0 <= result < 97])."
+    applicable_to: [function, method]
+
+  - tag: "@Complexity[time, space]"
+    description: "Big-O time and space complexity (e.g., @Complexity[O(n^2), O(n)])."
+    applicable_to: [function, method]
+
+  - tag: "@Tested[test_file]"
+    description: "Function is tested by the named test file."
+    applicable_to: [function, method]
+
+  - tag: "@Untested"
+    description: "Function has no automated test coverage."
+    applicable_to: [function, method]
+
+  - tag: "@Hardware"
+    description: "Function requires Tenstorrent hardware to run."
+    applicable_to: [function, method]
+
+  - tag: "@CPU"
+    description: "Function runs on CPU only (no TT hardware needed)."
+    applicable_to: [function, method]

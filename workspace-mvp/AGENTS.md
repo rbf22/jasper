@@ -32,6 +32,7 @@ is only one copy of the model code.
 | `train_text.py` | Training loop — imports shared infrastructure from `workspace-poc/train_ttnn.py`, adds host-side loss for large vocab |
 | `eval_text.py` | Perplexity evaluation + autoregressive text generation |
 | `configs/text_cell_c.yaml` | Cell C AR config adapted for text (vocab=50257, seq_len=512, lr=1e-4) |
+| `test_text_data.py` | Pytest tests for `text_data.py` (tokenizer, dataset loading, packed-stream labels). CPU-only. |
 | `data/tinystories_train.txt` | 1.9GB, ~480M tokens (pre-tokenized cache at `.tokens.pt`) |
 | `data/tinystories_valid.txt` | 19MB, ~4.8M tokens |
 
@@ -55,6 +56,9 @@ Same Jasper architecture as `workspace-poc/` Cell C AR:
   chain growth
 - `chain_scale_safety: 1.0` — 1/K chain gradient scaling (83% margin with
   ReZero gates, no extra safety factor needed)
+- `gate_clamp_bound: 0.3` — ReZero gates clamped to [-0.3, 0.3] after each
+  optimizer step (safety net against RMSNorm cancellation; see
+  `workspace-poc/AGENTS.md` § "Gate clamping fix")
 - 10.5M architecture params + 19.3M embedding = **29.8M total**
 
 The model code is symlinked from `workspace-poc/`, so all architecture

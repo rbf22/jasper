@@ -48,6 +48,14 @@ ws_entropy_weight: 0.0
 ws_diversity_weight: 0.0
 gate_init: 0.0
 slot_decay_init: 1.0
+# Clamp ReZero gates to [-0.3, 0.3] after each optimizer step.
+# Cell C's gates are positive (read gate ~0.30 at step 1950), so the risk
+# of RMSNorm cancellation is lower than Cell B. But this is a free safety
+# net — positive gates are self-dampening (amplification makes RMS larger
+# → 1/RMS smaller → gradient smaller), so clamping at 0.3 won't constrain
+# normal learning. It only prevents a catastrophic regime shift if the
+# dynamics change unexpectedly.
+gate_clamp_bound: 0.3
 
 # Training
 lr: 2.0e-4

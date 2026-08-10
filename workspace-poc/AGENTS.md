@@ -155,6 +155,46 @@ after a killed/canceled process, reset with:
 ~/.tenstorrent-venv/bin/tt-smi -r
 ```
 
+## CPU-only pytest tests
+
+The repo has pytest test suites that run on CPU only (no `ttnn` device
+required). They are listed explicitly in `pytest.ini` to avoid accidentally
+collecting `ttnn`-dependent tests.
+
+```bash
+# From workspace-poc/:
+/home/rfenwick/Documents/jasper/.tt-venv/bin/pytest test_data.py test_text_data.py -v
+
+# From workspace-mvp/:
+/home/rfenwick/Documents/jasper/.tt-venv/bin/pytest test_text_data.py -v
+```
+
+| Test file | What it covers |
+|-----------|---------------|
+| `test_data.py` | Synthetic task generators and verifiers in `data.py` (arithmetic, copy, reverse, sort) |
+| `test_text_data.py` | GPT-2 BPE tokenizer wrapper, TinyStories dataset loading, packed-stream label generation in `text_data.py` |
+| `test_gate_clamp.py` | Gate value clamping logic (verifies values outside [-0.3, 0.3] are clamped, values inside unchanged) |
+| `test_ws_qknorm_gradcheck.py` | Float64 autograd gradcheck of workspace cross-attention backward (including causal masks) |
+
+The `ttnn`-dependent tests (`test_mamba3_parity.py`, `test_retention_parity.py`,
+`test_scale_decay.py`, `test_fused_rope_single.py`, `test_scatter_loss.py`)
+are **not** in `pytest.ini` — they require a Tenstorrent device and are run
+manually as described in their respective sections above.
+
+### Code-as-Data (CaD) framework
+
+Two YAML manifests provide structural documentation of the codebase:
+
+- `architecture.yaml` — Bounded contexts, data flow, dependencies,
+  architectural decisions, and stability constraints. A structural
+  manifest that complements this file.
+- `traceability.yaml` — Maps test functions to the production functions
+  they cover, documenting coverage gaps.
+
+Key functions in `data.py` and `text_data.py` have semantic docstring
+decorators (`@Pure`, `@Idempotent`, `@Deterministic`) indicating their
+contractual properties for testability and reasoning.
+
 ## Current training run (2026-08-04, AR core + chain scaling fix)
 
 ### Directory rename
@@ -525,6 +565,54 @@ Code changes in `model_ttnn.py`:
 
 Training restarted from scratch (step 0) — the step-2600 checkpoint has
 sigmoid-gate weights that don't transfer to ReZero.
+
+### Gate clamping fix (2026-08-09) — Cell B divergence with causal masking
+
+After the causal masking fix (2026-08-08), Cell B (workspace, no recurrent
+core) diverged at step ~2384. The root cause was **ReZero gate overgrowth**
+leading to RMSNorm cancellation.
+
+With causal masking, Cell B's read gate grows **negative** (the workspace's
+past-only contribution is noise for Cell B, which has no recurrent core to
+mediate it). At `read_gate ≈ -0.43`, the pre-norm residual
+`decay * slots + gate * read_out` cancels, making RMS very small. RMSNorm
+backward divides by RMS, amplifying the gradient by `1/RMS` → gradient
+explosion.
+
+Cell C does not have this problem because its attention residual core
+mediates gate gradients — the AR softmax bounds the gradient flowing back
+to the gates, preventing overgrowth. Cell C's gates are positive (~0.30 at
+step 1950) and self-dampening (amplification makes RMS larger → 1/RMS
+smaller → gradient smaller).
+
+**Fix** (two parts, both in `configs/cell_b_tt.yaml`):
+
+1. **Gate value clamping** (`gate_clamp_bound: 0.3`): After each optimizer
+   step, `read_gate` and `write_gate` are clamped to `[-0.3, 0.3]`. This
+   prevents the cancellation regime. Implemented in `train_ttnn.py` after
+   `optimizer.step()`. The clamp is a no-op for normal learning (gates
+   reach ~0.03-0.30 during training) — it only fires in the pathological
+   regime.
+
+2. **Reduced gate LR** (`lr_groups.ws_read_gate: 3.0`, `ws_write_gate: 3.0`):
+   Decreased from 10x to 3x base LR. Slows gate growth, giving the backbone
+   more time to adapt before the workspace's contribution becomes
+   significant.
+
+3. **`freeze_slot_decay: true`** (added to Cell B): Matches Cell C. Prevents
+   `slot_decay` from drifting and destabilizing the slot update. Cell B
+   previously allowed it to learn (drifted to 0.98), but the drift is an
+   unnecessary degree of freedom that adds risk without benefit.
+
+**Safety net for Cell C and text POC**: `gate_clamp_bound: 0.3` is also set
+in `cell_c_attn_residual.yaml` and `text_cell_c.yaml`. Cell C's gates are
+positive and self-dampening, so the clamp won't constrain normal learning —
+it only prevents a catastrophic regime shift if the dynamics change
+unexpectedly.
+
+Verified with `test_gate_clamp.py` — the clamp logic is tested in isolation
+(confirming values outside [-0.3, 0.3] are clamped, values inside are
+unchanged).
 
 ### Checkpoint backups from previous runs
 

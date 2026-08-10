@@ -1,0 +1,253 @@
+# Jasper Architecture Manifest
+# Code-as-Data (CaD) Framework — Structural Architecture Manifest
+#
+# This is the single source of truth for the system's high-level structure.
+# It maps bounded contexts, data flow topology, and dependency trees.
+# Both humans and AI agents can parse this to navigate the codebase without
+# scanning unrelated files.
+#
+# Format: YAML (machine-readable, human-editable)
+# Update rule: Any structural change (new module, changed dependency, new
+# data flow) MUST be reflected here before merging.
+
+manifest_version: 1
+project: jasper
+description: >
+  Workspace-augmented retention network with recurrent core. Combines
+  RetNet-style linear attention, Perceiver-style external memory (workspace),
+  depth-recurrent iteration, and attention residuals into a unified
+  architecture. Trained on Tenstorrent hardware (tt-nn).
+
+# ---------------------------------------------------------------------------
+# 1. Bounded Contexts
+# ---------------------------------------------------------------------------
+
+contexts:
+  - name: workspace-poc
+    description: Synthetic arithmetic training (3 tasks, char-level vocab)
+    entry_points:
+      - train_ttnn.py
+      - eval_ttnn.py
+    key_modules:
+      - model_ttnn.py      # TT-native model (forward + manual backward)
+      - mamba3_layer.py     # Retention layer (Mamba-3 MIMO)
+      - model.py            # PyTorch reference (for parity testing)
+      - data.py             # Synthetic task generators + verifiers
+      - train_ttnn.py       # Training loop, optimizer, grad clipping
+    hardware: tenstorrent/blackhole
+    language: python/3.12
+
+  - name: workspace-mvp
+    description: Text training (TinyStories, GPT-2 BPE, 50K vocab)
+    entry_points:
+      - train_text.py
+      - eval_text.py
+    key_modules:
+      - text_data.py        # BPE tokenizer, TinyStories dataset
+      - train_text.py       # Text training loop (imports from workspace-poc)
+      - eval_text.py         # Perplexity eval + generation
+    shared_modules:
+      - model_ttnn.py       # Symlinked from workspace-poc
+      - mamba3_layer.py      # Symlinked from workspace-poc
+      - train_ttnn.py        # Imported (optimizer, grad clip, etc.)
+    hardware: tenstorrent/blackhole
+    language: python/3.12
+
+# ---------------------------------------------------------------------------
+# 2. Data Flow Topography
+# ---------------------------------------------------------------------------
+
+data_flows:
+  - name: synthetic_training
+    context: workspace-poc
+    flow:
+      - source: data.py:sample_batch
+        produces: "(input_ids, labels, task_ids) — torch.Tensor on host"
+      - step: model_ttnn.py:TTMambaWorkspaceModel.forward
+        transforms: "input_ids -> logits (B, T, vocab_size) on device"
+      - step: train_ttnn.py:cross_entropy_loss
+        transforms: "logits + labels -> scalar loss on device"
+      - step: model_ttnn.py:TTMambaWorkspaceModel.backward
+        transforms: "grad_loss -> per-parameter gradients on device"
+      - step: train_ttnn.py:clip_grad_norm
+        transforms: "gradients -> clipped gradients + grad_norm scalar"
+      - step: train_ttnn.py:TTAdamW.step
+        mutates: "model parameters (fp32 master + bf16 model copy)"
+      - step: model_ttnn.py:normalize_workspace_slots
+        mutates: "workspace slot parameters (RMS normalization)"
+      - step: model_ttnn.py:clamp_workspace_gates
+        mutates: "workspace ReZero gates (clamped to [-bound, bound])"
+      - step: model_ttnn.py:spectral_normalize_backbone_weights
+        mutates: "backbone qkv/out_proj weights (spectral norm capped)"
+
+  - name: text_training
+    context: workspace-mvp
+    flow:
+      - source: text_data.py:sample_text_batch
+        produces: "(input_ids, labels, task_ids) — torch.Tensor on host"
+      - step: model_ttnn.py:TTMambaWorkspaceModel.forward
+        transforms: "input_ids -> logits (B, T, 50257) on device"
+      - step: train_text.py:cross_entropy_loss_host
+        transforms: "logits + labels -> scalar loss on host (float32)"
+      - step: model_ttnn.py:TTMambaWorkspaceModel.backward
+        transforms: "grad_loss -> per-parameter gradients on device"
+      - step: train_ttnn.py:clip_grad_norm
+        transforms: "gradients -> clipped gradients"
+      - step: train_ttnn.py:TTAdamW.step
+        mutates: "model parameters"
+
+  - name: evaluation
+    context: workspace-poc
+    flow:
+      - source: data.py:generate_eval_set
+        produces: "fixed eval examples with known answers"
+      - step: model_ttnn.py:TTMambaWorkspaceModel.forward
+        transforms: "input_ids -> logits"
+      - step: eval_ttnn.py:evaluate
+        transforms: "logits -> predictions -> accuracy via data.py verifiers"
+
+# ---------------------------------------------------------------------------
+# 3. System Dependency Trees
+# ---------------------------------------------------------------------------
+
+dependencies:
+  internal:
+    - module: model_ttnn.py
+      depends_on:
+        - mamba3_layer.py     # TTMamba3Layer for retention layers
+        - kernels/             # Custom TT kernels (RoPE, scale_decay, gate_bwd)
+      depended_by:
+        - train_ttnn.py
+        - train_text.py
+        - eval_ttnn.py
+        - eval_text.py
+
+    - module: mamba3_layer.py
+      depends_on:
+        - kernels/             # diag_corr kernel
+      depended_by:
+        - model_ttnn.py
+
+    - module: train_ttnn.py
+      depends_on:
+        - model_ttnn.py
+        - data.py
+      depended_by:
+        - train_text.py        # imports build_model_config, TTAdamW, clip_grad_norm
+
+    - module: data.py
+      depends_on: []
+      depended_by:
+        - train_ttnn.py
+        - eval_ttnn.py
+
+    - module: text_data.py
+      depends_on:
+        - tiktoken             # GPT-2 BPE tokenizer
+      depended_by:
+        - train_text.py
+        - eval_text.py
+
+  external:
+    - package: torch
+      version: ">=2.0"
+      purpose: "Tensor ops, PyTorch reference model"
+    - package: ttnn
+      version: "tenstorrent-native"
+      purpose: "TT device ops, manual backward"
+    - package: tiktoken
+      version: "latest"
+      purpose: "GPT-2 BPE tokenization (text POC only)"
+    - package: pyyaml
+      version: "latest"
+      purpose: "Config file loading"
+
+# ---------------------------------------------------------------------------
+# 4. Key Architectural Decisions
+# ---------------------------------------------------------------------------
+
+decisions:
+  - id: ADR-001
+    title: "Manual backward pass instead of autograd"
+    rationale: >
+      tt-nn does not support autograd. All backward passes are manually
+      implemented using tt-nn ops. Parity is verified against PyTorch
+      autograd in test_mamba3_parity.py and test_ws_qknorm_gradcheck.py.
+    affects: [model_ttnn.py, mamba3_layer.py]
+
+  - id: ADR-002
+    title: "ReZero gates instead of sigmoid gates"
+    rationale: >
+      Sigmoid gates saturate and have vanishing gradients. ReZero gates
+      (scalar, init=0, no sigmoid) start as identity and grow linearly.
+      Bachlechner et al., 2020.
+    affects: [model_ttnn.py, configs/*.yaml]
+
+  - id: ADR-003
+    title: "QK Normalization on workspace cross-attention"
+    rationale: >
+      L2-normalize Q and K along d_head before attention scores. Bounds
+      logits regardless of weight magnitudes, preventing entropy collapse.
+      Henry et al., 2020 (standard in OLMo 2, Gemma 3, Qwen 3).
+    affects: [model_ttnn.py]
+
+  - id: ADR-004
+    title: "Causal masking on workspace cross-attention"
+    rationale: >
+      Perceiver-IO style causal masks on read/write passes to prevent
+      future-token leakage in autoregressive settings. Without this, the
+      model learns to copy the answer from future positions.
+    affects: [model_ttnn.py, model.py]
+
+  - id: ADR-005
+    title: "Attention Residual Core (Kimi K3 style)"
+    rationale: >
+      Replaces fixed 1/sqrt(K) blend with learned softmax attention over
+      iteration outputs. Bounds output magnitude and gives consistent
+      gradient magnitude across K iterations.
+    affects: [model_ttnn.py, configs/cell_c_attn_residual.yaml]
+
+  - id: ADR-006
+    title: "Gate clamping to prevent RMSNorm cancellation"
+    rationale: >
+      ReZero gates are unbounded. With causal masking, the workspace's
+      past-only contribution is noise for Cell B (no recurrent core),
+      so the model suppresses it → gates grow negative → pre-norm residual
+      cancels → RMSNorm backward amplifies gradient by 1/RMS → explosion.
+      Clamping to [-0.3, 0.3] prevents this.
+    affects: [model_ttnn.py, train_ttnn.py, configs/cell_b_tt.yaml]
+
+# ---------------------------------------------------------------------------
+# 5. Stability Constraints (mathematical invariants)
+# ---------------------------------------------------------------------------
+
+invariants:
+  - id: INV-001
+    description: "Retention gamma <= 0.98 (log_gamma <= -0.02)"
+    enforced_by: "train_ttnn.py: clamp_retention_gammas after optimizer step"
+    rationale: "gamma > 1.0 makes decay matrix exponentially growing"
+
+  - id: INV-002
+    description: "Workspace slot RMS = 1.0"
+    enforced_by: "model_ttnn.py: normalize_slots after optimizer step"
+    rationale: "Prevents unbounded slot growth → attention sharpening"
+
+  - id: INV-003
+    description: "Backbone qkv/out_proj spectral norm <= 2.0"
+    enforced_by: "model_ttnn.py: spectral_normalize_backbone_weights after optimizer step"
+    rationale: "Caps Lipschitz constant, breaks workspace feedback loop"
+
+  - id: INV-004
+    description: "Workspace ReZero gates in [-gate_clamp_bound, gate_clamp_bound]"
+    enforced_by: "model_ttnn.py: clamp_workspace_gates after optimizer step"
+    rationale: "Prevents RMSNorm cancellation when gates grow large negative"
+
+  - id: INV-005
+    description: "slot_decay frozen at 1.0 (Cell C only)"
+    enforced_by: "model_ttnn.py: get_params skips slot_decay when freeze_slot_decay=true"
+    rationale: "slot_decay > 1.0 causes slot chain self-amplification"
+
+  - id: INV-006
+    description: "Gradient norm < 5000 (skip-on-spike)"
+    enforced_by: "train_ttnn.py: skip optimizer step when grad_norm > threshold"
+    rationale: "Prevents explosion from corrupting model parameters"

@@ -65,6 +65,7 @@ class ModelConfig:
     slot_decay_init: float = 1.0        # slot decay factor init (1.0 = no decay, <1.0 = forgetful)
     slot_permutation: bool = False      # randomly permute slot indices each forward pass (breaks fixed routing)
     gate_schedule_steps: int = 0        # >0: anneal gates from gate_init to 0 over this many steps (no-op with ReZero)
+    gate_clamp_bound: float = 0.0       # >0: clamp ReZero gates to [-bound, bound] after each optimizer step. Prevents RMSNorm cancellation when gates grow large negative (causal masking makes workspace contribution noise → model suppresses it → gate grows negative → pre-norm residual cancels → 1/RMS amplifies gradient). 0.0 = disabled (backward compat).
     # --- Mamba-3 MIMO config ---
     headdim: int = 64                   # SSM head dimension (d_inner // headdim = nheads)
     d_state_m3: int = 64                # SSM state size for Mamba-3 (can differ from d_state)
@@ -4013,6 +4014,36 @@ class TTMambaWorkspaceModel:
                     inner.gamma = ttnn.from_torch(
                         clamped, dtype=ttnn.float32,
                         layout=ttnn.TILE_LAYOUT, device=inner.gamma.device())
+
+    def clamp_workspace_gates(self):
+        """Clamp ReZero gates to [-gate_clamp_bound, gate_clamp_bound] after each optimizer step.
+
+        ReZero gates are unbounded scalars (no sigmoid). When the read gate
+        grows large negative — which happens with causal masking because the
+        workspace's past-only contribution is noise that the model learns to
+        suppress — the pre-norm residual `decay * slots + gate * read_out`
+        experiences cancellation. This makes RMS(slots_pre_norm) very small,
+        and RMSNorm backward divides by RMS, amplifying the gradient by
+        1/RMS → gradient explosion.
+
+        This is a mathematical stability constraint, not regularization: the
+        pre-causal-fix run had gates in [-0.35, 0.43] and was stable, so
+        ±0.3 is a safe bound that doesn't constrain normal learning.
+
+        No-op when gate_clamp_bound is 0.0 (disabled) or no workspace.
+        """
+        bound = self.config.gate_clamp_bound
+        if bound <= 0 or self.workspace is None:
+            return
+        ws = self.workspace
+        for attr in ("read_gate", "write_gate"):
+            g = getattr(ws, attr)
+            g_host = ttnn.to_torch(g).float()
+            clamped = g_host.clamp(min=-bound, max=bound)
+            if not torch.equal(g_host, clamped):
+                setattr(ws, attr, ttnn.from_torch(
+                    clamped.to(torch.bfloat16),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=g.device()))
 
     def get_workspace_stats(self):
         """Extract workspace gate, QK scale, and slot-decay scalars to host for logging.

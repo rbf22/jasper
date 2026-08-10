@@ -37,18 +37,34 @@ ws_diversity_weight: 0.0
 # Kept for backward compatibility with checkpoint loading.
 gate_init: 0.0
 slot_decay_init: 1.0
+# Freeze slot_decay at init (1.0 = no decay). Matches Cell C — prevents
+# slot_decay from drifting and destabilizing the slot update. Cell B
+# previously allowed it to learn (drifted to 0.98), but the drift is an
+# unnecessary degree of freedom that adds risk without benefit.
+freeze_slot_decay: true
+# Clamp ReZero gates to [-0.3, 0.3] after each optimizer step.
+# With causal masking, the workspace's past-only contribution is noise for
+# Cell B (no recurrent core), so the model suppresses it → gates grow negative.
+# At -0.43, the pre-norm residual `decay * slots + gate * read_out` cancels,
+# making RMS very small. RMSNorm backward divides by RMS, amplifying the
+# gradient by 1/RMS → gradient explosion at step ~2100.
+# The pre-causal-fix run had gates in [-0.35, 0.43] and was stable, so ±0.3
+# is a safe bound that doesn't constrain normal learning.
+gate_clamp_bound: 0.3
 
 # Training
 lr: 2.0e-4
 # Per-parameter LR groups: workspace gets 0.25x base LR (5e-5) to prevent
-# gradient explosion at warmup peak. Gates get 10x base LR (2e-3) so they
+# gradient explosion at warmup peak. Gates get 3x base LR (6e-4) so they
 # open fast enough to contribute within the training budget.
-# With ReZero gates (no sigmoid), the gradient is not suppressed by sigmoid'
-# so gates may grow faster — the 10x LR may need reduction. Start with it
-# and monitor gate values.
+# Reduced from 10x to 3x on 2026-08-09: with causal masking, the workspace's
+# past-only contribution is noise for Cell B (no recurrent core), so the model
+# suppresses it → gates grow negative. At 10x LR, gates reached -0.43 by step
+# 2100, causing RMSNorm cancellation and gradient explosion. 3x gives more
+# time to learn before hitting the clamp bound.
 lr_groups:
-  ws_read_gate: 10.0
-  ws_write_gate: 10.0
+  ws_read_gate: 3.0
+  ws_write_gate: 3.0
   ws_read_qk_scale: 1.0
   ws_write_qk_scale: 1.0
   ws_: 0.25
