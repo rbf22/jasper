@@ -5,8 +5,7 @@ This test builds a pure-PyTorch reference of the TTWorkspaceModule's forward
 and manual backward pass, then verifies the backward against PyTorch autograd
 using float64 gradcheck.
 
-Unlike test_ws_backward_cpu.py (which tests the OLD architecture against
-model.py's WorkspaceModule), this test builds a self-contained reference that
+This test builds a self-contained reference that
 matches the current TT workspace (model_ttnn.py TTWorkspaceModule):
 
   - QK Normalization: L2-normalize Q and K along d_head before attention scores

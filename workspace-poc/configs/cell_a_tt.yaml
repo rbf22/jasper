@@ -22,8 +22,18 @@ max_steps: 10000
 tokens_per_batch: 50000
 seq_len: 128
 warmup_steps: 200
+# Cosine LR decay: matches Cell B/C configs for fair comparison.
+cosine_decay_steps: 8000
+cosine_min_ratio: 0.1
 weight_decay: 0.1
+# Exclude ReZero gates from weight decay — matches Cell B/C configs.
+wd_groups:
+  "suffix:_gate": 0.0
+# Per-parameter beta2 for backbone gates — matches Cell B/C configs.
+beta2_groups:
+  "suffix:_gate": 0.999
 grad_clip: 1.0
+spike_action: restore
 z_loss_coef: 1.0e-4
 depth_range: [2, 8]
 eval_interval: 500

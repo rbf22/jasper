@@ -78,12 +78,38 @@ max_steps: 10000
 tokens_per_batch: 50000
 seq_len: 128
 warmup_steps: 200
+# Cosine LR decay: after warmup, decay from base_lr to 10% over 8000 steps.
+# Without decay, the constant LR keeps oscillation amplitude fixed even as the
+# model converges, eventually pushing past a stability cliff (observed at step
+# 650 for Cell B). Cosine decay shrinks the step size as the model approaches
+# the minimum, preventing the bifurcation.
+cosine_decay_steps: 8000
+cosine_min_ratio: 0.1
 weight_decay: 0.1
+# Exclude ReZero gates from weight decay.  Weight decay pulls gates toward 0,
+# fighting their gradient-driven growth.  Gates are scalar parameters meant to
+# grow from 0 — applying weight decay to them is like applying it to a bias.
+wd_groups:
+  "suffix:_gate": 0.0
+# Per-parameter beta2: backbone ReZero gates use 0.999 (vs 0.95 default).
+# Gate gradients have extreme variance (8677x max/min ratio per diagnostic)
+# because grad_gate = sum(grad_out * inner_output) — a dot product that is
+# near-zero when grad_out and inner are orthogonal and large when they align.
+# With beta2=0.95, AdamW's v_hat only averages ~20 steps, so a single spike
+# dominates the normalization and destabilizes the update.  beta2=0.999
+# averages ~1000 steps, providing stable normalization despite the variance.
+beta2_groups:
+  "suffix:_gate": 0.999
 grad_clip: 1.0
 # Component-wise gradient clipping: workspace params clipped at 0.5,
 # backbone at grad_clip (1.0). Prevents workspace gradient spikes from
 # dominating the global clip and starving the backbone of learning signal.
 ws_grad_clip: 0.5
+# Restore-on-spike: when grad norm exceeds threshold (default 5000), reload
+# the last checkpoint instead of skipping the step. Skip-on-spike freezes the
+# model in the bad state that caused the spike — it can never recover. Restore
+# gives it a fresh start from a known-good state (at most 100 steps old).
+spike_action: restore
 z_loss_coef: 1.0e-4
 depth_range: [2, 8]
 eval_interval: 500

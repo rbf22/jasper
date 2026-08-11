@@ -19,7 +19,6 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
 | `model.py` | PyTorch reference model (`MambaWorkspaceModel`/`WorkspaceModule`) — no longer used for full training (`model_ttnn.py` is the active Jasper implementation), but kept as the CPU-side correctness reference for the workspace backward pass. |
 | `model_ttnn.py` | Jasper model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes the TTWorkspaceModule (perceiver-style workspace with QK-Norm and ReZero gates), custom fused kernels for RoPE, scale+decay, and gate backward, and the retention layer. |
-| `mamba3_layer.py` | Fixed Mamba-3 layer (replaces Mamba-2's selective scan with decayed linear attention). Used unconditionally for all non-attention layers. |
 | `retention_reference.py` | PyTorch reference implementation of the retention layer (decayed linear attention + RoPE). Used for parity testing. |
 | `train_ttnn.py` | Tenstorrent-native training loop. Runs on Blackhole chips via `ttnn`, bfloat16-native computation. Used for the current Quietbox 2 experiments. |
 | `eval_ttnn.py` | Checkpoint evaluation script for Tenstorrent. Loads a `.pt` checkpoint, runs the model on generated eval examples, reports accuracy per task and per depth. Supports JSON output for automated tracking. |
@@ -27,7 +26,6 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | `monitor_training.sh` | Background monitor script. Reports training status every 10 minutes to `logs/monitor.log`. |
 | `kernels/` | Custom tt-metal compute kernels: `rope4d_{reader,compute,writer}.cpp` (fused RoPE), `scale_decay_{reader,compute,writer}.cpp` (fused scale+decay), `gate_bwd_{reader,compute,writer}.cpp` (fused gate backward). |
 | `test_retention_parity.py` | Parity test: tt-nn forward + backward vs. PyTorch reference autograd. Run with `--tile-aligned` for tile-aligned shapes. |
-| `test_mamba3_parity.py` | Parity test for the Mamba-3 layer: float64 gradcheck + tt-nn forward/backward vs. reference. |
 | `test_fused_rope_single.py` | Standalone test for the fused RoPE kernel (forward + backward). |
 | `test_scale_decay.py` | Standalone test for the fused scale+decay kernel. |
 | `test_gate_bwd.py` | Standalone test for the fused gate backward kernel. |
@@ -35,12 +33,7 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | `test_gate_clamp.py` | Unit test for the gate value clamping logic (verifies values outside [-0.3, 0.3] are clamped, values inside unchanged). |
 | `test_data.py` | Pytest tests for `data.py` synthetic task generators and verifiers (arithmetic, copy, reverse, sort). CPU-only, listed in `pytest.ini`. |
 | `test_text_data.py` | Pytest tests for `text_data.py` GPT-2 BPE tokenizer, TinyStories dataset loading, packed-stream label generation. CPU-only, listed in `pytest.ini`. |
-| `test_ws_backward.py` | Device-side gradient check (earlier attempt, superseded by `test_ws_qknorm_gradcheck.py`). |
 | `configs/cell_{a,b,c}_tt.yaml` | YAML configs for each model cell, including Tenstorrent-specific settings. Cell A is the no-workspace control; B adds workspace; C adds recurrent core. `cell_c_attn_residual.yaml` is the primary Cell C config (attention residual core). |
-| `run_all_cells_parallel.sh` | Launches all three cells in parallel on separate Blackhole chips (one cell per device). |
-| `tt_runner.py` | Sequential training runner for a single Blackhole chip. Supports `--cell`, `--status`, `--clean`, `--smoke` modes. |
-| `colab_notebook.ipynb` | Google Colab T4 notebook for running cells A and C (the go/no-go pair) on free GPU time. (Deprecated — project moved to TT.) |
-| `requirements.txt` | Python dependencies. |
 | `checkpoints/` | Saved during training (gitignored). `cell_{X}_step{N}.pt` per cell per checkpoint interval. |
 | `logs/` | Training logs (`cell_{a,b,c}.log`) and monitor log (`monitor.log`). |
 
@@ -493,7 +486,7 @@ TT_VISIBLE_DEVICES=1 nohup python train_ttnn.py \
     --config configs/cell_b_tt.yaml --device 0 --checkpoint_dir checkpoints \
     > logs/cell_b.log 2>&1 &
 TT_VISIBLE_DEVICES=2 nohup python train_ttnn.py \
-    --config configs/cell_c_tt.yaml --device 0 --checkpoint_dir checkpoints \
+    --config configs/cell_c_attn_residual.yaml --device 0 --checkpoint_dir checkpoints \
     > logs/cell_c.log 2>&1 &
 
 # Start the background monitor (reports every 10 minutes):
@@ -682,7 +675,7 @@ See AGENTS.md for full details on the text POC setup.
 
 ### Architecture changes since the original plan
 
-1. **Mamba-2 → Retention (Mamba-3)**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. See `mamba3_layer.py`.
+1. **Mamba-2 → Retention**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. Implemented as `TTRetentionLayer` in `model_ttnn.py`.
 
 2. **Custom fused kernels**: Three custom tt-metal kernels eliminate intermediate DRAM writes and reduce op dispatch overhead:
    - **Fused RoPE**: Full rotation (rot1 = x1*cos - x2*sin, rot2 = x1*sin + x2*cos) in a single kernel pass. Uses split-RoPE optimization to avoid expensive sub-tile concat/slice when d_half=48 is not tile-aligned.

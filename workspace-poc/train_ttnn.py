@@ -89,6 +89,7 @@ if _is_p300():
 os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
 
 import argparse
+import gc
 import math
 import time
 import torch
@@ -103,15 +104,32 @@ logger.remove()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model_ttnn import TTMambaWorkspaceModel, ModelConfig
-try:
-    from mamba3_layer import _print_m3_timings, _M3_PROFILE
-except ImportError:
-    _print_m3_timings = lambda n: None
-    _M3_PROFILE = False
 
 # Cache for identity matrix on device (avoids recreating every step)
 _identity_cache = {}  # (V, device_id) -> ttnn.Tensor
 from data import Vocab, sample_batch, generate_eval_set
+
+
+# ---------------------------------------------------------------------------
+# Memory management helpers
+# ---------------------------------------------------------------------------
+
+def _safe_deallocate(tensor):
+    """Deallocate a ttnn tensor if it's a valid device tensor.
+
+    ttnn.deallocate() releases the on-device buffer immediately.  Without
+    explicit deallocation, intermediate tensors from every ttnn op accumulate
+    in device DRAM until Python's garbage collector runs — but ttnn wrapper
+    objects are tiny, so GC doesn't see the memory pressure and may not run
+    for hundreds of steps.  This was the root cause of the OOM that killed
+    the system when running 3 training processes in parallel.
+    """
+    if tensor is None:
+        return
+    try:
+        ttnn.deallocate(tensor)
+    except Exception:
+        pass  # already deallocated, host tensor, or not a device tensor
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +208,7 @@ class TTAdamW:
     """
 
     def __init__(self, params: dict, lr=6e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
-                 lr_groups: dict = None, wd_groups: dict = None):
+                 lr_groups: dict = None, wd_groups: dict = None, beta2_groups: dict = None):
         self.base_lr = lr
         self.lr = lr
         self.beta1, self.beta2 = betas
@@ -213,6 +231,11 @@ class TTAdamW:
         # Per-parameter weight decay groups: same matching as lr_groups
         self.wd_groups = wd_groups or {}
         self.param_wd = {}  # name -> weight decay (resolved at init)
+        # Per-parameter beta2 groups: same matching as lr_groups.
+        # Allows high-variance parameters (e.g. ReZero gates) to use a higher
+        # beta2 (e.g. 0.999) for more stable second-moment estimation.
+        self.beta2_groups = beta2_groups or {}
+        self.param_beta2 = {}  # name -> beta2 (resolved at init)
         for name in params:
             mult = 1.0
             for key, prefix_mult in self.lr_groups.items():
@@ -237,6 +260,18 @@ class TTAdamW:
                     wd = group_wd
                     break
             self.param_wd[name] = wd
+            # Resolve beta2: default to global, override with group match
+            b2 = self.beta2
+            for key, group_b2 in self.beta2_groups.items():
+                if key.startswith("suffix:"):
+                    suffix = key[7:]
+                    if name.endswith(suffix):
+                        b2 = group_b2
+                        break
+                elif name.startswith(key):
+                    b2 = group_b2
+                    break
+            self.param_beta2[name] = b2
 
         self.param_names = list(params.keys())
         self.device = None  # set from first param
@@ -253,9 +288,14 @@ class TTAdamW:
             # Optimizer state always in fp32
             self.exp_avg[name] = ttnn.zeros(shape, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
             self.exp_avg_sq[name] = ttnn.zeros(shape, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
-            # fp32 master copy — upcast from model's dtype
-            self.master[name] = ttnn.typecast(tt_tensor, ttnn.float32) \
-                if tt_tensor.dtype != ttnn.float32 else tt_tensor
+            # fp32 master copy — upcast from model's dtype.
+            # Always create a new tensor — never alias to the model param.
+            new_master = ttnn.typecast(tt_tensor, ttnn.float32)
+            if new_master is tt_tensor:
+                new_master = ttnn.from_torch(
+                    ttnn.to_torch(tt_tensor).clone(),
+                    dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=tt_tensor.device())
+            self.master[name] = new_master
 
     def set_lr(self, lr: float):
         self.lr = lr
@@ -279,31 +319,58 @@ class TTAdamW:
 
             grad = grads[name]
             storage_dtype = self.param_dtype[name]
-            m = self.exp_avg[name]     # fp32
-            v = self.exp_avg_sq[name]  # fp32
-            param = self.master[name]  # fp32 master
+            m_old = self.exp_avg[name]     # fp32
+            v_old = self.exp_avg_sq[name]  # fp32
+            param_old = self.master[name]  # fp32 master
 
             # Upcast grad to fp32 if needed
+            grad_fp32 = None
             if grad.dtype != ttnn.float32:
-                grad = ttnn.typecast(grad, ttnn.float32)
+                grad_fp32 = ttnn.typecast(grad, ttnn.float32)
+                grad_for_update = grad_fp32
+            else:
+                grad_for_update = grad
 
             lr = self.get_param_lr(name)
-            b1, b2, eps = self.beta1, self.beta2, self.eps
+            b1, b2, eps = self.beta1, self.param_beta2.get(name, self.beta2), self.eps
             wd = self.param_wd.get(name, self.weight_decay)
 
-            # m = b1*m + (1-b1)*g
-            m = ttnn.add(ttnn.mul(m, b1), ttnn.mul(grad, 1.0 - b1))
+            # m = b1*m + (1-b1)*g  — deallocate intermediates
+            m_b1 = ttnn.mul(m_old, b1)
+            g_1mb1 = ttnn.mul(grad_for_update, 1.0 - b1)
+            m = ttnn.add(m_b1, g_1mb1)
+            _safe_deallocate(m_b1)
+            _safe_deallocate(g_1mb1)
+
             # v = b2*v + (1-b2)*g^2
-            g_sq = ttnn.mul(grad, grad)
-            v = ttnn.add(ttnn.mul(v, b2), ttnn.mul(g_sq, 1.0 - b2))
+            g_sq = ttnn.mul(grad_for_update, grad_for_update)
+            v_b2 = ttnn.mul(v_old, b2)
+            g_sq_1mb2 = ttnn.mul(g_sq, 1.0 - b2)
+            v = ttnn.add(v_b2, g_sq_1mb2)
+            _safe_deallocate(g_sq)
+            _safe_deallocate(v_b2)
+            _safe_deallocate(g_sq_1mb2)
+
             # bias correction
             bc1 = 1.0 - b1 ** self.step_count
             bc2 = 1.0 - b2 ** self.step_count
             m_hat = ttnn.mul(m, 1.0 / bc1)
             v_hat = ttnn.mul(v, 1.0 / bc2)
+
             # param -= lr * m_hat / (sqrt(v_hat) + eps)
-            update = ttnn.div(m_hat, ttnn.add(ttnn.sqrt(v_hat), eps))
-            param = ttnn.sub(param, ttnn.mul(update, lr))
+            sqrt_v = ttnn.sqrt(v_hat)
+            denom = ttnn.add(sqrt_v, eps)
+            update = ttnn.div(m_hat, denom)
+            _safe_deallocate(sqrt_v)
+            _safe_deallocate(denom)
+            _safe_deallocate(m_hat)
+            _safe_deallocate(v_hat)
+
+            update_scaled = ttnn.mul(update, lr)
+            _safe_deallocate(update)
+            param = ttnn.sub(param_old, update_scaled)
+            _safe_deallocate(update_scaled)
+
             # weight decay
             # NOTE: unless a config sets `wd_groups` to override it, `wd` here
             # is the single global `weight_decay` applied to EVERY parameter,
@@ -320,25 +387,38 @@ class TTAdamW:
             # params instead of changing this default.
             param = ttnn.mul(param, 1.0 - lr * wd)
 
+            # Deallocate old optimizer state (replaced by new tensors above)
+            _safe_deallocate(m_old)
+            _safe_deallocate(v_old)
+            _safe_deallocate(param_old)
+            _safe_deallocate(grad_fp32)
+
             # Store updated optimizer state (fp32)
             self.exp_avg[name] = m
             self.exp_avg_sq[name] = v
             # Update fp32 master
             self.master[name] = param
 
-            # Downcast master to model's storage dtype and write into model
+            # Downcast master to model's storage dtype and write into model.
+            # When the storage dtype is fp32, we must NOT alias the model param
+            # to the master — the next step's _safe_deallocate(param_old) would
+            # free the model's parameter. Create a copy instead.
             if storage_dtype != ttnn.float32:
                 param_bf16 = ttnn.typecast(param, storage_dtype)
             else:
-                param_bf16 = param
+                param_bf16 = ttnn.from_torch(
+                    ttnn.to_torch(param).clone(),
+                    dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=param.device())
             self._set_model_param(model, name, param_bf16)
 
     def _set_model_param(self, model: TTMambaWorkspaceModel, name: str, param: "ttnn.Tensor"):
         """Update a model parameter from a device tensor (no transfer)."""
         if name == "token_emb_weight":
+            _safe_deallocate(model.token_emb_weight)
             model.token_emb_weight = param
             model.lm_head_weight = param  # weight tying
         elif name == "norm_weight":
+            _safe_deallocate(model.norm.weight)
             model.norm.weight = param
         elif name.startswith("layer_"):
             parts = name.split("_", 2)  # ["layer", "0", "in_proj_weight"]
@@ -381,8 +461,20 @@ class TTAdamW:
         for name in self.param_names:
             if name in model_params and (names is None or name in names):
                 p = model_params[name]
-                self.master[name] = ttnn.typecast(p, ttnn.float32) \
-                    if p.dtype != ttnn.float32 else p
+                old_master = self.master.get(name)
+                # Always create a new fp32 tensor — never alias the model param.
+                # If we set self.master[name] = p (same object), the next
+                # optimizer step's _safe_deallocate(param_old) would free the
+                # model's actual parameter tensor.
+                new_master = ttnn.typecast(p, ttnn.float32)
+                # If typecast returned the same object (same dtype, some
+                # implementations do this), force a copy via from_torch.
+                if new_master is p:
+                    new_master = ttnn.from_torch(
+                        ttnn.to_torch(p).clone(),
+                        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=p.device())
+                self.master[name] = new_master
+                _safe_deallocate(old_master)
 
     def load_state(self, state: dict, model: TTMambaWorkspaceModel):
         """Load optimizer state from checkpoint (transfers to device, in fp32)."""
@@ -391,14 +483,17 @@ class TTAdamW:
         for name in self.param_names:
             if name in state.get("exp_avg", {}):
                 host_m = state["exp_avg"][name]
+                _safe_deallocate(self.exp_avg.get(name))
                 self.exp_avg[name] = ttnn.from_torch(
                     host_m.float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
             if name in state.get("exp_avg_sq", {}):
                 host_v = state["exp_avg_sq"][name]
+                _safe_deallocate(self.exp_avg_sq.get(name))
                 self.exp_avg_sq[name] = ttnn.from_torch(
                     host_v.float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
             if name in state.get("master", {}):
                 host_master = state["master"][name]
+                _safe_deallocate(self.master.get(name))
                 self.master[name] = ttnn.from_torch(
                     host_master.float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
             elif name in state.get("exp_avg", {}):
@@ -407,8 +502,14 @@ class TTAdamW:
                 # but is the best we can do.
                 model_params = model.get_params()
                 if name in model_params:
-                    self.master[name] = ttnn.typecast(model_params[name], ttnn.float32) \
-                        if model_params[name].dtype != ttnn.float32 else model_params[name]
+                    _safe_deallocate(self.master.get(name))
+                    p = model_params[name]
+                    new_master = ttnn.typecast(p, ttnn.float32)
+                    if new_master is p:
+                        new_master = ttnn.from_torch(
+                            ttnn.to_torch(p).clone(),
+                            dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=p.device())
+                    self.master[name] = new_master
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +551,7 @@ def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
     label_indices = ttnn.from_torch(flat_labels.unsqueeze(-1), dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
     one_hot = ttnn.embedding(label_indices, identity_tt, layout=ttnn.TILE_LAYOUT)  # (B*(T-1), 1, V)
     one_hot = ttnn.reshape(one_hot, [B, T - 1, V])
+    _safe_deallocate(label_indices)
 
     # Apply valid mask to one_hot: zero out invalid positions
     mask_tt = ttnn.from_torch(
@@ -457,6 +559,7 @@ def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
     )
     one_hot_masked = ttnn.mul(one_hot, mask_tt)  # (B, T-1, V) — zero at invalid positions
+    _safe_deallocate(one_hot)
 
     # grad_logits = (probs - one_hot_masked) / n_valid
     # At invalid positions, one_hot_masked=0, so grad = probs / n_valid
@@ -467,19 +570,33 @@ def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
     )
 
-    grad_shift = ttnn.mul(ttnn.sub(probs, one_hot_masked), inv_n_valid_tt)  # (B, T-1, V)
+    diff = ttnn.sub(probs, one_hot_masked)
+    grad_shift = ttnn.mul(diff, inv_n_valid_tt)  # (B, T-1, V)
+    _safe_deallocate(diff)
+    _safe_deallocate(inv_n_valid_tt)
     grad_shift = ttnn.mul(grad_shift, mask_tt)  # zero out invalid positions
 
     # Pad to (B, T, V) — last position has zero gradient
     zeros_pad = ttnn.zeros((B, 1, V), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
     grad_logits_tt = ttnn.concat([grad_shift, zeros_pad], dim=1)  # (B, T, V)
+    _safe_deallocate(grad_shift)
+    _safe_deallocate(zeros_pad)
 
     # Compute loss value on device: loss = -sum(one_hot_masked * log(probs)) / n_valid
     probs_clamped = ttnn.clamp(probs, min=1e-8, max=1.0)
     log_probs = ttnn.log(probs_clamped)  # (B, T-1, V)
+    _safe_deallocate(probs_clamped)
     neg_log_probs_at_target = ttnn.mul(one_hot_masked, log_probs)  # (B, T-1, V)
+    _safe_deallocate(log_probs)
+    _safe_deallocate(one_hot_masked)
     loss_sum = ttnn.sum(neg_log_probs_at_target)  # scalar
+    _safe_deallocate(neg_log_probs_at_target)
     loss_value = -ttnn.to_torch(loss_sum).item() / n_valid
+    _safe_deallocate(loss_sum)
+
+    # Deallocate remaining intermediates (probs and mask_tt are no longer needed)
+    _safe_deallocate(probs)
+    _safe_deallocate(mask_tt)
 
     return loss_value, grad_logits_tt
 
@@ -540,10 +657,15 @@ def clip_grad_norm(grads: dict, max_norm: float, gamma_scale: float = 128.0,
             if name.endswith("_gamma"):
                 g_scaled = ttnn.mul(tt_grad, gamma_scale_tt)
                 sq = ttnn.mul(g_scaled, g_scaled)
+                _safe_deallocate(g_scaled)
             else:
                 sq = ttnn.mul(tt_grad, tt_grad)
             norm_sq = ttnn.sum(sq)
+            _safe_deallocate(sq)
+            old = norm_sq_tt
             norm_sq_tt = ttnn.add(norm_sq_tt, norm_sq)
+            _safe_deallocate(old)
+            _safe_deallocate(norm_sq)
         return norm_sq_tt
 
     def clip_group(group_grads, group_max_norm, group_norm_sq_tt):
@@ -559,7 +681,10 @@ def clip_grad_norm(grads: dict, max_norm: float, gamma_scale: float = 128.0,
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
             )
             for name in group_grads:
-                group_grads[name] = ttnn.mul(group_grads[name], scale_tt)
+                old_grad = group_grads[name]
+                group_grads[name] = ttnn.mul(old_grad, scale_tt)
+                _safe_deallocate(old_grad)
+            _safe_deallocate(scale_tt)
         return group_norm
 
     # Compute norms for both groups
@@ -578,7 +703,11 @@ def clip_grad_norm(grads: dict, max_norm: float, gamma_scale: float = 128.0,
             for name, tt_grad in ws_grads.items():
                 sq = ttnn.mul(tt_grad, tt_grad)
                 norm_sq = ttnn.sum(sq)
+                _safe_deallocate(sq)
+                old = bb_norm_sq_tt
                 bb_norm_sq_tt = ttnn.add(bb_norm_sq_tt, norm_sq)
+                _safe_deallocate(old)
+                _safe_deallocate(norm_sq)
             # Recompute and clip combined
             total_norm_sq = ttnn.to_torch(bb_norm_sq_tt).item()
             total_norm = math.sqrt(total_norm_sq)
@@ -589,9 +718,14 @@ def clip_grad_norm(grads: dict, max_norm: float, gamma_scale: float = 128.0,
                     dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
                 )
                 for name in bb_grads:
-                    bb_grads[name] = ttnn.mul(bb_grads[name], scale_tt)
+                    old_grad = bb_grads[name]
+                    bb_grads[name] = ttnn.mul(old_grad, scale_tt)
+                    _safe_deallocate(old_grad)
                 for name in ws_grads:
-                    ws_grads[name] = ttnn.mul(ws_grads[name], scale_tt)
+                    old_grad = ws_grads[name]
+                    ws_grads[name] = ttnn.mul(old_grad, scale_tt)
+                    _safe_deallocate(old_grad)
+                _safe_deallocate(scale_tt)
             bb_norm = total_norm
 
     # Merge clipped grads back
@@ -604,8 +738,12 @@ def clip_grad_norm(grads: dict, max_norm: float, gamma_scale: float = 128.0,
     if ws_norm_sq_tt is not None:
         total_norm_sq_tt = ttnn.add(bb_norm_sq_tt, ws_norm_sq_tt)
         total_norm = math.sqrt(ttnn.to_torch(total_norm_sq_tt).item())
+        _safe_deallocate(total_norm_sq_tt)
     else:
         total_norm = bb_norm
+    _safe_deallocate(bb_norm_sq_tt)
+    _safe_deallocate(ws_norm_sq_tt)
+    _safe_deallocate(gamma_scale_tt)
     return total_norm
 
 
@@ -793,8 +931,10 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     # Config format: lr_groups: {"ws_": 0.25}  → workspace params get 0.25x base LR
     lr_groups = cfg.get("lr_groups", None)
     wd_groups = cfg.get("wd_groups", None)
+    beta2_groups = cfg.get("beta2_groups", None)
     optimizer = TTAdamW(model.get_params(), lr=base_lr, weight_decay=weight_decay,
-                        lr_groups=lr_groups, wd_groups=wd_groups)
+                        lr_groups=lr_groups, wd_groups=wd_groups,
+                        beta2_groups=beta2_groups)
     if lr_groups:
         ws_mult = lr_groups.get("ws_", 1.0)
         ws_lr = base_lr * ws_mult
@@ -866,6 +1006,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     total_time = 0
     total_tokens = 0
     skipped_steps = 0
+    restored_steps = 0
+    last_ckpt_path = None  # track last saved checkpoint for restore-on-spike
 
     for step in range(start_step, max_steps):
         t_step_start = time.time()
@@ -927,6 +1069,9 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
 
             step_loss += loss_val
 
+            # Deallocate logits (no longer needed after loss computation)
+            _safe_deallocate(logits)
+
             # Workspace regularizers (entropy + diversity)
             # Computes regularizer losses and stores gradients for backward
             ent_loss, div_loss = model.compute_workspace_regularizers()
@@ -940,12 +1085,23 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             else:
                 grads = model.backward(grad_logits)
 
-            # Accumulate gradients (host-side)
+            # Deallocate grad_logits (consumed by backward)
+            _safe_deallocate(grad_logits)
+
+            # Accumulate gradients (host-side) — transfers to host, then we
+            # can deallocate the device-side gradient tensors.
             if profile:
                 with profiler.time_section("grad_accum"):
                     accumulate_grads(accum_grads, grads, accum_steps)
             else:
                 accumulate_grads(accum_grads, grads, accum_steps)
+
+            # Deallocate device-side gradient tensors (already copied to host)
+            for g in grads.values():
+                _safe_deallocate(g)
+
+            # Clear model's forward/backward caches to free intermediate tensors
+            model.clear_caches()
 
         # Average loss over accumulation steps
         step_loss /= accum_steps
@@ -968,19 +1124,44 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             else:
                 grad_norm = clip_grad_norm(tt_grads, grad_clip, ws_max_norm=ws_grad_clip)
 
-        # Skip-on-spike: if the pre-clip gradient norm exceeds a threshold,
-        # skip the optimizer step entirely.  This prevents explosion from
-        # corrupting the model.  The norm now includes gamma/T (scale-corrected),
-        # so genuine gamma explosions will also trigger the skip.  The threshold
-        # of 5000 is high enough to tolerate Cell B's naturally sharp loss
-        # landscape (non-gamma grad norm ~500-1000) while catching genuine
-        # explosions (25,000+ and 10^14 observed in preliminary runs).
+        # Skip-on-spike / restore-on-spike: if the pre-clip gradient norm
+        # exceeds a threshold, the model has entered an unstable region.
+        # Two modes:
+        #   - "skip" (default, backward compat): skip the optimizer step.
+        #     This prevents the explosion from worsening but leaves the model
+        #     in whatever state caused the spike — it cannot recover.
+        #   - "restore": reload the last checkpoint (model + optimizer state).
+        #     This gives the model a fresh start from a known-good state.
+        #     The data RNG is not restored (known limitation), so the batches
+        #     that triggered the spike won't reoccur in the same order.
         skip_step = grad_norm_spike_threshold > 0 and grad_norm > grad_norm_spike_threshold
         if skip_step:
-            print(f"  *** SKIP step {step}: grad_norm {grad_norm:.1f} > "
-                  f"threshold {grad_norm_spike_threshold:.0f} — skipping optimizer step ***",
-                  flush=True)
-            skipped_steps += 1
+            spike_action = cfg.get("spike_action", "skip")
+            if spike_action == "restore" and last_ckpt_path is not None:
+                print(f"  *** RESTORE step {step}: grad_norm {grad_norm:.1f} > "
+                      f"threshold {grad_norm_spike_threshold:.0f} — "
+                      f"restoring from {last_ckpt_path} ***", flush=True)
+                # Deallocate grads before restore (checkpoint load creates new tensors)
+                for g in tt_grads.values():
+                    _safe_deallocate(g)
+                del tt_grads, accum_grads
+                gc.collect()
+                opt_state = model.load_checkpoint(last_ckpt_path, device=device)
+                if opt_state:
+                    optimizer.load_state(opt_state, model)
+                    step = optimizer.step_count  # resume from checkpoint step
+                    # Re-apply LR for the restored step
+                    current_lr = get_lr(step, base_lr, warmup_steps,
+                                        cosine_decay_steps, cosine_min_ratio)
+                    optimizer.set_lr(current_lr)
+                restored_steps += 1
+                skipped_steps += 1
+                continue  # skip the rest of this iteration, re-run from restored step
+            else:
+                print(f"  *** SKIP step {step}: grad_norm {grad_norm:.1f} > "
+                      f"threshold {grad_norm_spike_threshold:.0f} — skipping optimizer step ***",
+                      flush=True)
+                skipped_steps += 1
         else:
             # Optimizer step
             if profile:
@@ -1050,6 +1231,17 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 optimizer.sync_master_from_model(
                     model, names={"ws_read_gate", "ws_write_gate"})
 
+        # Deallocate tt_grads (no longer needed after optimizer step / skip)
+        for g in tt_grads.values():
+            _safe_deallocate(g)
+        del tt_grads
+        # Free host-side accumulated gradients
+        del accum_grads
+        # Force garbage collection to reclaim any remaining orphaned tensors.
+        # Without this, ttnn wrapper objects (tiny Python objects) don't trigger
+        # GC often enough, and device DRAM grows until OOM.
+        gc.collect()
+
         t_step_end = time.time()
         step_time = t_step_end - t_step_start
         total_time += step_time
@@ -1089,6 +1281,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:
             ckpt_path = os.path.join(ckpt_dir, f"cell_{cell}_step{step+1}.pt")
             model.save_checkpoint(ckpt_path, optimizer_state=optimizer.get_state(), step=step+1)
+            last_ckpt_path = ckpt_path
 
         # Profile report every 100 steps during profiling
         if profile and step > 0 and (step + 1) % 100 == 0:
@@ -1106,17 +1299,14 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         print(f"\n--- Final profile report ---", flush=True)
         print(profiler.report(), flush=True)
 
-    # Mamba-3 per-section timing
-    if _M3_PROFILE:
-        _print_m3_timings(model_config.n_layers)
-
     avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
     print(f"\nTotal time: {total_time:.1f}s", flush=True)
     print(f"Avg step: {total_time/(max_steps-start_step):.2f}s", flush=True)
     print(f"Avg throughput: {avg_tokens_per_sec:.0f} tokens/sec", flush=True)
     print(f"Total tokens: {total_tokens:,}", flush=True)
     if skipped_steps > 0:
-        print(f"Skipped steps (grad spike): {skipped_steps}", flush=True)
+        print(f"Skipped steps (grad spike): {skipped_steps} "
+              f"(restored: {restored_steps})", flush=True)
     ttnn.close_device(device)
     print("Training complete.", flush=True)
 

@@ -21,8 +21,8 @@ Same as `workspace-poc/`:
 ```
 
 The venv is symlinked as `venv/`. Model code (`model_ttnn.py`,
-`mamba3_layer.py`, `kernels/`) is symlinked from `workspace-poc/` — there
-is only one copy of the model code.
+`kernels/`) is symlinked from `workspace-poc/` — there is only one copy
+of the model code.
 
 ## Files
 
@@ -59,6 +59,15 @@ Same Jasper architecture as `workspace-poc/` Cell C AR:
 - `gate_clamp_bound: 0.3` — ReZero gates clamped to [-0.3, 0.3] after each
   optimizer step (safety net against RMSNorm cancellation; see
   `workspace-poc/AGENTS.md` § "Gate clamping fix")
+- `cosine_decay_steps: 4000` — cosine LR decay after warmup (prevents
+  constant-LR bifurcation; see `workspace-poc/AGENTS.md` § "Gradient
+  stability fix")
+- `wd_groups: {"suffix:_gate": 0.0}` — ReZero gates excluded from weight
+  decay (scalar params meant to grow from 0)
+- `beta2_groups: {"suffix:_gate": 0.999}` — backbone gates use higher
+  beta2 for stable normalization of high-variance gate gradients
+- `spike_action: restore` — reload last checkpoint on grad spike instead
+  of skipping (skip-on-spike freezes model in bad state permanently)
 - 10.5M architecture params + 19.3M embedding = **29.8M total**
 
 The model code is symlinked from `workspace-poc/`, so all architecture

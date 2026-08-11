@@ -29,8 +29,7 @@ contexts:
       - train_ttnn.py
       - eval_ttnn.py
     key_modules:
-      - model_ttnn.py      # TT-native model (forward + manual backward)
-      - mamba3_layer.py     # Retention layer (Mamba-3 MIMO)
+      - model_ttnn.py      # TT-native model (forward + manual backward, includes TTRetentionLayer)
       - model.py            # PyTorch reference (for parity testing)
       - data.py             # Synthetic task generators + verifiers
       - train_ttnn.py       # Training loop, optimizer, grad clipping
@@ -48,7 +47,6 @@ contexts:
       - eval_text.py         # Perplexity eval + generation
     shared_modules:
       - model_ttnn.py       # Symlinked from workspace-poc
-      - mamba3_layer.py      # Symlinked from workspace-poc
       - train_ttnn.py        # Imported (optimizer, grad clip, etc.)
     hardware: tenstorrent/blackhole
     language: python/3.12
@@ -114,7 +112,7 @@ dependencies:
   internal:
     - module: model_ttnn.py
       depends_on:
-        - mamba3_layer.py     # TTMamba3Layer for retention layers
+        - model_ttnn.py        # TTRetentionLayer for retention layers
         - kernels/             # Custom TT kernels (RoPE, scale_decay, gate_bwd)
       depended_by:
         - train_ttnn.py
@@ -122,7 +120,7 @@ dependencies:
         - eval_ttnn.py
         - eval_text.py
 
-    - module: mamba3_layer.py
+    - module: model_ttnn.py  # TTRetentionLayer (retention backbone)
       depends_on:
         - kernels/             # diag_corr kernel
       depended_by:
@@ -172,8 +170,8 @@ decisions:
     rationale: >
       tt-nn does not support autograd. All backward passes are manually
       implemented using tt-nn ops. Parity is verified against PyTorch
-      autograd in test_mamba3_parity.py and test_ws_qknorm_gradcheck.py.
-    affects: [model_ttnn.py, mamba3_layer.py]
+      autograd in test_retention_parity.py and test_ws_qknorm_gradcheck.py.
+    affects: [model_ttnn.py]
 
   - id: ADR-002
     title: "ReZero gates instead of sigmoid gates"

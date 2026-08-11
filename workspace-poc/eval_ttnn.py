@@ -9,12 +9,12 @@ Usage:
         --checkpoint run_B/checkpoints/cell_B_step300.pt
 
     # Extended depths (extrapolation beyond training range)
-    python eval_ttnn.py --config configs/cell_c_tt.yaml --device 0 \
+    python eval_ttnn.py --config configs/cell_c_attn_residual.yaml --device 0 \
         --checkpoint checkpoints/cell_C_step5000.pt \
         --depths 2 4 6 8 10 12 14 16
 
     # K-sweep for Cell C (test-time compute scaling, R2)
-    python eval_ttnn.py --config configs/cell_c_tt.yaml --device 0 \
+    python eval_ttnn.py --config configs/cell_c_attn_residual.yaml --device 0 \
         --checkpoint checkpoints/cell_C_step5000.pt \
         --depths 2 4 6 8 10 12 14 16 \
         --k-sweep 1 2 4 6 8 12 16 \

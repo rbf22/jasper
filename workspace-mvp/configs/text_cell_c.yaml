@@ -55,9 +55,22 @@ max_steps: 5000
 tokens_per_batch: 50000
 seq_len: 512
 warmup_steps: 500
+# Cosine LR decay: after warmup, decay from base_lr to 10% over 4000 steps.
+# Prevents the constant-LR bifurcation observed in synthetic training.
+cosine_decay_steps: 4000
+cosine_min_ratio: 0.1
 weight_decay: 0.1
+# Exclude ReZero gates from weight decay (scalar params meant to grow from 0).
+wd_groups:
+  "suffix:_gate": 0.0
+# Per-parameter beta2: backbone ReZero gates use 0.999 for stable normalization
+# of high-variance gate gradients (see workspace-poc configs for full rationale).
+beta2_groups:
+  "suffix:_gate": 0.999
 grad_clip: 1.0
 ws_grad_clip: 0.5
+# Restore-on-spike: reload last checkpoint on grad spike instead of skipping.
+spike_action: restore
 z_loss_coef: 1.0e-4
 eval_interval: 250
 log_interval: 50

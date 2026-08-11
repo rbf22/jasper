@@ -30,107 +30,12 @@ Python venv (has `torch` + `ttnn`, Tenstorrent hardware present):
 is a teardown artifact, not a failure — filter it with `2>/dev/null` or
 `grep -viE "nanobind|leaked"`.
 
-## Verifying the Mamba-3 layer
-
-```bash
-/home/rfenwick/Documents/jasper/.tt-venv/bin/python test_mamba3_parity.py --gradcheck
-/home/rfenwick/Documents/jasper/.tt-venv/bin/python test_mamba3_parity.py --tile-aligned
-```
-
-Three stages:
-
-- **Stage 0** (`--gradcheck`): float64 `torch.autograd.gradcheck` of
-  `mamba3_reference.py`, plus an explicit causality assertion. Validates the
-  reference that everything else is measured against.
-- **Stage 1**: tt-nn forward vs. reference forward. Catches tt-nn
-  tile/broadcast/reshape issues.
-- **Stage 2**: `TTMamba3Layer.backward` vs. reference autograd, per parameter.
-  Catches manual-gradient math bugs.
-
-`--tile-aligned` uses shapes >= the 32x32 tile size. Sub-tile trailing dims are
-where tt-nn most often returns silently padded results, so if a sub-tile config
-fails but the tile-aligned one passes, suspect a ttnn op rather than the math.
-
-### Do not gradient-check this layer with finite differences
-
-`test_mamba3_grad.py` (the older test) uses central differences with `eps=2.0`
-against a bf16 loss sum. It cannot work:
-
-- bf16 carries ~3 decimal digits, so any eps small enough to be a derivative is
-  buried in noise, and `eps=2.0` is measuring a secant across a wildly
-  nonlinear region (`exp`/`tanh`/`sigmoid`/`softplus`/`cumsum`).
-- FD validates the backward against the layer's *own* forward, so a forward bug
-  hides itself. The non-causal decay matrix was invisible to it.
-
-Use `test_mamba3_parity.py` instead.
-
-### Expected error levels
-
-Everything should sit at ~0.02 relative error (bf16 vs fp32 noise floor). A
-real math bug shows up as O(1), not O(0.05).
-
-`grad_A_log` is the exception: it is precision-limited, not math-limited, and
-grows with T (0.017 @T=16 → 0.085 @T=64). It is the only gradient depending
-solely on the decay-matrix path, whose backward takes `row_sum - col_sum` of a
-TxT matrix — a difference much smaller than either operand, amplifying upstream
-bf16 error by ~O(T). Two mitigations are applied: (1) the decay matrix and its
-backward reduction run in fp32, and (2) the two matmuls that feed
-`grad_L_accum` (`QK`, `grad_QK`) use `compute_kernel_config` with
-`fp32_dest_acc_en=True` — fp32 accumulation in the matmul's destination
-register while Q/K/V stay bf16 in memory, no extra DRAM traffic. This is safe
-on Blackhole (the Wormhole fp32_dest_acc_en rounding erratum is fixed there —
-see `ttnn.matmul`'s docstring). Together these took T=64 from 0.43 (no
-mitigation) to 0.14 (fp32 reduction only) to 0.085 (both). See
-`test_mamba3_parity.py`'s `PARAM_TOL` comment for the full measurement table.
-
-Broadening `fp32_dest_acc_en` to the other matmuls in the R² attention loop
-(`out_rq` accumulation, `grad_V_rk`, `grad_Q_rq`, `grad_K_rk`) was tried and
-measured to give **no further improvement anywhere** — `fp32_dest_acc_en` only
-raises precision of the accumulator, not of the bf16-quantized Q/K/V tiles
-being read, so it only helps ops that are themselves cancellation-sensitive
-(the decay-matrix reduction is; ordinary attention matmuls aren't). Don't
-re-add it elsewhere without a new measurement justifying the extra HiFi4
-compute cost.
-
-If you need `grad_A_log` fully precision-matched (e.g. for a stricter test),
-the remaining error is bf16 storage quantization of Q/K/V, not accumulation —
-the only way to remove it is to store those specific tensors in fp32, which
-doubles their DRAM footprint. Not done here because it wasn't needed: `A_log`
-is a single scalar per head, not a large tensor to update precisely, and
-`BWD_TOL` on every other parameter is already met.
-
-### Testing gotcha: randomise the parameters
-
-`TTMamba3Layer.__init__` used to set `MIMO_V/Z/O` to constants across the R
-axis. Since every other tensor they multiply (V, z) is broadcast identically
-across R, that made every MIMO rank numerically identical at init, and that
-symmetry is a fixed point of gradient descent — it can never break on its own.
-This hid rank-indexing bugs from testing AND was a standing capacity bug in
-training (the R "parallel SSMs" permanently degenerated to one effective rank).
-Fixed: init now adds small per-rank noise (2% relative) so ranks specialize.
-
-Note: this is unrelated to the former `run_*_v1_degenerate` directories (now
-deleted), which were about workspace (Cell B/C) read/write attention collapsing
-to uniform — a different, older ablation project using `model.py`'s Mamba-2,
-not this layer.
-
-The parity test additionally overrides all parameters with independent random
-values (`randomised_params`) regardless of the production init, to maximize
-the chance of catching index/broadcast bugs. Keep it that way.
-
-### Known limitation
-
-`ngroups > 1` is not implemented — `ttnn.expand` can only broadcast size-1
-dims, so the GQA expansion in `forward()` only works for `ngroups == 1`. There
-is an assert in `__init__`.
-
 ## Production integration
 
 `TTMambaWorkspaceModel` (in `model_ttnn.py`) — the Jasper model — uses
-`TTMamba3Layer` (the retention layer) unconditionally for every non-attention
-layer, for all cells (A/B/C) and all `configs/cell_*_tt.yaml` runs. `run_A/`, `run_B/`, `run_C/` symlink `mamba3_layer.py` and `model_ttnn.py`
-back to the repo root, so fixes here apply immediately to those run directories —
-there is only one copy of the layer in play for current runs.
+`TTRetentionLayer` (defined inline in `model_ttnn.py`, RetNet-style decayed
+linear attention) for every non-attention layer, for all cells (A/B/C) and
+all `configs/cell_*_tt.yaml` runs.
 
 Smoke-tested end-to-end after the fixes above (3 steps each, `--accum_steps 1`
 to skip the full gradient-accumulation loop):
@@ -138,7 +43,7 @@ to skip the full gradient-accumulation loop):
 ```bash
 .tt-venv/bin/python train_ttnn.py --config configs/cell_a_tt.yaml --steps 3 --micro_batch 4 --accum_steps 1 --checkpoint_dir /tmp/x --device 0
 .tt-venv/bin/python train_ttnn.py --config configs/cell_b_tt.yaml --steps 3 --micro_batch 4 --accum_steps 1 --checkpoint_dir /tmp/x --device 0
-.tt-venv/bin/python train_ttnn.py --config configs/cell_c_tt.yaml --steps 3 --micro_batch 4 --accum_steps 1 --checkpoint_dir /tmp/x --device 0
+.tt-venv/bin/python train_ttnn.py --config configs/cell_c_attn_residual.yaml --steps 3 --micro_batch 4 --accum_steps 1 --checkpoint_dir /tmp/x --device 0
 ```
 
 All three ran forward + backward + AdamW step + checkpoint save cleanly with
@@ -176,7 +81,7 @@ collecting `ttnn`-dependent tests.
 | `test_gate_clamp.py` | Gate value clamping logic (verifies values outside [-0.3, 0.3] are clamped, values inside unchanged) |
 | `test_ws_qknorm_gradcheck.py` | Float64 autograd gradcheck of workspace cross-attention backward (including causal masks) |
 
-The `ttnn`-dependent tests (`test_mamba3_parity.py`, `test_retention_parity.py`,
+The `ttnn`-dependent tests (`test_retention_parity.py`,
 `test_scale_decay.py`, `test_fused_rope_single.py`, `test_scatter_loss.py`)
 are **not** in `pytest.ini` — they require a Tenstorrent device and are run
 manually as described in their respective sections above.
@@ -209,40 +114,39 @@ The architecture has evolved well beyond Mamba (retention layers + workspace
 
 ### Active runs
 
-Two Cell C variants are training in parallel on the synthetic tasks:
+All three cells are training in parallel on the synthetic tasks:
 
 | Run | Device | Config | Checkpoint dir | Log |
 |-----|--------|--------|----------------|-----|
-| Cell C AR (primary) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/ar_chain_fix/` | `logs/cell_c_ar_chain_fix2_20260804.log` |
-| Cell C K3 (deprioritized) | 3 | `cell_c_attn_residual_k3.yaml` | `checkpoints/k3_chain_fix/` | `logs/cell_c_k3_chainfix2_20260804.log` |
-
-The **AR version is the primary Cell C config**. The K3 variant (short conv +
-per-channel decay) is deprioritized due to increased overhead (~13s/step vs
-~8s/step) from host-side gamma gradient transfers. It's kept running as a
-backup in case the AR version encounters issues, but is not expected to be
-used for the text POC.
-
-Cell A (backbone-only control) and Cell B (workspace, no recurrence) completed
-training earlier — Cell B early-stopped at step 9404. Their results are valid
-(no bugs affected them — the AR chain gradient bug only impacts
-`recurrent_core: true` configs).
+| Cell A (backbone control) | 3 | `cell_a_tt.yaml` | `checkpoints/stability_fix_a/` | `logs/cell_a_stability_fix_20260810.log` |
+| Cell B (workspace) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b/` | `logs/cell_b_stability_fix_20260810.log` |
+| Cell C (AR + recurrent) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c/` | `logs/cell_c_stability_fix_20260810b.log` |
 
 ### Launch commands (from workspace-poc/):
 
 ```bash
-# Cell C AR (primary) — device 2
+# Cell B — device 1
 cd /home/rfenwick/Documents/jasper/workspace-poc
+TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
+    --config configs/cell_b_tt.yaml --device 0 \
+    --checkpoint_dir checkpoints/stability_fix_b \
+    --resume checkpoints/stability_fix_b/cell_B_step2700.pt \
+    >> logs/cell_b_stability_fix_20260810.log 2>&1 &
+
+# Cell C — device 2
 TT_VISIBLE_DEVICES=2 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
     --config configs/cell_c_attn_residual.yaml --device 0 \
-    --checkpoint_dir checkpoints/ar_chain_fix \
-    > logs/cell_c_ar_chain_fix2_20260804.log 2>&1 &
+    --checkpoint_dir checkpoints/stability_fix_c \
+    --resume checkpoints/stability_fix_c/cell_C_step1300.pt \
+    >> logs/cell_c_stability_fix_20260810b.log 2>&1 &
 
-# Cell C K3 (deprioritized) — device 3 (P300, needs mesh graph descriptor)
+# Cell A — device 3 (P150, needs mesh graph descriptor)
 TT_VISIBLE_DEVICES=3 TT_MESH_GRAPH_DESC_PATH=/home/rfenwick/tt-boltz/env/lib/python3.12/site-packages/ttnn/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto \
 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
-    --config configs/cell_c_attn_residual_k3.yaml --device 0 \
-    --checkpoint_dir checkpoints/k3_chain_fix \
-    > logs/cell_c_k3_chainfix2_20260804.log 2>&1 &
+    --config configs/cell_a_tt.yaml --device 0 \
+    --checkpoint_dir checkpoints/stability_fix_a \
+    --resume checkpoints/stability_fix_a/cell_A_step900.pt \
+    >> logs/cell_a_stability_fix_20260810.log 2>&1 &
 ```
 
 ### Critical divergence thresholds
@@ -436,8 +340,8 @@ they get the workspace LR group (0.25x by default, configurable via
 `lr_groups` in the YAML). The slot chain still uses 1/K gradient scaling
 in backward — the attention residual only replaces the x-path blend.
 
-Config: `configs/cell_c_attn_residual.yaml` — identical to
-`cell_c_tt.yaml` but with `attention_residual_core: true`.
+Config: `configs/cell_c_attn_residual.yaml` — the primary Cell C config,
+with `attention_residual_core: true`.
 
 Activation: set `attention_residual_core: true` in the config. When
 `false` (default), the original fixed blend core is used (backward
@@ -614,6 +518,86 @@ Verified with `test_gate_clamp.py` — the clamp logic is tested in isolation
 (confirming values outside [-0.3, 0.3] are clamped, values inside are
 unchanged).
 
+### Gradient stability fix (2026-08-10) — root cause of training divergence
+
+After the gate clamping fix, both Cell B and Cell C still diverged:
+- Cell B: stable for 600 steps → grad norm jumped from 4.9 to 569 at step
+  650 → 7765 at step 700 (skip-on-spike fired, model frozen permanently)
+- Cell C: stable for 2100 steps → grad norm jumped from 4.3 to 116 at
+  step 2100 → 116K at step 2200
+
+The gate clamping fix addressed the *consequence* (gate values too large)
+but not the *cause* (gate gradient variance). A diagnostic analysis
+revealed that **backbone ReZero gate gradients**
+(`layer_N_gate`) are the dominant source of instability:
+
+| Parameter | Mean grad | Max grad | Variance (max/min) |
+|-----------|-----------|----------|---------------------|
+| Cell B `layer_0_gate` | 11.21 | 71.50 | 8677x |
+| Cell C `layer_0_gate` | 2.61 | 31.00 | 127x |
+| Cell C `layer_7_gate` | 0.92 | 9.81 | 1568x |
+
+The ReZero gate gradient is `grad_gate = sum(grad_out * inner_output)` — a
+dot product of the backward gradient and the layer's forward output. When
+these align on a particular batch, the gradient is enormous; when
+orthogonal, it's near-zero. This is a known high-variance estimator.
+
+**Root cause: three converging factors**
+
+1. **Constant LR + sharp loss landscape = bifurcation.** The grad norm
+   trajectory is not a gradual climb — it's a sudden jump. The model
+   oscillates around a minimum near a cliff edge, and eventually a
+   stochastic step pushes it past the edge. The constant LR (2e-4 for all
+   10000 steps) keeps oscillation amplitude fixed even as the model
+   converges. Cosine LR decay was already implemented in `get_lr()` but
+   not configured.
+
+2. **beta2=0.95 is too low for gate gradient variance.** With 8677x
+   variance in gate gradients, AdamW's second moment estimate `v_hat`
+   only averages over ~20 steps (beta2=0.95 → effective window 1/(1-0.95)
+   = 20). A single spike dominates v_hat, making the update
+   `m_hat / sqrt(v_hat)` unstable. With beta2=0.999, v_hat averages over
+   ~1000 steps, providing stable normalization.
+
+3. **Weight decay on gates + no recovery from skip-on-spike.** Weight
+   decay (0.1) pulls gates toward 0, fighting their growth. And
+   skip-on-spike freezes the model permanently when it enters a bad
+   state — 934 consecutive skipped steps for Cell B, with no recovery.
+
+**Fix (four changes, all config + optimizer)**
+
+1. **Cosine LR decay** (`cosine_decay_steps: 8000`, `cosine_min_ratio: 0.1`):
+   After 200-step warmup, LR decays from 2e-4 to 2e-5 over 8000 steps,
+   then stays at 2e-5. This shrinks step size as the model converges,
+   preventing the bifurcation. Already implemented in `get_lr()` — just
+   needed config. Text POC uses `cosine_decay_steps: 4000` (5000 total
+   steps).
+
+2. **Per-parameter beta2** (`beta2_groups: {"suffix:_gate": 0.999}`):
+   New `beta2_groups` config field in `TTAdamW` (same matching syntax as
+   `lr_groups`/`wd_groups`). Backbone ReZero gates use beta2=0.999
+   instead of the global 0.95, giving stable second-moment estimation
+   despite extreme gradient variance. All other parameters keep beta2=0.95.
+
+3. **Exclude gates from weight decay** (`wd_groups: {"suffix:_gate": 0.0}`):
+   ReZero gates are scalar parameters meant to grow from 0 via gradient
+   descent. Weight decay pulls them back toward 0, fighting their purpose.
+   This is the standard convention for biases/norms/scalars — gates are
+   analogous.
+
+4. **Restore-on-spike** (`spike_action: restore`): When grad norm exceeds
+   the threshold (5000), reload the last checkpoint (model + optimizer
+   state) instead of skipping the step. Skip-on-spike freezes the model
+   in the bad state that caused the spike — it can never recover. Restore
+   gives it a fresh start from a known-good state (at most 100 steps old).
+   The data RNG is not restored (known limitation), so the triggering
+   batches won't reoccur in the same order. Default is `"skip"` for
+   backward compatibility.
+
+All four changes are in `configs/cell_b_tt.yaml`, `configs/cell_c_attn_residual.yaml`,
+and `configs/text_cell_c.yaml`. The optimizer changes are in `train_ttnn.py`
+(`TTAdamW.__init__` and `TTAdamW.step`).
+
 ### Checkpoint backups from previous runs
 
 - `checkpoints/diverged_run_20260802/` — Run 1 checkpoints
@@ -633,31 +617,6 @@ topology`). Always set both env vars when using device 3:
 ```bash
 TT_VISIBLE_DEVICES=3 TT_MESH_GRAPH_DESC_PATH=/home/rfenwick/tt-boltz/env/lib/python3.12/site-packages/ttnn/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto
 ```
-
-### Kimi K3 architectural updates (2026-08-04, deprioritized)
-
-Two improvements from Kimi K3 (see `kimi-k3-relevance-notes.md` §3, §5)
-were added to `TTRetentionLayer` in `model_ttnn.py`:
-
-1. **Short convolution** (`short_conv: true`): depthwise causal conv1d
-   (kernel=3) applied before the QKV projection. Captures local token
-   dependencies. Implemented as manual shifted multiply (not
-   `ttnn.conv1d`, which has heavy compilation overhead for a 3-tap
-   kernel). Identity init (w[:,0]=1, w[:,1:]=0) — starts as a no-op.
-
-2. **Per-channel decay** (`per_channel_decay: true`): expands gamma from
-   `(n_heads,)` to `(n_heads, d_head)` for element-wise per-channel
-   memory decay. Uses an exp decomposition to avoid materializing a
-   `(1, H, d_head, T, T)` decay matrix. The gamma gradient is computed
-   on host (4 tensor transfers per step) — **this is the source of the
-   ~60% overhead that led to deprioritization**.
-
-Config: `configs/cell_c_attn_residual_k3.yaml`. Param count: 10,543,891.
-
-**Status: deprioritized.** The K3 variant is ~60% slower per step (13s vs 8s)
-due to host-side gamma gradient transfers. It's kept as a backup but the AR
-version without K3 features is the primary config for both synthetic and text
-training.
 
 ### Early stopping
 
@@ -717,7 +676,8 @@ old C→B, old D→C. Run directories renamed: `run_E`→`run_A`, `run_C`→`run
 `run_D`→`run_C`. PID files renamed accordingly. Old `run_C_v1_degenerate/`
 and `run_D_v1_degenerate/` directories deleted. Config files renamed:
 `cell_e_tt.yaml`→`cell_a_tt.yaml`, `cell_c_tt.yaml`→`cell_b_tt.yaml`,
-`cell_d_tt.yaml`→`cell_c_tt.yaml`. Non-TT config variants (`cell_c.yaml`,
+`cell_d_tt.yaml`→`cell_c_tt.yaml` (the old `cell_c_tt.yaml` was later
+superseded by `cell_c_attn_residual.yaml` and removed). Non-TT config variants (`cell_c.yaml`,
 `cell_d.yaml`, `cell_c_colab.yaml`, `cell_d_colab.yaml`, `cell_d_vast.yaml`)
 deleted. GPU runners (`vast_runner.py`, `colab_runner.py`, `colab_runner_ac.py`)
 marked deprecated — project moved to tt-nn on Blackhole.
@@ -843,7 +803,6 @@ workspace-mvp/
 │   ├── tinystories_train.txt         # 1.9GB, ~480M tokens
 │   └── tinystories_valid.txt         # 19MB, ~4.8M tokens
 ├── model_ttnn.py -> ../workspace-poc/model_ttnn.py  (symlink)
-├── mamba3_layer.py -> ../workspace-poc/mamba3_layer.py
 ├── kernels/ -> ../workspace-poc/kernels/
 └── venv -> ../.tt-venv/
 ```

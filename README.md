@@ -35,10 +35,9 @@ jasper/
 │   ├── eval_ttnn.py                   ← checkpoint evaluation (per-task, per-depth accuracy)
 │   ├── probe.py                       ← R2/R3/R4 analysis (K sweep, linear probes, ablation)
 │   ├── configs/
-│   │   ├── cell_a_tt.yaml             ← hybrid baseline (no workspace, no recurrence)
-│   │   ├── cell_b_tt.yaml             ← hybrid + workspace (no recurrence)
-│   │   ├── cell_c_tt.yaml             ← hybrid + workspace + recurrent core (fixed blend)
-│   │   └── cell_c_attn_residual.yaml  ← Cell C with attention residual core (primary config)
+│   │   ├── cell_a_tt.yaml             ← backbone baseline (no workspace, no recurrence)
+│   │   ├── cell_b_tt.yaml             ← backbone + workspace (no recurrence)
+│   │   └── cell_c_attn_residual.yaml  ← backbone + workspace + recurrent core + attention residual (primary Cell C config)
 │   ├── kernels/                       ← custom tt-metal compute kernels (RoPE, scale+decay, gate bwd)
 │   └── checkpoints/                   ← saved during training (gitignored)
 ├── workspace-mvp/                     ← text POC (TinyStories, shared model code via symlinks)

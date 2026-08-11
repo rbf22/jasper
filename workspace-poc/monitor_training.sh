@@ -13,8 +13,9 @@ cd /home/rfenwick/Documents/jasper/workspace-poc
 #   config — the --config value used by train_ttnn.py (for pgrep matching)
 #   log    — path to the run's stdout log
 RUNS=(
-    "Cell C (AR)|configs/cell_c_attn_residual.yaml|logs/cell_c_ar_chain_fix_20260804.log"
-    "Cell C (AR+K3)|configs/cell_c_attn_residual_k3.yaml|logs/cell_c_k3_chainfix_20260804.log"
+    "Cell A|configs/cell_a_tt.yaml|logs/cell_a_stability_fix_20260810.log"
+    "Cell B|configs/cell_b_tt.yaml|logs/cell_b_stability_fix_20260810.log"
+    "Cell C (AR)|configs/cell_c_attn_residual.yaml|logs/cell_c_stability_fix_20260810b.log"
 )
 
 # Find the python PID for a given --config value.

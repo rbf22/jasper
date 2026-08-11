@@ -51,25 +51,6 @@ tests:
       - function: text_data.py:make_eval_batches
     test_count: 29
 
-  # --- Mamba-3 layer parity (requires TT device) ---
-  - file: workspace-poc/test_mamba3_parity.py
-    framework: standalone
-    hardware: true
-    covers:
-      - function: mamba3_layer.py:TTMamba3Layer.forward
-      - function: mamba3_layer.py:TTMamba3Layer.backward
-      - function: mamba3_layer.py:mamba3_reference.py (PyTorch ref)
-    stages:
-      - stage: 0
-        name: gradcheck
-        description: "float64 gradcheck of PyTorch reference + causality assertion"
-      - stage: 1
-        name: forward_parity
-        description: "tt-nn forward vs reference forward"
-      - stage: 2
-        name: backward_parity
-        description: "tt-nn backward vs reference autograd (per parameter)"
-
   # --- Retention layer parity (requires TT device) ---
   - file: workspace-poc/test_retention_parity.py
     framework: standalone
@@ -96,12 +77,6 @@ tests:
       - function: model_ttnn.py:ModelConfig.gate_clamp_bound
 
   # --- Fused RoPE kernel (requires TT device) ---
-  - file: workspace-poc/test_fused_rope.py
-    framework: standalone
-    hardware: true
-    covers:
-      - function: model_ttnn.py:TTRetentionLayer._fused_rope_4d
-
   - file: workspace-poc/test_fused_rope_single.py
     framework: standalone
     hardware: true
@@ -216,15 +191,6 @@ functions:
 
   - function: model_ttnn.py:TTRetentionLayer.backward
     tested_by: [test_retention_parity.py]
-    coverage: full
-
-  # --- mamba3_layer.py ---
-  - function: mamba3_layer.py:TTMamba3Layer.forward
-    tested_by: [test_mamba3_parity.py]
-    coverage: full
-
-  - function: mamba3_layer.py:TTMamba3Layer.backward
-    tested_by: [test_mamba3_parity.py]
     coverage: full
 
   # --- UNTESTED functions (coverage gaps) ---

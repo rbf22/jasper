@@ -35,7 +35,7 @@ from datetime import datetime
 CELL_CONFIGS = {
     "A": "configs/cell_a_tt.yaml",
     "B": "configs/cell_b_tt.yaml",
-    "C": "configs/cell_c_tt.yaml",
+    "C": "configs/cell_c_attn_residual.yaml",
 }
 
 # Plateau detection: no improvement >= threshold over N consecutive evals

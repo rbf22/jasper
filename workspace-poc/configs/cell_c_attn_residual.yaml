@@ -14,10 +14,9 @@
 # no longer has the multiplicative blend chain — each iteration receives
 # gradient directly from the attention residual (bounded by softmax weights).
 #
-# Differences from cell_c_tt.yaml:
-# - attention_residual_core: true (new)
-# - ws_grad_clip: 0.5 (kept — still needed for slot chain)
-# - Everything else identical to cell_c_tt.yaml
+# Primary Cell C config — attention residual core + recurrent workspace.
+# - attention_residual_core: true
+# - ws_grad_clip: 0.5 (needed for slot chain)
 cell: C
 d_model: 384
 n_layers: 13
@@ -81,11 +80,33 @@ max_steps: 10000
 tokens_per_batch: 50000
 seq_len: 128
 warmup_steps: 200
+# Cosine LR decay: after warmup, decay from base_lr to 10% over 8000 steps.
+# Cell C diverged at step 2100 with constant LR — a bifurcation where the
+# model oscillates past a stability cliff. Cosine decay shrinks step size
+# as the model converges, preventing the bifurcation.
+cosine_decay_steps: 8000
+cosine_min_ratio: 0.1
 weight_decay: 0.1
+# Exclude ReZero gates from weight decay. Gates are scalar parameters meant
+# to grow from 0 — weight decay pulls them back, fighting gradient-driven growth.
+wd_groups:
+  "suffix:_gate": 0.0
+# Per-parameter beta2: backbone ReZero gates use 0.999 (vs 0.95 default).
+# Gate gradients have extreme variance (1568x max/min ratio per diagnostic)
+# because grad_gate = sum(grad_out * inner_output). With beta2=0.95, a single
+# spike dominates v_hat and destabilizes the update. beta2=0.999 averages
+# ~1000 steps for stable normalization.
+beta2_groups:
+  "suffix:_gate": 0.999
 grad_clip: 1.0
 # Component-wise gradient clipping: workspace params clipped at 0.5,
 # backbone at grad_clip (1.0). Still needed for the slot chain.
 ws_grad_clip: 0.5
+# Restore-on-spike: when grad norm exceeds threshold (default 5000), reload
+# the last checkpoint instead of skipping the step. Skip-on-spike freezes the
+# model in the bad state that caused the spike — it can never recover. Restore
+# gives it a fresh start from a known-good state (at most 100 steps old).
+spike_action: restore
 z_loss_coef: 1.0e-4
 depth_range: [2, 8]
 eval_interval: 500

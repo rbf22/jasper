@@ -30,6 +30,26 @@ _KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"
 
 
 # ---------------------------------------------------------------------------
+# Memory management helper
+# ---------------------------------------------------------------------------
+
+def _safe_deallocate(tensor):
+    """Deallocate a ttnn device tensor, ignoring errors.
+
+    Without explicit deallocation, intermediate tensors from every ttnn op
+    accumulate in device DRAM until Python GC runs — but ttnn wrapper objects
+    are tiny so GC doesn't see the memory pressure.  This was the root cause
+    of the OOM that killed the system when running 3 training processes.
+    """
+    if tensor is None:
+        return
+    try:
+        ttnn.deallocate(tensor)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Config (shared with model.py)
 # ---------------------------------------------------------------------------
 
@@ -826,18 +846,8 @@ class TTMamba2Layer:
                 setattr(self, k, v)
 
 
-# Mamba-3 MIMO layer is implemented in mamba3_layer.py
-# (import deferred to avoid circular import — use _get_mamba3_layer_class())
-_mamba3_layer_cls = None
-
-def _get_mamba3_layer_class():
-    global _mamba3_layer_cls
-    if _mamba3_layer_cls is None:
-        from mamba3_layer import TTMamba3Layer as cls
-        _mamba3_layer_cls = cls
-    return _mamba3_layer_cls
-
-
+# ---------------------------------------------------------------------------
+# Attention layer (used at configured positions in the backbone)
 # ---------------------------------------------------------------------------
 
 class TTAttentionLayer:
@@ -2149,6 +2159,17 @@ class TTGatedResidualLayer:
 
         return grad_x, all_grads
 
+    def clear_caches(self):
+        """Clear cached tensors from the last forward pass.
+
+        _cached_x and _cached_inner are intermediates (not model parameters),
+        so we just drop references and let gc.collect() reclaim them.
+        """
+        self._cached_x = None
+        self._cached_inner = None
+        if hasattr(self.layer, 'clear_caches'):
+            self.layer.clear_caches()
+
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
         params = {"gate": self.gate, "wrapper_norm_weight": self.norm.weight}
         params.update(self.layer.get_params())
@@ -2156,8 +2177,10 @@ class TTGatedResidualLayer:
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         if "gate" in params:
+            _safe_deallocate(self.gate)
             self.gate = params["gate"]
         if "wrapper_norm_weight" in params:
+            _safe_deallocate(self.norm.weight)
             self.norm.weight = params["wrapper_norm_weight"]
         layer_params = {k: v for k, v in params.items() if k not in ("gate", "wrapper_norm_weight")}
         if layer_params:
@@ -2704,7 +2727,9 @@ class TTWorkspaceModule:
         Uses fixed weight=1 (not learned) so the slots are constrained to
         unit RMS regardless of training dynamics.
         """
+        old_slots = self.slots
         self.slots = ttnn.rms_norm(self.slots, weight=self._slot_param_norm_weight, epsilon=1e-6)
+        _safe_deallocate(old_slots)
 
     def spectral_normalize_weights(self):
         """Apply spectral normalization to all workspace weight matrices.
@@ -2785,7 +2810,26 @@ class TTWorkspaceModule:
             # scale = min(1, bound/sigma) = bound / max(bound, sigma)
             scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma)))
             W_normalized = ttnn.mul(W, scale_factor)
+            _safe_deallocate(getattr(self, name))
             setattr(self, name, W_normalized)
+            # Deallocate intermediates from power iteration
+            _safe_deallocate(v)
+            _safe_deallocate(v_norm)
+            _safe_deallocate(Wv)
+            _safe_deallocate(sigma)
+            _safe_deallocate(bound_tt)
+            _safe_deallocate(scale_factor)
+
+    def clear_caches(self):
+        """Clear cached tensors from the last forward pass.
+
+        The cache contains references to both intermediates and model parameters
+        (gates, slots).  We just drop references and let gc.collect() reclaim
+        the intermediates.  Model parameters survive because they're still
+        referenced by self.read_gate, self.slots, etc.
+        """
+        self._cache = {}
+        self._forward_caches = []
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         # NOTE: params are matched to attributes generically via `hasattr` —
@@ -2797,10 +2841,13 @@ class TTWorkspaceModule:
         # attribute on self.
         for k, v in params.items():
             if k == "ws_norm_weight":
+                _safe_deallocate(self.norm.weight)
                 self.norm.weight = v
             elif k == "ws_slot_norm_weight":
+                _safe_deallocate(self.slot_norm.weight)
                 self.slot_norm.weight = v
             elif hasattr(self, k):
+                _safe_deallocate(getattr(self, k))
                 setattr(self, k, v)
 
 
@@ -3057,13 +3104,24 @@ class AttentionResidual:
 
         return grad_x_list, grads
 
+    def clear_caches(self):
+        """Clear cached tensors from the last forward pass.
+
+        Just drop references — gc.collect() in the training loop reclaims
+        intermediates.  Model parameters (query, scale) survive because
+        they're still referenced by self.query, self.scale.
+        """
+        self._cache = {}
+
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
         return {"ar_query": self.query, "ar_scale": self.scale}
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         if "ar_query" in params:
+            _safe_deallocate(self.query)
             self.query = params["ar_query"]
         if "ar_scale" in params:
+            _safe_deallocate(self.scale)
             self.scale = params["ar_scale"]
 
 
@@ -3086,11 +3144,10 @@ class TTMambaWorkspaceModel:
 
         # Build layers with gated residual wrappers.
         # Non-attention layers use TTRetentionLayer (RetNet-style decayed linear
-        # attention) instead of TTMamba3Layer. Retention maps to pure matmuls,
-        # avoiding the bandwidth-bound selective scan and custom kernels that
-        # caused 0.17% MFU on Blackhole. The J-space workspace and recurrent
-        # core attach identically -- they operate on hidden states regardless
-        # of the backbone that produced them.
+        # attention). Retention maps to pure matmuls, avoiding the bandwidth-bound
+        # selective scan and custom kernels that caused 0.17% MFU on Blackhole.
+        # The J-space workspace and recurrent core attach identically -- they
+        # operate on hidden states regardless of the backbone that produced them.
         self.layers = []
         self.attention_positions = set(config.attention_positions) if config.use_attention else set()
         for i in range(config.n_layers):
@@ -3880,6 +3937,28 @@ class TTMambaWorkspaceModel:
 
         return all_grads
 
+    def clear_caches(self):
+        """Clear all cached tensors from the last forward/backward pass.
+
+        Call this after backward() completes to drop references to intermediate
+        tensors that each layer cached for backward.  gc.collect() (called in
+        the training loop) then reclaims the device memory for intermediates
+        that are no longer referenced.  Model parameters survive because they're
+        still referenced by self.token_emb_weight, self.layers[i].gate, etc.
+        """
+        self._cached_x_pre_final_norm = None
+        self._cached_input_ids = None
+        self._fwd_trace = []
+        self._core_x_outputs = []
+        self._core_blend_info = []
+        for layer in self.layers:
+            if hasattr(layer, 'clear_caches'):
+                layer.clear_caches()
+        if self.workspace is not None:
+            self.workspace.clear_caches()
+        if self.attn_residual is not None:
+            self.attn_residual.clear_caches()
+
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
         params = {"token_emb_weight": self.token_emb_weight, "norm_weight": self.norm.weight}
         for i, layer in enumerate(self.layers):
@@ -3980,7 +4059,17 @@ class TTMambaWorkspaceModel:
                 # scale = min(1, bound/sigma) = bound / max(bound, sigma)
                 scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma)))
                 W_normalized = ttnn.mul(W, scale_factor)
+                _safe_deallocate(getattr(inner, wname))
                 setattr(inner, wname, W_normalized)
+                # Deallocate power iteration intermediates
+                _safe_deallocate(v)
+                _safe_deallocate(v_norm)
+                _safe_deallocate(Wv)
+                _safe_deallocate(sigma)
+                _safe_deallocate(scale_factor)
+
+        _safe_deallocate(bound_tt)
+        _safe_deallocate(eps_tt)
 
     def clamp_retention_gammas(self, max_log_gamma: float = -0.02):
         """Clamp retention layer log-gamma to <= max_log_gamma after each optimizer step.
@@ -4011,9 +4100,11 @@ class TTMambaWorkspaceModel:
                 g_host = ttnn.to_torch(inner.gamma).float()  # (n_heads,)
                 clamped = g_host.clamp(max=max_log_gamma)
                 if not torch.equal(g_host, clamped):
+                    old_gamma = inner.gamma
                     inner.gamma = ttnn.from_torch(
                         clamped, dtype=ttnn.float32,
-                        layout=ttnn.TILE_LAYOUT, device=inner.gamma.device())
+                        layout=ttnn.TILE_LAYOUT, device=old_gamma.device())
+                    _safe_deallocate(old_gamma)
 
     def clamp_workspace_gates(self):
         """Clamp ReZero gates to [-gate_clamp_bound, gate_clamp_bound] after each optimizer step.
@@ -4041,9 +4132,11 @@ class TTMambaWorkspaceModel:
             g_host = ttnn.to_torch(g).float()
             clamped = g_host.clamp(min=-bound, max=bound)
             if not torch.equal(g_host, clamped):
+                old_g = getattr(ws, attr)
                 setattr(ws, attr, ttnn.from_torch(
                     clamped.to(torch.bfloat16),
                     dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=g.device()))
+                _safe_deallocate(old_g)
 
     def get_workspace_stats(self):
         """Extract workspace gate, QK scale, and slot-decay scalars to host for logging.
@@ -4153,6 +4246,8 @@ class TTMambaWorkspaceModel:
         if saved_config:
             print(f"Loaded checkpoint from {path} (step {checkpoint.get('step', 0)})", flush=True)
 
+        # _set_param → set_params now deallocates old params internally,
+        # so no explicit cleanup needed here.
         for name, host_tensor in model_state.items():
             if name == "token_emb_weight":
                 dtype = ttnn.bfloat16
@@ -4172,9 +4267,11 @@ class TTMambaWorkspaceModel:
     def _set_param(self, name: str, tt_tensor: "ttnn.Tensor"):
         """Set a single parameter by name."""
         if name == "token_emb_weight":
+            _safe_deallocate(self.token_emb_weight)
             self.token_emb_weight = tt_tensor
-            self.lm_head_weight = tt_tensor
+            self.lm_head_weight = tt_tensor  # weight tying — same tensor
         elif name == "norm_weight":
+            _safe_deallocate(self.norm.weight)
             self.norm.weight = tt_tensor
         elif name.startswith("layer_"):
             parts = name.split("_", 2)
