@@ -543,6 +543,8 @@ def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
 
     # Compute softmax on device
     probs = ttnn.softmax(shift_logits, dim=-1)  # (B, T-1, V)
+    # REVIEWED: shift_logits is a slice (new tensor) — deallocate after softmax.
+    _safe_deallocate(shift_logits)
 
     # Create one-hot encoding on device using embedding with identity matrix (cached)
     cache_key = (V, device.id())

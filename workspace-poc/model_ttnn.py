@@ -1358,6 +1358,24 @@ class TTRetentionLayer:
                     _safe_deallocate(v)
         self._cache_history = []
 
+    def _deallocate_conv_cache(self):
+        """Deallocate short conv cache (x_shifts and w_taps).
+
+        REVIEWED: w_taps are reshapes of persistent self.conv_weight (may be
+        views — do NOT deallocate). x_shifts[0] is the input x (not owned).
+        x_shifts[1:] are concat results (new tensors — must be deallocated).
+        """
+        if not hasattr(self, '_conv_cache') or not self._conv_cache:
+            return
+        c = self._conv_cache
+        x_shifts = c.get("x_shifts", [])
+        # x_shifts[0] is the input x (not owned by this cache).
+        # x_shifts[1:] are concat results — deallocate them.
+        for i in range(1, len(x_shifts)):
+            _safe_deallocate(x_shifts[i])
+        # w_taps are reshapes of self.conv_weight — may be views, do NOT deallocate.
+        self._conv_cache = {}
+
     def _init_rope(self, T, device):
         """Initialize RoPE cos/sin tables for sequence length T on device."""
         if self._rope_T == T and self._rope_cos is not None:
@@ -2513,6 +2531,9 @@ class TTGatedResidualLayer:
             # Deallocate cache history from recurrent core iterations
             if hasattr(self.layer, '_deallocate_cache_history'):
                 self.layer._deallocate_cache_history()
+            # REVIEWED: deallocate short conv cache if present (latent leak when short_conv=True)
+            if hasattr(self.layer, '_deallocate_conv_cache'):
+                self.layer._deallocate_conv_cache()
 
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
         params = {"gate": self.gate, "wrapper_norm_weight": self.norm.weight}
@@ -2609,6 +2630,13 @@ class TTWorkspaceModule:
         self._cache_history = []  # old caches from recurrent core iterations
         self._forward_caches = []  # list of dicts, one per forward call (for regularizers)
 
+        # REVIEWED: Cache epsilon tensor for L2 normalization (called 4x per
+        # forward + 4x per backward = 8x per workspace call, K times per step
+        # in Cell C). Avoids repeated from_torch + deallocate overhead.
+        self._eps_tt = ttnn.from_torch(
+            torch.tensor([1e-6], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
     def _deallocate_cache(self):
         """Deallocate cached intermediates, excluding persistent tensors."""
         if self._cache:
@@ -2686,10 +2714,8 @@ class TTWorkspaceModule:
         norm_sq = ttnn.reshape(norm_sq, [B, H, L, 1])
         norm_sq = ttnn.expand(norm_sq, [B, H, L, self.d_head])
         # Add epsilon for numerical stability (avoid div-by-zero)
-        eps_tt = ttnn.from_torch(torch.tensor([1e-6], dtype=torch.bfloat16),
-                                  dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
-        norm_sq = ttnn.add(norm_sq, eps_tt)
-        _safe_deallocate(eps_tt)
+        # REVIEWED: use cached _eps_tt (persistent) instead of from_torch every call.
+        norm_sq = ttnn.add(norm_sq, self._eps_tt)
         # rsqrt via SFPU
         inv_norm = ttnn.rsqrt(norm_sq)                   # (B, H, L, d_h) broadcast
         _safe_deallocate(norm_sq)
@@ -2774,10 +2800,8 @@ class TTWorkspaceModule:
         # norm_sq, norm_sq_scalar (would crash if view shares buffer).
         norm_sq_scalar = ttnn.reshape(norm_sq, [B, H, L, 1])
         norm_sq_expanded = ttnn.expand(norm_sq_scalar, [B, H, L, self.d_head])
-        eps_tt = ttnn.from_torch(torch.tensor([1e-6], dtype=torch.bfloat16),
-                                  dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
-        norm_sq_safe = ttnn.add(norm_sq_expanded, eps_tt)
-        _safe_deallocate(eps_tt)
+        # REVIEWED: use cached _eps_tt (persistent) instead of from_torch every call.
+        norm_sq_safe = ttnn.add(norm_sq_expanded, self._eps_tt)
         inv_norm = ttnn.rsqrt(norm_sq_safe)
         _safe_deallocate(norm_sq_safe)
         y = ttnn.mul(x, inv_norm)                        # normalized output
@@ -2820,8 +2844,11 @@ class TTWorkspaceModule:
                 slot_perm = torch.randperm(m)
                 slots_host = slots_host[slot_perm]  # gather along slot dim
             slots = to_device(slots_host, device)
-            slots = ttnn.reshape(slots, [1, m, D])
-            slots = ttnn.expand(slots, [B, m, D])
+            # REVIEWED: reshape/expand create new tensors — deallocate intermediates.
+            _slots_reshaped = ttnn.reshape(slots, [1, m, D])
+            _safe_deallocate(slots)
+            slots = ttnn.expand(_slots_reshaped, [B, m, D])
+            _safe_deallocate(_slots_reshaped)
         else:
             slots = slot_state
 
@@ -2911,11 +2938,11 @@ class TTWorkspaceModule:
         self._cache = {
             "x": x, "slots_in": slots, "decayed_slots": decayed_slots,
             "slots_pre_norm": slots_pre_norm,
-            "rq": rq, "rk": rk, "rv": rv, "read_attn": read_attn, "read_out_4d": read_out_4d,
+            "rq": rq, "rk": rk, "rv": rv, "read_attn": read_attn,
             "read_out": read_out, "read_out_proj": read_out_proj,
             "read_gate_val": read_gate_val,
             "slots_out": slots_out,
-            "wq": wq, "wk": wk, "wv": wv, "write_attn": write_attn, "write_out_4d": write_out_4d,
+            "wq": wq, "wk": wk, "wv": wv, "write_attn": write_attn,
             "write_out": write_out, "write_out_proj": write_out_proj,
             "write_gate_val": write_gate_val,
             "x_pre_norm": x_pre_norm,
@@ -3356,7 +3383,10 @@ class TTWorkspaceModule:
             # and prevents a sudden scaling jump when resuming from a checkpoint
             # saved with a different (or no) bound.
             # scale = min(1, bound/sigma) = bound / max(bound, sigma)
-            scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma_c)))
+            # REVIEWED: nested ttnn.maximum creates an intermediate — deallocate it.
+            _max_bound_sigma = ttnn.maximum(bound_tt, sigma_c)
+            scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(_max_bound_sigma))
+            _safe_deallocate(_max_bound_sigma)
             W_normalized = ttnn.mul(W, scale_factor)
             _safe_deallocate(getattr(self, name))
             setattr(self, name, W_normalized)
@@ -3649,6 +3679,9 @@ class AttentionResidual:
 
         # Concat grad_alpha: (B, T, n_outputs)
         grad_alpha = ttnn.concat(grad_alpha_list, dim=-1)
+        # REVIEWED: deallocate individual grad_alpha items after concat.
+        for gak in grad_alpha_list:
+            _safe_deallocate(gak)
 
         # --- Through alpha = softmax(scores_masked) ---
         # Manual softmax backward: grad_scores = (grad_alpha - sum(grad_alpha*alpha, -1, keepdim)) * alpha
@@ -3711,6 +3744,8 @@ class AttentionResidual:
             # grad_query += sum over (B, T) of grad_spk * x_k
             # grad_spk: (B, T, 1), x_k: (B, T, D) → mul → (B, T, D) → sum to (1, D)
             gq_term = ttnn.mul(grad_spk, x_k)  # (B, T, D)
+            # REVIEWED: grad_spk no longer needed — deallocate it.
+            _safe_deallocate(grad_spk)
             # REVIEWED: nested sum reassignment leak — deallocate intermediates.
             gq_term_2 = ttnn.sum(gq_term, dim=0)
             _safe_deallocate(gq_term)
@@ -4716,6 +4751,9 @@ class TTMambaWorkspaceModel:
                 # Deallocate cache history from recurrent core iterations
                 if hasattr(layer, '_deallocate_cache_history'):
                     layer._deallocate_cache_history()
+                # REVIEWED: deallocate short conv cache if present
+                if hasattr(layer, '_deallocate_conv_cache'):
+                    layer._deallocate_conv_cache()
         if self.workspace is not None:
             self.workspace.clear_caches()
         if self.attn_residual is not None:
