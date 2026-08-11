@@ -201,11 +201,19 @@ class TTRMSNorm:
         eps = self.eps
 
         # Compute rms = sqrt(eps + mean(x^2)) along last dim
+        # REVIEWED: RMS norm backward is called for every norm in the model
+        # (final norm, workspace norm, slot norm). All intermediates must be
+        # explicitly deallocated to avoid compounding leaks.
         x_sq = ttnn.mul(x, x)
         x_sq_mean = ttnn.mean(x_sq, dim=-1)  # (...,) — drops last dim
+        _safe_deallocate(x_sq)
         # Reshape to (..., 1) for broadcasting via mul
         mean_shape = list(int(x_sq_mean.shape[i]) for i in range(len(x_sq_mean.shape))) + [1]
-        inv_rms = ttnn.rsqrt(ttnn.add(x_sq_mean, eps))  # (...,)
+        _xsm_eps = ttnn.add(x_sq_mean, eps)
+        _safe_deallocate(x_sq_mean)
+        inv_rms = ttnn.rsqrt(_xsm_eps)  # (...,)
+        _safe_deallocate(_xsm_eps)
+        # REVIEWED: reshape may return a view — do NOT deallocate inv_rms.
         inv_rms_b = ttnn.reshape(inv_rms, mean_shape)  # (..., 1)
 
         # x_normed = x * inv_rms (broadcast over last dim)
@@ -213,6 +221,7 @@ class TTRMSNorm:
 
         # grad_out * weight (broadcast weight across all leading dims)
         w_shape = [1] * (len(grad_out.shape) - 1) + [d]
+        # REVIEWED: reshape of persistent self.weight may return a view — do NOT deallocate w.
         w = ttnn.reshape(self.weight, w_shape)
         grad_out_w = ttnn.mul(grad_out, w)
 
@@ -221,21 +230,37 @@ class TTRMSNorm:
 
         # mean(grad_out_w * x_normed) along last dim
         grad_out_w_xnorm = ttnn.mul(grad_out_w, x_normed)
+        _safe_deallocate(grad_out_w)
         grad_out_w_xnorm_mean = ttnn.mean(grad_out_w_xnorm, dim=-1)  # (...,)
+        _safe_deallocate(grad_out_w_xnorm)
+        # REVIEWED: reshape may return a view — do NOT deallocate grad_out_w_xnorm_mean.
         grad_out_w_xnorm_mean_b = ttnn.reshape(grad_out_w_xnorm_mean, mean_shape)  # (..., 1)
 
         # x_normed * (grad_out_w_xnorm_mean / rms)
-        correction = ttnn.mul(x_normed, ttnn.mul(grad_out_w_xnorm_mean_b, inv_rms_b))
+        _inner = ttnn.mul(grad_out_w_xnorm_mean_b, inv_rms_b)
+        correction = ttnn.mul(x_normed, _inner)
+        _safe_deallocate(_inner)
 
         # grad_x = grad_out_w_rms - correction
         grad_x = ttnn.sub(grad_out_w_rms, correction)
+        _safe_deallocate(grad_out_w_rms)
+        _safe_deallocate(correction)
 
         # grad_weight = sum(grad_out * x_normed, over all leading dims)
         grad_weight_full = ttnn.mul(grad_out, x_normed)
+        _safe_deallocate(x_normed)
         # Sum over all dims except last
+        # REVIEWED: nested sum reassignment leak — deallocate intermediates.
         for _ in range(len(grad_weight_full.shape) - 1):
-            grad_weight_full = ttnn.sum(grad_weight_full, dim=0)
+            _gw = ttnn.sum(grad_weight_full, dim=0)
+            _safe_deallocate(grad_weight_full)
+            grad_weight_full = _gw
         grad_weight = grad_weight_full
+
+        # REVIEWED: inv_rms_b may share buffer with inv_rms — deallocate inv_rms
+        # only after inv_rms_b is no longer needed (it's not used after here).
+        _safe_deallocate(inv_rms)
+        _safe_deallocate(inv_rms_b)
 
         return grad_x, grad_weight
 
@@ -886,6 +911,30 @@ class TTAttentionLayer:
         self._rope_T = 0
 
         self._cache = {}
+        self._cache_history = []  # old caches from recurrent core iterations
+
+    def _deallocate_cache(self):
+        """Deallocate cached intermediates, excluding persistent tensors."""
+        if not self._cache:
+            return
+        _persistent = set()
+        if hasattr(self, '_scale_tt') and self._scale_tt is not None:
+            _persistent.add(id(self._scale_tt))
+        for v in self._cache.values():
+            if id(v) not in _persistent and hasattr(v, 'shape'):
+                _safe_deallocate(v)
+        self._cache = {}
+
+    def _deallocate_cache_history(self):
+        """Deallocate all historical caches (from recurrent core iterations)."""
+        for old_cache in self._cache_history:
+            _persistent = set()
+            if hasattr(self, '_scale_tt') and self._scale_tt is not None:
+                _persistent.add(id(self._scale_tt))
+            for v in old_cache.values():
+                if id(v) not in _persistent and hasattr(v, 'shape'):
+                    _safe_deallocate(v)
+        self._cache_history = []
 
     def _init_rope(self, T: int, device):
         """Initialize RoPE cos/sin tables for sequence length T on device."""
@@ -908,14 +957,23 @@ class TTAttentionLayer:
         Splits x into [x1, x2] along last dim, rotates:
           rotated = cat([x1*cos - x2*sin, x1*sin + x2*cos], dim=-1)
         """
+        # REVIEWED: intermediates must be explicitly deallocated.
         d_h = self.d_head
         x1 = ttnn.slice(x, [0, 0, 0, 0], [B, H, T, d_h // 2])
         x2 = ttnn.slice(x, [0, 0, 0, d_h // 2], [B, H, T, d_h])
         x1_cos = ttnn.mul(x1, self._rope_cos)
         x2_sin = ttnn.mul(x2, self._rope_sin)
+        rot1 = ttnn.sub(x1_cos, x2_sin)
+        _safe_deallocate(x1_cos)
+        _safe_deallocate(x2_sin)
         x1_sin = ttnn.mul(x1, self._rope_sin)
         x2_cos = ttnn.mul(x2, self._rope_cos)
-        rotated = ttnn.concat([ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)], dim=-1)
+        rot2 = ttnn.add(x1_sin, x2_cos)
+        _safe_deallocate(x1_sin)
+        _safe_deallocate(x2_cos)
+        rotated = ttnn.concat([rot1, rot2], dim=-1)
+        _safe_deallocate(rot1)
+        _safe_deallocate(rot2)
         return rotated
 
     def _apply_rope_backward(self, grad_rotated: "ttnn.Tensor", B, H, T) -> "ttnn.Tensor":
@@ -925,12 +983,25 @@ class TTAttentionLayer:
         grad_x1 = grad_r1*cos + grad_r2*sin
         grad_x2 = -grad_r1*sin + grad_r2*cos
         """
+        # REVIEWED: intermediates must be explicitly deallocated.
         d_h = self.d_head
         grad_r1 = ttnn.slice(grad_rotated, [0, 0, 0, 0], [B, H, T, d_h // 2])
         grad_r2 = ttnn.slice(grad_rotated, [0, 0, 0, d_h // 2], [B, H, T, d_h])
-        grad_x1 = ttnn.add(ttnn.mul(grad_r1, self._rope_cos), ttnn.mul(grad_r2, self._rope_sin))
-        grad_x2 = ttnn.add(ttnn.mul(ttnn.neg(grad_r1), self._rope_sin), ttnn.mul(grad_r2, self._rope_cos))
+        _r1_cos = ttnn.mul(grad_r1, self._rope_cos)
+        _r2_sin = ttnn.mul(grad_r2, self._rope_sin)
+        grad_x1 = ttnn.add(_r1_cos, _r2_sin)
+        _safe_deallocate(_r1_cos)
+        _safe_deallocate(_r2_sin)
+        _neg_r1 = ttnn.neg(grad_r1)
+        _nr1_sin = ttnn.mul(_neg_r1, self._rope_sin)
+        _safe_deallocate(_neg_r1)
+        _r2_cos = ttnn.mul(grad_r2, self._rope_cos)
+        grad_x2 = ttnn.add(_nr1_sin, _r2_cos)
+        _safe_deallocate(_nr1_sin)
+        _safe_deallocate(_r2_cos)
         grad_x = ttnn.concat([grad_x1, grad_x2], dim=-1)
+        _safe_deallocate(grad_x1)
+        _safe_deallocate(grad_x2)
         return grad_x
 
     def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
@@ -959,18 +1030,25 @@ class TTAttentionLayer:
         k_rope = self._apply_rope(k_4d, B, H, T)
 
         # Attention scores: (B, H, T, T) = Q @ K^T * scale
+        # REVIEWED: intermediates must be explicitly deallocated.
         scores = ttnn.matmul(q_rope, ttnn.transpose(k_rope, -2, -1))  # (B, H, T, T)
         scale_tt = ttnn.from_torch(torch.tensor([self.scale], dtype=torch.bfloat16),
                                     dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        scores = ttnn.mul(scores, scale_tt)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
+        scores_scaled = ttnn.mul(scores, scale_tt)
+        _safe_deallocate(scores)
+        scores = scores_scaled
 
         # Causal mask: upper triangular (s > t) -> -inf
         ones_tt = ttnn.from_torch(torch.ones(T, T, dtype=torch.bfloat16),
                                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
         mask = ttnn.triu(ones_tt, diagonal=1)  # 1 for s > t
+        _safe_deallocate(ones_tt)
         neg_inf = ttnn.full((B, H, T, T), -1e4, dtype=ttnn.bfloat16,
                             layout=ttnn.TILE_LAYOUT, device=device)
         scores_masked = ttnn.where(mask, neg_inf, scores)
+        _safe_deallocate(mask)
+        _safe_deallocate(neg_inf)
 
         # Softmax over last dim
         attn = ttnn.softmax(scores_masked, dim=-1)  # (B, H, T, T)
@@ -979,11 +1057,16 @@ class TTAttentionLayer:
         out_4d = ttnn.matmul(attn, v_4d)  # (B, H, T, d_head)
 
         # Reshape back: (B, T, d_model)
-        out = ttnn.reshape(ttnn.permute(out_4d, [0, 2, 1, 3]), [B, T, D])
+        out_flat = ttnn.reshape(ttnn.permute(out_4d, [0, 2, 1, 3]), [B, T, D])
 
         # Output projection: (B, T, d_model) @ (d_model, d_model) -> (B, T, d_model)
-        out = ttnn.linear(out, self.out_proj_weight)
+        out = ttnn.linear(out_flat, self.out_proj_weight)
+        _safe_deallocate(out_flat)
 
+        # Save old cache to history before overwriting (forward may be called
+        # multiple times in the recurrent core; backward needs each cache)
+        if self._cache:
+            self._cache_history.append(self._cache)
         # Cache for backward
         self._cache = {
             "x": x, "qkv": qkv, "q": q, "k": k, "v": v,
@@ -1016,6 +1099,7 @@ class TTAttentionLayer:
         out_2d = ttnn.reshape(ttnn.permute(out_4d, [0, 2, 1, 3]), [B * T, D])  # (B*T, D)
         grad_out_2d = ttnn.reshape(grad_out, [B * T, D])
         grad_out_proj_weight = ttnn.matmul(ttnn.transpose(out_2d, 0, 1), grad_out_2d)  # (D, D)
+        # NOTE: Do NOT deallocate out_2d or grad_out_2d — reshape may return views.
 
         # Reshape grad back to 4D: (B*T, D) -> (B, T, H, d_head) -> (B, H, T, d_head)
         grad_out_4d = ttnn.reshape(grad_out_proj, [B, T, H, d_h])
@@ -1033,9 +1117,13 @@ class TTAttentionLayer:
         # --- Backward through softmax ---
         # grad_scores = (grad_attn - sum(grad_attn * attn, dim=-1, keepdim=True)) * attn
         grad_attn_sum = ttnn.sum(ttnn.mul(grad_attn, attn), dim=-1)  # (B, H, T)
+        # REVIEWED: reshape/expand may return views — do NOT deallocate old
+        # grad_attn_sum (would crash if view shares buffer with new one).
         grad_attn_sum = ttnn.reshape(grad_attn_sum, [B, H, T, 1])
         grad_attn_sum = ttnn.expand(grad_attn_sum, [B, H, T, T])
         grad_scores = ttnn.mul(ttnn.sub(grad_attn, grad_attn_sum), attn)
+        _safe_deallocate(grad_attn)
+        _safe_deallocate(grad_attn_sum)
 
         # --- Backward through causal masking (where mask, -inf, scores) ---
         # The mask sets scores to -inf for s > t. After softmax, those are 0.
@@ -1045,8 +1133,15 @@ class TTAttentionLayer:
         ones_tt = ttnn.from_torch(torch.ones(T, T, dtype=torch.bfloat16),
                                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
         mask_causal = ttnn.tril(ones_tt, diagonal=0)  # 1 for s <= t
+        _safe_deallocate(ones_tt)
         zeros_4d = ttnn.zeros((B, H, T, T), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        grad_scores = ttnn.where(mask_causal, grad_scores, zeros_4d)
+        # REVIEWED: reassignment leak — ttnn.where creates a new tensor,
+        # old grad_scores must be explicitly deallocated.
+        grad_scores_new = ttnn.where(mask_causal, grad_scores, zeros_4d)
+        _safe_deallocate(grad_scores)
+        grad_scores = grad_scores_new
+        _safe_deallocate(mask_causal)
+        _safe_deallocate(zeros_4d)
 
         # --- Backward through scores = QK^T * scale ---
         # Chain rule: d(L)/d(QK^T) = d(L)/d(scores) * scale (this multiplies
@@ -1054,7 +1149,11 @@ class TTAttentionLayer:
         # here so there's no separate grad_scale term to compute, unlike the
         # workspace's learnable qk_scale in TTWorkspaceModule).
         scale_tt = c["scale_tt"]
-        grad_scores = ttnn.mul(grad_scores, scale_tt)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor,
+        # old grad_scores must be explicitly deallocated.
+        grad_scores_scaled = ttnn.mul(grad_scores, scale_tt)
+        _safe_deallocate(grad_scores)
+        grad_scores = grad_scores_scaled
 
         # grad_q_rope = grad_scores @ k_rope — (B, H, T, d_head)
         k_rope = c["k_rope"]
@@ -1063,13 +1162,18 @@ class TTAttentionLayer:
         # grad_k_rope = grad_scores^T @ q_rope — (B, H, T, d_head)
         q_rope = c["q_rope"]
         grad_k_rope = ttnn.matmul(ttnn.transpose(grad_scores, -2, -1), q_rope)
+        _safe_deallocate(grad_scores)
 
         # --- Backward through RoPE ---
         grad_q_4d = self._apply_rope_backward(grad_q_rope, B, H, T)
         grad_k_4d = self._apply_rope_backward(grad_k_rope, B, H, T)
+        _safe_deallocate(grad_q_rope)
+        _safe_deallocate(grad_k_rope)
 
         # --- Backward through reshape (B, H, T, d_head) -> (B, T, D) ---
         # q: (B, H, T, d_head) -> (B, T, H, d_head) -> (B, T, D)
+        # NOTE: Do NOT deallocate grad_q_4d/grad_k_4d/grad_v_4d — permute/reshape
+        # may return views sharing the same buffer.
         grad_q = ttnn.reshape(ttnn.permute(grad_q_4d, [0, 2, 1, 3]), [B, T, D])
         grad_k = ttnn.reshape(ttnn.permute(grad_k_4d, [0, 2, 1, 3]), [B, T, D])
         grad_v = ttnn.reshape(ttnn.permute(grad_v_4d, [0, 2, 1, 3]), [B, T, D])
@@ -1082,9 +1186,14 @@ class TTAttentionLayer:
         x_2d = ttnn.reshape(c["x"], [B * T, D])
         grad_qkv_2d = ttnn.reshape(grad_qkv, [B * T, 3 * D])
         grad_qkv_weight = ttnn.matmul(ttnn.transpose(x_2d, 0, 1), grad_qkv_2d)
+        # NOTE: Do NOT deallocate x_2d or grad_qkv_2d — reshape may return views.
 
         # grad_x = grad_qkv @ qkv_weight^T — (B, T, D)
         grad_x = ttnn.matmul(grad_qkv_2d, ttnn.transpose(self.qkv_weight, 0, 1))
+        _safe_deallocate(grad_qkv)
+        # REVIEWED: reshape may return a view sharing the matmul buffer.
+        # Do NOT deallocate old grad_x — if reshape returned a view, deallocating
+        # would free the buffer we're about to return.
         grad_x = ttnn.reshape(grad_x, [B, T, D])
 
         grads = {
@@ -1191,6 +1300,34 @@ class TTRetentionLayer:
         self.use_fused_rope = use_fused_rope
 
         self._cache = {}
+        self._cache_history = []  # old caches from recurrent core iterations
+
+    def _deallocate_cache(self):
+        """Deallocate cached intermediates, excluding persistent tensors."""
+        if not self._cache:
+            return
+        _persistent = set()
+        if hasattr(self, '_scale_tt') and self._scale_tt is not None:
+            _persistent.add(id(self._scale_tt))
+        if hasattr(self, 'gate') and self.gate is not None:
+            _persistent.add(id(self.gate))
+        for v in self._cache.values():
+            if id(v) not in _persistent and hasattr(v, 'shape'):
+                _safe_deallocate(v)
+        self._cache = {}
+
+    def _deallocate_cache_history(self):
+        """Deallocate all historical caches (from recurrent core iterations)."""
+        for old_cache in self._cache_history:
+            _persistent = set()
+            if hasattr(self, '_scale_tt') and self._scale_tt is not None:
+                _persistent.add(id(self._scale_tt))
+            if hasattr(self, 'gate') and self.gate is not None:
+                _persistent.add(id(self.gate))
+            for v in old_cache.values():
+                if id(v) not in _persistent and hasattr(v, 'shape'):
+                    _safe_deallocate(v)
+        self._cache_history = []
 
     def _init_rope(self, T, device):
         """Initialize RoPE cos/sin tables for sequence length T on device."""
@@ -1240,11 +1377,13 @@ class TTRetentionLayer:
             w_taps.append(w_k)
 
         # Build shifted versions of x (zero-padded left for causality)
+        # REVIEWED: intermediates must be explicitly deallocated.
         x_shifts = [x]  # x[t] (no shift)
         for k in range(1, K):
             zeros_k = ttnn.zeros([B, k, D], dtype=ttnn.bfloat16,
                                  layout=ttnn.TILE_LAYOUT, device=device)
             x_prev = ttnn.concat([zeros_k, ttnn.slice(x, [0, 0, 0], [B, T - k, D])], dim=1)
+            _safe_deallocate(zeros_k)
             x_shifts.append(x_prev)
 
         # Weighted sum: out = sum_k w_k * x_shift_k
@@ -1254,7 +1393,11 @@ class TTRetentionLayer:
             if out is None:
                 out = term
             else:
-                out = ttnn.add(out, term)
+                # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+                _out_new = ttnn.add(out, term)
+                _safe_deallocate(out)
+                _safe_deallocate(term)
+                out = _out_new
 
         # Cache for backward
         self._conv_cache = {"x_shifts": x_shifts, "w_taps": w_taps, "B": B, "T": T, "D": D}
@@ -1276,12 +1419,14 @@ class TTRetentionLayer:
 
         # grad_x[t] = w0*grad_out[t] + w1*grad_out[t+1] + w2*grad_out[t+2]
         # (reverse shift: grad_out shifted left, zero-padded right)
-        grad_x_shifts = [grad_out]  # grad_out[t]
+        # REVIEWED: intermediates must be explicitly deallocated.
+        grad_x_shifts = [grad_out]  # grad_out[t] — do NOT deallocate (input)
         for k in range(1, K):
             zeros_k = ttnn.zeros([B, k, D], dtype=ttnn.bfloat16,
                                  layout=ttnn.TILE_LAYOUT, device=device)
             # Shift left: drop first k, pad right with zeros
             g_shifted = ttnn.concat([ttnn.slice(grad_out, [0, k, 0], [B, T, D]), zeros_k], dim=1)
+            _safe_deallocate(zeros_k)
             grad_x_shifts.append(g_shifted)
 
         w_taps = c["w_taps"]
@@ -1291,19 +1436,34 @@ class TTRetentionLayer:
             if grad_x is None:
                 grad_x = term
             else:
-                grad_x = ttnn.add(grad_x, term)
+                # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+                _gx_new = ttnn.add(grad_x, term)
+                _safe_deallocate(grad_x)
+                _safe_deallocate(term)
+                grad_x = _gx_new
+        # Deallocate shifted gradients (no longer needed)
+        for k in range(1, K):
+            _safe_deallocate(grad_x_shifts[k])
 
         # grad_w_k = sum_{b,t} grad_out[b,t,d] * x_shift_k[b,t,d] → (D,)
         grad_conv_weight = None
         for k in range(K):
             gw = ttnn.mul(grad_out, x_shifts[k])  # (B, T, D)
-            gw = ttnn.sum(gw, dim=0)  # (T, D)
-            gw = ttnn.sum(gw, dim=0)  # (D,)
-            gw = ttnn.reshape(gw, [D, 1])
+            # REVIEWED: nested sum reassignment leak — deallocate intermediates.
+            gw_2 = ttnn.sum(gw, dim=0)  # (T, D)
+            _safe_deallocate(gw)
+            gw_3 = ttnn.sum(gw_2, dim=0)  # (D,)
+            _safe_deallocate(gw_2)
+            # REVIEWED: reshape may return a view — do NOT deallocate gw_3.
+            gw = ttnn.reshape(gw_3, [D, 1])
             if grad_conv_weight is None:
                 grad_conv_weight = gw
             else:
-                grad_conv_weight = ttnn.concat([grad_conv_weight, gw], dim=-1)
+                # REVIEWED: reassignment leak — ttnn.concat creates a new tensor.
+                _gcw_new = ttnn.concat([grad_conv_weight, gw], dim=-1)
+                _safe_deallocate(grad_conv_weight)
+                _safe_deallocate(gw)
+                grad_conv_weight = _gcw_new
 
         return grad_x, grad_conv_weight
 
@@ -1359,6 +1519,7 @@ class TTRetentionLayer:
         eliminating expensive sub-tile concat/slice ops when d_half is not
         tile-aligned.
         """
+        # REVIEWED: intermediates must be explicitly deallocated.
         d_h = self.d_head
         x1 = ttnn.slice(x, [0, 0, 0, 0], [B, H, T, d_h // 2])
         x2 = ttnn.slice(x, [0, 0, 0, d_h // 2], [B, H, T, d_h])
@@ -1369,9 +1530,15 @@ class TTRetentionLayer:
         else:
             x1_cos = ttnn.mul(x1, self._rope_cos)
             x2_sin = ttnn.mul(x2, self._rope_sin)
+            rot1 = ttnn.sub(x1_cos, x2_sin)
+            _safe_deallocate(x1_cos)
+            _safe_deallocate(x2_sin)
             x1_sin = ttnn.mul(x1, self._rope_sin)
             x2_cos = ttnn.mul(x2, self._rope_cos)
-            return ttnn.sub(x1_cos, x2_sin), ttnn.add(x1_sin, x2_cos)
+            rot2 = ttnn.add(x1_sin, x2_cos)
+            _safe_deallocate(x1_sin)
+            _safe_deallocate(x2_cos)
+            return rot1, rot2
 
     def _apply_rope_backward(self, grad_rotated, B, H, T):
         """Backward through RoPE — same rotation with sin negated."""
@@ -1386,16 +1553,33 @@ class TTRetentionLayer:
         grad_r1, grad_r2: (B, H, T, d_half) each — grads w.r.t. rot1, rot2
         Returns: (B, H, T, d_head) = concat([grad_x1, grad_x2])
         """
+        # REVIEWED: intermediates must be explicitly deallocated.
         d_h = self.d_head
         if self.use_fused_rope:
             grad_x1, grad_x2 = self._fused_rope_4d(
                 grad_r1, grad_r2, self._rope_cos_2d, self._rope_neg_sin_2d,
                 B, H, T, d_h // 2, self.device)
-            return ttnn.concat([grad_x1, grad_x2], dim=-1)
+            result = ttnn.concat([grad_x1, grad_x2], dim=-1)
+            _safe_deallocate(grad_x1)
+            _safe_deallocate(grad_x2)
+            return result
         else:
-            grad_x1 = ttnn.add(ttnn.mul(grad_r1, self._rope_cos), ttnn.mul(grad_r2, self._rope_sin))
-            grad_x2 = ttnn.add(ttnn.mul(ttnn.neg(grad_r1), self._rope_sin), ttnn.mul(grad_r2, self._rope_cos))
-            return ttnn.concat([grad_x1, grad_x2], dim=-1)
+            _r1_cos = ttnn.mul(grad_r1, self._rope_cos)
+            _r2_sin = ttnn.mul(grad_r2, self._rope_sin)
+            grad_x1 = ttnn.add(_r1_cos, _r2_sin)
+            _safe_deallocate(_r1_cos)
+            _safe_deallocate(_r2_sin)
+            _neg_r1 = ttnn.neg(grad_r1)
+            _nr1_sin = ttnn.mul(_neg_r1, self._rope_sin)
+            _safe_deallocate(_neg_r1)
+            _r2_cos = ttnn.mul(grad_r2, self._rope_cos)
+            grad_x2 = ttnn.add(_nr1_sin, _r2_cos)
+            _safe_deallocate(_nr1_sin)
+            _safe_deallocate(_r2_cos)
+            result = ttnn.concat([grad_x1, grad_x2], dim=-1)
+            _safe_deallocate(grad_x1)
+            _safe_deallocate(grad_x2)
+            return result
 
     @staticmethod
     def _fused_rope_4d(x1, x2, cos, sin, B, H, T, d_half, device):
@@ -1735,13 +1919,19 @@ class TTRetentionLayer:
 
         # log_D = diff * log_gamma  — broadcast (1,1,T,T) * (1,H,1,1) -> (1,H,T,T)
         # gamma is (H,) stored as log(gamma); reshape to (1, H, 1, 1)
+        # REVIEWED: intermediates must be explicitly deallocated. This function
+        # is called every forward pass (6x per step for Cell C recurrent core).
         log_gamma_4d = ttnn.reshape(self.gamma, [1, self.n_heads, 1, 1])
         # Convert to bf16 for the multiply (gamma is fp32, diff is bf16)
         log_gamma_bf16 = ttnn.typecast(log_gamma_4d, ttnn.bfloat16)
         log_D = ttnn.mul(self._diff_tt, log_gamma_bf16)  # (1, H, T, T)
+        _safe_deallocate(log_gamma_bf16)
         D = ttnn.exp(log_D)  # (1, H, T, T)
-        D = ttnn.mul(D, self._causal_tt)  # zero out future positions
-        return D
+        _safe_deallocate(log_D)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
+        D_masked = ttnn.mul(D, self._causal_tt)  # zero out future positions
+        _safe_deallocate(D)
+        return D_masked
 
     def forward(self, x):
         """x: (B, T, d_model) -> (B, T, d_model)"""
@@ -1778,10 +1968,12 @@ class TTRetentionLayer:
 
         # Scores: (B, H, T, T) = (Q @ K^T) * scale
         # Split matmul: qk = q1@k1^T + q2@k2^T (avoids concat of rot1/rot2)
-        qk = ttnn.add(
-            ttnn.matmul(rot1_q, ttnn.transpose(rot1_k, -2, -1)),
-            ttnn.matmul(rot2_q, ttnn.transpose(rot2_k, -2, -1))
-        )
+        # REVIEWED: intermediates must be explicitly deallocated.
+        _qk1 = ttnn.matmul(rot1_q, ttnn.transpose(rot1_k, -2, -1))
+        _qk2 = ttnn.matmul(rot2_q, ttnn.transpose(rot2_k, -2, -1))
+        qk = ttnn.add(_qk1, _qk2)
+        _safe_deallocate(_qk1)
+        _safe_deallocate(_qk2)
         scale_tt = self._scale_tt
 
         if self.per_channel_decay:
@@ -1802,6 +1994,7 @@ class TTRetentionLayer:
                 self._decay_T = T
 
             # Apply scale + causal mask to scores (no decay matrix)
+            # REVIEWED: intermediates must be explicitly deallocated.
             qk_2d = ttnn.reshape(qk, [B * H * T, T])
             # Build (H, T, T) causal mask for the fused kernel (broadcast over B)
             causal_H_2d = ttnn.reshape(
@@ -1810,6 +2003,8 @@ class TTRetentionLayer:
                     dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
                 [H * T, T])
             scores_2d = self._fused_scale_decay(qk_2d, causal_H_2d, self.scale, B, H, T, device)
+            _safe_deallocate(causal_H_2d)
+            # REVIEWED: qk_2d and scores_2d may be views of qk/scores — do NOT deallocate.
             scores = ttnn.reshape(scores_2d, [B, H, T, T])
 
             # Scale V by exp(-pos * log_gamma): v_scaled[b,h,s,d] = v[b,h,s,d] * exp(-s*lg[h,d])
@@ -1825,15 +2020,21 @@ class TTRetentionLayer:
             D_decay = self._get_decay_matrix(T, device)
 
             # Reshape to 2D for the fused kernel (it expects flat (BH*T, T) layout)
+            # REVIEWED: intermediates must be explicitly deallocated.
             qk_2d = ttnn.reshape(qk, [B * H * T, T])
             D_decay_2d = ttnn.reshape(D_decay, [H * T, T])
             scores_2d = self._fused_scale_decay(qk_2d, D_decay_2d, self.scale, B, H, T, device)
+            # REVIEWED: D_decay_2d may be a view of D_decay (cached) — do NOT deallocate.
+            # qk_2d may be a view of qk (cached) — do NOT deallocate.
+            # scores_2d may be a view of scores — do NOT deallocate.
             scores = ttnn.reshape(scores_2d, [B, H, T, T])
 
             # Output: (B, H, T, d_head) = scores @ V
             out_4d = ttnn.matmul(scores, v_4d)
 
         # Reshape to (B, T, D): permute (B,H,T,d_h) -> (B,T,H,d_h) -> (B,T,D)
+        # REVIEWED: ttnn.permute may return a view of out_4d (cached) — do NOT
+        # deallocate the intermediate. out_flat is also cached for backward.
         out_flat = ttnn.reshape(ttnn.permute(out_4d, [0, 2, 1, 3]), [B, T, D])
 
         # Output gate: sigmoid(g) element-wise over (B, T, D)
@@ -1843,6 +2044,10 @@ class TTRetentionLayer:
         # Output projection
         out = ttnn.linear(out_gated, self.out_proj_weight)
 
+        # Save old cache to history before overwriting (forward may be called
+        # multiple times in the recurrent core; backward needs each cache)
+        if self._cache:
+            self._cache_history.append(self._cache)
         # Cache for backward
         self._cache = {
             "x": x, "x_conv": x_conv, "qkvg": qkvg, "q": q, "k": k, "v": v, "g": g,
@@ -1882,6 +2087,9 @@ class TTRetentionLayer:
         out_gated_2d = ttnn.reshape(c["out_gated"], [B * T, D])
         grad_out_2d = ttnn.reshape(grad_out, [B * T, D])
         grad_out_proj_weight = ttnn.matmul(ttnn.transpose(out_gated_2d, 0, 1), grad_out_2d)
+        # NOTE: Do NOT deallocate out_gated_2d or grad_out_2d — reshape may
+        # return views sharing buffers with c["out_gated"] (cached, reused
+        # across recurrent core iterations) or grad_out (input).
 
         # --- Backward through gate: out_gated = out_flat * sigmoid(g) ---
         # Fused kernel: grad_out_flat = grad_out_gated * gate
@@ -1889,6 +2097,7 @@ class TTRetentionLayer:
         gate = c["gate"]  # (B, T, D)
         grad_out_flat, grad_g = self._fused_gate_backward(
             grad_out_gated, gate, c["out_flat"], B, T, D, device)
+        _safe_deallocate(grad_out_gated)
 
         # --- Backward through reshape: out_flat = reshape(permute(out_4d)) ---
         # out_4d (B, H, T, d_h) -> permute -> (B, T, H, d_h) -> reshape -> (B, T, D)
@@ -1896,6 +2105,7 @@ class TTRetentionLayer:
             ttnn.reshape(grad_out_flat, [B, T, H, d_h]),
             [0, 2, 1, 3]
         )  # (B, H, T, d_h)
+        _safe_deallocate(grad_out_flat)
 
         if self.per_channel_decay:
             # --- Per-channel decay backward ---
@@ -1918,12 +2128,14 @@ class TTRetentionLayer:
 
             # grad_raw_out = grad_out_4d * pos_exp_pos
             grad_raw_out = ttnn.mul(grad_out_4d, pos_exp_pos)
+            _safe_deallocate(grad_out_4d)
 
             # grad_scores = grad_raw_out @ v_scaled^T
             grad_scores = ttnn.matmul(grad_raw_out, ttnn.transpose(v_scaled, -2, -1))
 
             # grad_v_scaled = scores^T @ grad_raw_out
             grad_v_scaled = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_raw_out)
+            _safe_deallocate(grad_raw_out)
 
             # grad_v = grad_v_scaled * pos_exp_neg
             grad_v_4d = ttnn.mul(grad_v_scaled, pos_exp_neg)
@@ -1951,6 +2163,7 @@ class TTRetentionLayer:
             raw_out_h = ttnn.to_torch(raw_out).float()
             grad_v_scaled_h = ttnn.to_torch(grad_v_scaled).float()
             v_4d_h = ttnn.to_torch(c["v_4d"]).float()
+            _safe_deallocate(grad_v_scaled)
             pos = torch.arange(T, dtype=torch.float32)  # (T,)
 
             # grad from pos_exp_pos: sum over B,T of grad_raw_out * raw_out * t
@@ -1977,12 +2190,18 @@ class TTRetentionLayer:
             grad_scores_scaled_2d = self._fused_scale_decay(
                 grad_scores_2d, causal_H_2d, self.scale, B, H, T, device)
             grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+            _safe_deallocate(causal_H_2d)
+            # NOTE: Do NOT deallocate grad_scores_2d or grad_scores_scaled_2d —
+            # ttnn.reshape() may return a view sharing the same device buffer.
+            # grad_scores_2d shares with grad_scores, grad_scores_scaled_2d shares
+            # with grad_scores_scaled (used later for RoPE backward).
 
         else:
             # --- Scalar decay backward (original) ---
             # --- Backward through out_4d = scores @ v_4d ---
             grad_scores = ttnn.matmul(grad_out_4d, ttnn.transpose(c["v_4d"], -2, -1))  # (B, H, T, T)
             grad_v_4d = ttnn.matmul(ttnn.transpose(c["scores"], -2, -1), grad_out_4d)  # (B, H, T, d_h)
+            _safe_deallocate(grad_out_4d)
 
             # --- Backward through scores = qk * scale * D_decay (fused in forward) ---
             D_decay = c["D_decay"]
@@ -1994,10 +2213,17 @@ class TTRetentionLayer:
             grad_scores_scaled_2d = self._fused_scale_decay(
                 grad_scores_2d, D_decay_2d, self.scale, B, H, T, device)
             grad_scores_scaled = ttnn.reshape(grad_scores_scaled_2d, [B, H, T, T])
+            # NOTE: Do NOT deallocate grad_scores_2d, D_decay_2d, or
+            # grad_scores_scaled_2d — ttnn.reshape() may return a view sharing
+            # the same device buffer. grad_scores_2d shares with grad_scores
+            # (used below), D_decay_2d shares with D_decay (used below),
+            # grad_scores_scaled_2d shares with grad_scores_scaled (used later).
 
             # grad_D_decay = grad_scores * (qk * scale)
             qk_scaled = ttnn.mul(qk, c["scale_tt"])
             grad_D_decay = ttnn.mul(grad_scores, qk_scaled)  # (B, H, T, T)
+            _safe_deallocate(qk_scaled)
+            _safe_deallocate(grad_scores)
 
             # --- Backward through D_decay w.r.t. gamma (log_gamma) ---
             # D[h,t,s] = exp(diff[t,s] * log_gamma[h]) for s <= t
@@ -2007,13 +2233,24 @@ class TTRetentionLayer:
             # 47% of total time in profiling. Uses the cached diff_tt from forward.
             # weighted = grad_D_decay * D_decay * diff  -> (B, H, T, T)
             weighted = ttnn.mul(grad_D_decay, D_decay)      # (B, H, T, T)
-            weighted = ttnn.mul(weighted, self._diff_tt)     # broadcast (1,1,T,T)
+            _safe_deallocate(grad_D_decay)
+            # REVIEWED: reassignment leak — ttnn.mul creates a new tensor,
+            # old `weighted` must be explicitly deallocated.
+            weighted_new = ttnn.mul(weighted, self._diff_tt)  # broadcast (1,1,T,T)
+            _safe_deallocate(weighted)
+            weighted = weighted_new
             # Sum over batch (dim 0) and positions (dims 2, 3) -> (H,)
             grad_log_gamma = ttnn.sum(weighted, dim=0)       # (H, T, T)
-            grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H, T)
-            grad_log_gamma = ttnn.sum(grad_log_gamma, dim=1) # (H,)
+            _safe_deallocate(weighted)
+            # REVIEWED: reassignment leak — ttnn.sum creates a new tensor,
+            # old grad_log_gamma must be explicitly deallocated.
+            grad_log_gamma_2 = ttnn.sum(grad_log_gamma, dim=1) # (H, T)
+            _safe_deallocate(grad_log_gamma)
+            grad_log_gamma_3 = ttnn.sum(grad_log_gamma_2, dim=1) # (H,)
+            _safe_deallocate(grad_log_gamma_2)
             # Store as fp32 to match gamma's dtype
-            grad_gamma = ttnn.typecast(grad_log_gamma, ttnn.float32)
+            grad_gamma = ttnn.typecast(grad_log_gamma_3, ttnn.float32)
+            _safe_deallocate(grad_log_gamma_3)
 
         # grad_q_rope = grad_scores_scaled @ k_rope (split: no concat needed)
         # grad_k_rope = grad_scores_scaled^T @ q_rope (split: no concat needed)
@@ -2021,12 +2258,20 @@ class TTRetentionLayer:
         grad_rot2_q = ttnn.matmul(grad_scores_scaled, c["rot2_k"])
         grad_rot1_k = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), c["rot1_q"])
         grad_rot2_k = ttnn.matmul(ttnn.transpose(grad_scores_scaled, -2, -1), c["rot2_q"])
+        _safe_deallocate(grad_scores_scaled)
 
         # --- Backward through RoPE (split: no slice needed) ---
         grad_q_4d = self._apply_rope_backward_split(grad_rot1_q, grad_rot2_q, B, H, T)
         grad_k_4d = self._apply_rope_backward_split(grad_rot1_k, grad_rot2_k, B, H, T)
+        _safe_deallocate(grad_rot1_q)
+        _safe_deallocate(grad_rot2_q)
+        _safe_deallocate(grad_rot1_k)
+        _safe_deallocate(grad_rot2_k)
 
         # --- Backward through reshape: (B, H, T, d_head) -> (B, T, D) ---
+        # NOTE: ttnn.permute/reshape may return views sharing the same buffer.
+        # Do NOT deallocate grad_q_4d/grad_k_4d/grad_v_4d here — grad_q/grad_k/grad_v
+        # may share their buffers. They'll be cleaned up by clear_caches() or GC.
         grad_q = ttnn.reshape(ttnn.permute(grad_q_4d, [0, 2, 1, 3]), [B, T, D])
         grad_k = ttnn.reshape(ttnn.permute(grad_k_4d, [0, 2, 1, 3]), [B, T, D])
         grad_v = ttnn.reshape(ttnn.permute(grad_v_4d, [0, 2, 1, 3]), [B, T, D])
@@ -2041,8 +2286,15 @@ class TTRetentionLayer:
         x_conv_2d = ttnn.reshape(x_conv, [B * T, D])
         grad_qkvg_2d = ttnn.reshape(grad_qkvg, [B * T, 4 * D])
         grad_qkv_weight = ttnn.matmul(ttnn.transpose(x_conv_2d, 0, 1), grad_qkvg_2d)
+        # NOTE: Do NOT deallocate x_conv_2d or grad_qkvg_2d — they may be views
+        # of x_conv (cached) or grad_qkvg (used below).
 
         grad_x_conv = ttnn.matmul(grad_qkvg_2d, ttnn.transpose(self.qkv_weight, 0, 1))
+        _safe_deallocate(grad_qkvg)
+        # REVIEWED: reshape may return a view sharing the matmul buffer.
+        # Do NOT deallocate the old grad_x_conv — if reshape returned a view,
+        # deallocating would free the buffer we're about to use. The matmul
+        # buffer will be reclaimed by GC when grad_x_conv goes out of scope.
         grad_x_conv = ttnn.reshape(grad_x_conv, [B, T, D])
 
         # --- Backward through short conv (if enabled) ---
@@ -2102,13 +2354,22 @@ class TTGatedResidualLayer:
             torch.zeros(1, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
+        self._cached_x = None
+        self._cached_inner = None
+        self._cache_history = []  # old caches from recurrent core iterations
 
     def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
         normed = self.norm.forward(x)
         inner = self.layer.forward(normed)
         # ReZero: x + gate * inner (no sigmoid)
+        # REVIEWED: intermediates must be explicitly deallocated.
         gated_inner = ttnn.mul(self.gate, inner)  # (B, T, d_model)
         out = ttnn.add(x, gated_inner)
+        _safe_deallocate(gated_inner)
+        # Save old cache to history before overwriting (forward may be called
+        # multiple times in the recurrent core; backward needs each cache)
+        if self._cached_x is not None:
+            self._cache_history.append((self._cached_x, self._cached_inner))
         # Cache for backward
         self._cached_x = x
         self._cached_inner = inner
@@ -2137,18 +2398,26 @@ class TTGatedResidualLayer:
         inner = self._cached_inner
         grad_gate_val = ttnn.mul(grad_out, inner)
         # Gate is a scalar — sum over all dimensions on device
-        grad_gate = ttnn.sum(grad_gate_val, dim=0)
-        grad_gate = ttnn.sum(grad_gate, dim=0)
-        grad_gate = ttnn.sum(grad_gate, dim=0)  # (1,)
+        # REVIEWED: nested sum reassignment leak — deallocate intermediates.
+        _gg1 = ttnn.sum(grad_gate_val, dim=0)
+        _safe_deallocate(grad_gate_val)
+        _gg2 = ttnn.sum(_gg1, dim=0)
+        _safe_deallocate(_gg1)
+        grad_gate = ttnn.sum(_gg2, dim=0)  # (1,)
+        _safe_deallocate(_gg2)
 
         # Layer backward (through norm and layer)
         grad_norm_input, layer_grads = self.layer.backward(grad_inner)
+        _safe_deallocate(grad_inner)
 
         # Norm backward — on device
         grad_x_from_norm, grad_norm_w = self.norm.backward(grad_norm_input, self._cached_x)
+        _safe_deallocate(grad_norm_input)
 
         # Total grad_x = grad_out (residual) + grad_x_from_norm
+        # REVIEWED: intermediate grad_x_from_norm must be deallocated after add.
         grad_x = ttnn.add(grad_out, grad_x_from_norm)
+        _safe_deallocate(grad_x_from_norm)
 
         # Collect all grads
         all_grads = {}
@@ -2162,13 +2431,37 @@ class TTGatedResidualLayer:
     def clear_caches(self):
         """Clear cached tensors from the last forward pass.
 
-        _cached_x and _cached_inner are intermediates (not model parameters),
-        so we just drop references and let gc.collect() reclaim them.
+        Explicitly deallocate cached intermediates to free device buffers,
+        then drop references. Model parameters survive (still referenced by
+        self.gate, self.norm.weight, etc.).
         """
+        _safe_deallocate(self._cached_x)
+        _safe_deallocate(self._cached_inner)
         self._cached_x = None
         self._cached_inner = None
+        # Deallocate cache history from recurrent core iterations
+        for old_x, old_inner in self._cache_history:
+            _safe_deallocate(old_x)
+            _safe_deallocate(old_inner)
+        self._cache_history = []
         if hasattr(self.layer, 'clear_caches'):
             self.layer.clear_caches()
+        elif hasattr(self.layer, '_cache'):
+            # Retention/attention layers: deallocate cached intermediates.
+            # Exclude persistent tensors: scale_tt (self._scale_tt) and
+            # gate (self.gate) are model parameters reused across steps.
+            _persistent = set()
+            if hasattr(self.layer, '_scale_tt'):
+                _persistent.add(id(self.layer._scale_tt))
+            if hasattr(self.layer, 'gate'):
+                _persistent.add(id(self.layer.gate))
+            for k, v in self.layer._cache.items():
+                if id(v) not in _persistent and hasattr(v, 'shape'):
+                    _safe_deallocate(v)
+            self.layer._cache = {}
+            # Deallocate cache history from recurrent core iterations
+            if hasattr(self.layer, '_deallocate_cache_history'):
+                self.layer._deallocate_cache_history()
 
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
         params = {"gate": self.gate, "wrapper_norm_weight": self.norm.weight}
@@ -2262,7 +2555,45 @@ class TTWorkspaceModule:
         self.slot_decay = ttnn.from_torch(torch.tensor([config.slot_decay_init], dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         self._cache = {}
+        self._cache_history = []  # old caches from recurrent core iterations
         self._forward_caches = []  # list of dicts, one per forward call (for regularizers)
+
+    def _deallocate_cache(self):
+        """Deallocate cached intermediates, excluding persistent tensors."""
+        if self._cache:
+            _persistent_ids = set()
+            if hasattr(self, 'slots') and self.slots is not None:
+                _persistent_ids.add(id(self.slots))
+            if hasattr(self, 'read_gate') and self.read_gate is not None:
+                _persistent_ids.add(id(self.read_gate))
+            if hasattr(self, 'write_gate') and self.write_gate is not None:
+                _persistent_ids.add(id(self.write_gate))
+            for v in self._cache.values():
+                if id(v) not in _persistent_ids and hasattr(v, 'shape'):
+                    _safe_deallocate(v)
+            self._cache = {}
+
+    def _deallocate_cache_history(self):
+        """Deallocate all historical caches (from recurrent core iterations)."""
+        _persistent_ids = set()
+        if hasattr(self, 'slots') and self.slots is not None:
+            _persistent_ids.add(id(self.slots))
+        if hasattr(self, 'read_gate') and self.read_gate is not None:
+            _persistent_ids.add(id(self.read_gate))
+        if hasattr(self, 'write_gate') and self.write_gate is not None:
+            _persistent_ids.add(id(self.write_gate))
+        # REVIEWED: also exclude cached causal masks (stored in _mask_cache).
+        # The same mask objects are referenced from every cache entry —
+        # deallocating them from history would free the persistent mask buffers.
+        if hasattr(self, '_mask_cache'):
+            for rm, wm in self._mask_cache.values():
+                _persistent_ids.add(id(rm))
+                _persistent_ids.add(id(wm))
+        for old_cache in self._cache_history:
+            for v in old_cache.values():
+                if id(v) not in _persistent_ids and hasattr(v, 'shape'):
+                    _safe_deallocate(v)
+        self._cache_history = []
 
     def _reshape_to_heads(self, x, B, L):
         """(B, L, D) -> (B, H, L, d_head)"""
@@ -2274,10 +2605,18 @@ class TTWorkspaceModule:
 
     def _softmax_backward(self, grad_attn, attn, B, H, L_q, L_k):
         """Manual softmax backward: grad_scores = (grad_attn - sum(grad_attn*attn, -1, keepdim)) * attn"""
-        grad_sum = ttnn.sum(ttnn.mul(grad_attn, attn), dim=-1)  # (B, H, L_q)
+        # REVIEWED: intermediates must be explicitly deallocated.
+        _ga_mul = ttnn.mul(grad_attn, attn)
+        grad_sum = ttnn.sum(_ga_mul, dim=-1)  # (B, H, L_q)
+        _safe_deallocate(_ga_mul)
+        # REVIEWED: reshape/expand may return views — do NOT deallocate grad_sum.
         grad_sum = ttnn.reshape(grad_sum, [B, H, L_q, 1])
         grad_sum = ttnn.expand(grad_sum, [B, H, L_q, L_k])
-        return ttnn.mul(ttnn.sub(grad_attn, grad_sum), attn)
+        _ga_sub = ttnn.sub(grad_attn, grad_sum)
+        _safe_deallocate(grad_sum)
+        result = ttnn.mul(_ga_sub, attn)
+        _safe_deallocate(_ga_sub)
+        return result
 
     def _l2_normalize_heads(self, x, B, H, L):
         """L2-normalize along d_head dimension. x: (B, H, L, d_head) -> normalized (B, H, L, d_head)
@@ -2286,18 +2625,26 @@ class TTWorkspaceModule:
         This bounds attention logits regardless of weight magnitudes, preventing entropy
         collapse.  (Henry et al., 2020 — now standard in OLMo 2, Gemma 3, Qwen 3)
         """
+        # REVIEWED: intermediates must be explicitly deallocated. This function
+        # is called in both forward and backward (for scores_pre recomputation).
         # Compute L2 norm along last dim: ||x|| = sqrt(sum(x^2, dim=-1))
         sq = ttnn.mul(x, x)                              # (B, H, L, d_h)
         norm_sq = ttnn.sum(sq, dim=-1)                   # (B, H, L)
+        _safe_deallocate(sq)
+        # REVIEWED: reshape/expand may return views — do NOT deallocate norm_sq.
         norm_sq = ttnn.reshape(norm_sq, [B, H, L, 1])
         norm_sq = ttnn.expand(norm_sq, [B, H, L, self.d_head])
         # Add epsilon for numerical stability (avoid div-by-zero)
         eps_tt = ttnn.from_torch(torch.tensor([1e-6], dtype=torch.bfloat16),
                                   dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         norm_sq = ttnn.add(norm_sq, eps_tt)
+        _safe_deallocate(eps_tt)
         # rsqrt via SFPU
         inv_norm = ttnn.rsqrt(norm_sq)                   # (B, H, L, d_h) broadcast
-        return ttnn.mul(x, inv_norm)
+        _safe_deallocate(norm_sq)
+        result = ttnn.mul(x, inv_norm)
+        _safe_deallocate(inv_norm)
+        return result
 
     def _build_causal_masks(self, T: int, m: int, B: int, H: int, device):
         """Build causal masks for workspace cross-attention.
@@ -2326,6 +2673,13 @@ class TTWorkspaceModule:
             read_mask: (m, T) — 1.0 where attention is allowed, 0.0 where masked
             write_mask: (T, m) — 1.0 where attention is allowed, 0.0 where masked
         """
+        # REVIEWED: Cache masks persistently per (T, m) — they're identical
+        # across forward calls and were being recreated 12x per step (Cell C),
+        # leaking device memory. The masks are small but the leak compounds.
+        cache_key = (T, m, device.id())
+        if hasattr(self, '_mask_cache') and cache_key in self._mask_cache:
+            return self._mask_cache[cache_key]
+
         # Read mask: slot i -> positions [0, (i+1)*T//m - 1]
         read_mask_host = torch.zeros(m, T, dtype=torch.bfloat16)
         for i in range(m):
@@ -2342,6 +2696,9 @@ class TTWorkspaceModule:
                                      layout=ttnn.TILE_LAYOUT, device=device)
         write_mask = ttnn.from_torch(write_mask_host, dtype=ttnn.bfloat16,
                                       layout=ttnn.TILE_LAYOUT, device=device)
+        if not hasattr(self, '_mask_cache'):
+            self._mask_cache = {}
+        self._mask_cache[cache_key] = (read_mask, write_mask)
         return read_mask, write_mask
 
     def _l2_normalize_backward(self, grad_normed, x, B, H, L):
@@ -2355,26 +2712,43 @@ class TTWorkspaceModule:
         grad_normed: (B, H, L, d_head) — gradient w.r.t. normalized output
         Returns: grad_x (B, H, L, d_head)
         """
+        # REVIEWED: This function is called 4x per workspace backward (which
+        # is called K times per step in Cell C). All intermediates must be
+        # explicitly deallocated to avoid compounding leaks.
         # Recompute y = x / ||x|| and ||x||
         sq = ttnn.mul(x, x)
         norm_sq = ttnn.sum(sq, dim=-1)                   # (B, H, L)
+        _safe_deallocate(sq)
+        # REVIEWED: reshape/expand may return views — do NOT deallocate
+        # norm_sq, norm_sq_scalar (would crash if view shares buffer).
         norm_sq_scalar = ttnn.reshape(norm_sq, [B, H, L, 1])
         norm_sq_expanded = ttnn.expand(norm_sq_scalar, [B, H, L, self.d_head])
         eps_tt = ttnn.from_torch(torch.tensor([1e-6], dtype=torch.bfloat16),
                                   dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         norm_sq_safe = ttnn.add(norm_sq_expanded, eps_tt)
+        _safe_deallocate(eps_tt)
         inv_norm = ttnn.rsqrt(norm_sq_safe)
+        _safe_deallocate(norm_sq_safe)
         y = ttnn.mul(x, inv_norm)                        # normalized output
 
         # dot = grad_y . y  (scalar per position)
-        dot = ttnn.sum(ttnn.mul(grad_normed, y), dim=-1)  # (B, H, L)
+        _gy_mul = ttnn.mul(grad_normed, y)
+        dot = ttnn.sum(_gy_mul, dim=-1)  # (B, H, L)
+        _safe_deallocate(_gy_mul)
+        # REVIEWED: reshape/expand may return views — do NOT deallocate dot.
         dot = ttnn.reshape(dot, [B, H, L, 1])
         dot = ttnn.expand(dot, [B, H, L, self.d_head])
 
         # grad_x = (grad_y - y * dot) * inv_norm
-        grad_x = ttnn.sub(grad_normed, ttnn.mul(y, dot))
-        grad_x = ttnn.mul(grad_x, inv_norm)
-        return grad_x
+        _y_dot = ttnn.mul(y, dot)
+        _safe_deallocate(y)
+        grad_x = ttnn.sub(grad_normed, _y_dot)
+        _safe_deallocate(_y_dot)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
+        grad_x_final = ttnn.mul(grad_x, inv_norm)
+        _safe_deallocate(grad_x)
+        _safe_deallocate(inv_norm)
+        return grad_x_final
 
     def forward(self, x: "ttnn.Tensor", slot_state: Optional["ttnn.Tensor"]) -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
         """x: (B, T, D), slot_state: (B, m, D) or None -> (x_out, slot_state_out)"""
@@ -2413,21 +2787,32 @@ class TTWorkspaceModule:
         read_mask, write_mask = self._build_causal_masks(T, m, B, H, device)
 
         read_scores = ttnn.matmul(rq_norm, ttnn.transpose(rk_norm, -2, -1))  # (B, H, m, T)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
         read_scores = ttnn.mul(read_scores, self.read_qk_scale)  # learnable scale
         # Apply causal mask: set masked positions to -1e4 before softmax
         neg_inf_read = ttnn.full((B, H, m, T), -1e4, dtype=ttnn.bfloat16,
                                   layout=ttnn.TILE_LAYOUT, device=device)
-        read_scores = ttnn.where(read_mask, read_scores, neg_inf_read)
+        # REVIEWED: reassignment leak — ttnn.where creates a new tensor.
+        read_scores_masked = ttnn.where(read_mask, read_scores, neg_inf_read)
+        _safe_deallocate(read_scores)
+        _safe_deallocate(neg_inf_read)
+        read_scores = read_scores_masked
         read_attn = ttnn.softmax(read_scores, dim=-1)               # (B, H, m, T)
+        _safe_deallocate(read_scores)
         read_out_4d = ttnn.matmul(read_attn, rv)                    # (B, H, m, d_h)
         read_out = self._reshape_from_heads(read_out_4d, B, m)      # (B, m, D)
+        _safe_deallocate(read_out_4d)
         read_out_proj = ttnn.linear(read_out, self.read_out_weight)  # (B, m, D)
+        # REVIEWED: read_out is cached for backward — do NOT deallocate.
 
         # slots = slot_norm(decay * slots + read_gate * read_out_proj)
         # ReZero gate: scalar (no sigmoid), starts at 0.0 (true identity)
         read_gate_val = self.read_gate  # ReZero: direct scalar, no sigmoid
         decayed_slots = ttnn.mul(self.slot_decay, slots)
-        slots_pre_norm = ttnn.add(decayed_slots, ttnn.mul(read_gate_val, read_out_proj))
+        # REVIEWED: intermediate must be deallocated after add.
+        _rg_ro = ttnn.mul(read_gate_val, read_out_proj)
+        slots_pre_norm = ttnn.add(decayed_slots, _rg_ro)
+        _safe_deallocate(_rg_ro)
         slots_out = self.slot_norm.forward(slots_pre_norm)
 
         # --- Write: hidden states attend over slots ---
@@ -2440,22 +2825,37 @@ class TTWorkspaceModule:
         wk_norm = self._l2_normalize_heads(wk, B, H, m)   # (B, H, m, d_h)
 
         write_scores = ttnn.matmul(wq_norm, ttnn.transpose(wk_norm, -2, -1))  # (B, H, T, m)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
         write_scores = ttnn.mul(write_scores, self.write_qk_scale)  # learnable scale
         # Apply causal mask: set masked positions to -1e4 before softmax
         neg_inf_write = ttnn.full((B, H, T, m), -1e4, dtype=ttnn.bfloat16,
                                    layout=ttnn.TILE_LAYOUT, device=device)
-        write_scores = ttnn.where(write_mask, write_scores, neg_inf_write)
+        # REVIEWED: reassignment leak — ttnn.where creates a new tensor.
+        write_scores_masked = ttnn.where(write_mask, write_scores, neg_inf_write)
+        _safe_deallocate(write_scores)
+        _safe_deallocate(neg_inf_write)
+        write_scores = write_scores_masked
         write_attn = ttnn.softmax(write_scores, dim=-1)              # (B, H, T, m)
+        _safe_deallocate(write_scores)
         write_out_4d = ttnn.matmul(write_attn, wv)                   # (B, H, T, d_h)
         write_out = self._reshape_from_heads(write_out_4d, B, T)     # (B, T, D)
+        _safe_deallocate(write_out_4d)
         write_out_proj = ttnn.linear(write_out, self.write_out_weight)  # (B, T, D)
+        # REVIEWED: write_out is cached for backward — do NOT deallocate.
 
         # x = norm(x + write_gate * write_out_proj)
         # ReZero gate: scalar (no sigmoid), starts at 0.0 (true identity)
         write_gate_val = self.write_gate  # ReZero: direct scalar, no sigmoid
-        x_pre_norm = ttnn.add(x, ttnn.mul(write_gate_val, write_out_proj))
+        # REVIEWED: intermediate must be deallocated after add.
+        _wg_wo = ttnn.mul(write_gate_val, write_out_proj)
+        x_pre_norm = ttnn.add(x, _wg_wo)
+        _safe_deallocate(_wg_wo)
         x_out = self.norm.forward(x_pre_norm)
 
+        # Save old cache to history before overwriting (forward may be called
+        # multiple times in the recurrent core; backward needs each cache)
+        if self._cache:
+            self._cache_history.append(self._cache)
         # Cache for backward
         self._cache = {
             "x": x, "slots_in": slots, "decayed_slots": decayed_slots,
@@ -2507,7 +2907,14 @@ class TTWorkspaceModule:
 
         # grad_write_gate = sum(grad_x_pre_norm * write_out_proj)  (no sigmoid derivative)
         grad_write_gate = ttnn.mul(grad_x_pre_norm, c["write_out_proj"])
-        grad_write_gate = ttnn.sum(ttnn.sum(ttnn.sum(grad_write_gate, dim=0), dim=0), dim=0)
+        # REVIEWED: nested sum reassignment leak — each ttnn.sum creates a new
+        # tensor; intermediate results must be explicitly deallocated.
+        _gw = ttnn.sum(grad_write_gate, dim=0)
+        _safe_deallocate(grad_write_gate)
+        _gw2 = ttnn.sum(_gw, dim=0)
+        _safe_deallocate(_gw)
+        grad_write_gate = ttnn.sum(_gw2, dim=0)
+        _safe_deallocate(_gw2)
 
         # --- Backward through write_out_proj = linear(write_out) ---
         grad_write_out = ttnn.linear(grad_write_out_proj, ttnn.transpose(self.write_out_weight, 0, 1))
@@ -2520,7 +2927,11 @@ class TTWorkspaceModule:
         wv = c["wv"]
         grad_write_attn = ttnn.matmul(grad_write_out_4d, ttnn.transpose(wv, -2, -1))  # (B, H, T, m)
         if extra_grad_write_attn is not None:
-            grad_write_attn = ttnn.add(grad_write_attn, extra_grad_write_attn)
+            # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+            _gwa = ttnn.add(grad_write_attn, extra_grad_write_attn)
+            _safe_deallocate(grad_write_attn)
+            _safe_deallocate(extra_grad_write_attn)
+            grad_write_attn = _gwa
         grad_wv = ttnn.matmul(ttnn.transpose(c["write_attn"], -2, -1), grad_write_out_4d)  # (B, H, m, d_h)
 
         # --- Backward through write_attn = softmax(write_scores * write_qk_scale) ---
@@ -2534,7 +2945,11 @@ class TTWorkspaceModule:
         write_mask = c["write_mask"]
         zeros_write = ttnn.zeros((B, H, T, m), dtype=ttnn.bfloat16,
                                   layout=ttnn.TILE_LAYOUT, device=device)
-        grad_write_scores = ttnn.where(write_mask, grad_write_scores, zeros_write)
+        # REVIEWED: reassignment leak — ttnn.where creates a new tensor.
+        _gws = ttnn.where(write_mask, grad_write_scores, zeros_write)
+        _safe_deallocate(grad_write_scores)
+        grad_write_scores = _gws
+        _safe_deallocate(zeros_write)
 
         # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE scaling.
         # IMPORTANT: order matters here. grad_write_scores below is still
@@ -2550,18 +2965,29 @@ class TTWorkspaceModule:
         # write_qk_scale is a scalar param: ttnn.sum with no `dim` reduces
         # over ALL dims (B,H,T,m) -> scalar, per ttnn.sum's documented
         # default behavior (unlike torch.sum this is NOT a no-op/identity).
-        grad_write_qk_scale = ttnn.sum(ttnn.mul(grad_write_scores, write_scores_pre))
+        _gws_mul = ttnn.mul(grad_write_scores, write_scores_pre)
+        grad_write_qk_scale = ttnn.sum(_gws_mul)
+        _safe_deallocate(_gws_mul)
+        _safe_deallocate(write_scores_pre)
 
         # Now scale: d(L)/d(scores_pre) = d(L)/d(scores) * qk_scale
-        grad_write_scores = ttnn.mul(grad_write_scores, self.write_qk_scale)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
+        _gws_scaled = ttnn.mul(grad_write_scores, self.write_qk_scale)
+        _safe_deallocate(grad_write_scores)
+        grad_write_scores = _gws_scaled
 
         # grad_wq_norm = d(L)/d(scores_pre) @ wk_norm, etc.
         grad_wq_norm = ttnn.matmul(grad_write_scores, wk_norm)               # (B, H, T, d_h)
         grad_wk_norm = ttnn.matmul(ttnn.transpose(grad_write_scores, -2, -1), wq_norm)  # (B, H, m, d_h)
+        _safe_deallocate(wq_norm)
+        _safe_deallocate(wk_norm)
 
         # --- Backward through QK-Norm: wq_norm = L2_normalize(wq), wk_norm = L2_normalize(wk) ---
         grad_wq = self._l2_normalize_backward(grad_wq_norm, wq, B, H, T)
         grad_wk = self._l2_normalize_backward(grad_wk_norm, wk, B, H, m)
+        # REVIEWED: grad_wq_norm/grad_wk_norm no longer needed after backward.
+        _safe_deallocate(grad_wq_norm)
+        _safe_deallocate(grad_wk_norm)
 
         # --- Backward through write projections ---
         # wq = linear(x), wk = linear(slots_out), wv = linear(slots_out)
@@ -2584,9 +3010,18 @@ class TTWorkspaceModule:
         grad_slots_from_wv = ttnn.reshape(ttnn.matmul(grad_wv_2d, ttnn.transpose(self.write_v_weight, 0, 1)), [B, m, D])
 
         # Total grad_slots_out (from write path + incoming grad_slots_out + regularizer)
-        grad_slots_total = ttnn.add(grad_slots_out, ttnn.add(grad_slots_from_wk, grad_slots_from_wv))
+        # REVIEWED: intermediate tensors must be explicitly deallocated.
+        _gs_wk_wv = ttnn.add(grad_slots_from_wk, grad_slots_from_wv)
+        _safe_deallocate(grad_slots_from_wk)
+        _safe_deallocate(grad_slots_from_wv)
+        grad_slots_total = ttnn.add(grad_slots_out, _gs_wk_wv)
+        _safe_deallocate(_gs_wk_wv)
         if extra_grad_slots_out is not None:
-            grad_slots_total = ttnn.add(grad_slots_total, extra_grad_slots_out)
+            # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+            _gst = ttnn.add(grad_slots_total, extra_grad_slots_out)
+            _safe_deallocate(grad_slots_total)
+            _safe_deallocate(extra_grad_slots_out)
+            grad_slots_total = _gst
 
         # --- Backward through slots_out = slot_norm(slots_pre_norm) ---
         grad_slots_pre_norm, grad_slot_norm_w = self.slot_norm.backward(grad_slots_total, c["slots_pre_norm"])
@@ -2598,11 +3033,23 @@ class TTWorkspaceModule:
 
         # grad_read_gate = sum(grad_slots_pre_norm * read_out_proj)  (no sigmoid derivative)
         grad_read_gate = ttnn.mul(grad_slots_pre_norm, c["read_out_proj"])
-        grad_read_gate = ttnn.sum(ttnn.sum(ttnn.sum(grad_read_gate, dim=0), dim=0), dim=0)
+        # REVIEWED: nested sum reassignment leak — deallocate intermediates.
+        _grg = ttnn.sum(grad_read_gate, dim=0)
+        _safe_deallocate(grad_read_gate)
+        _grg2 = ttnn.sum(_grg, dim=0)
+        _safe_deallocate(_grg)
+        grad_read_gate = ttnn.sum(_grg2, dim=0)
+        _safe_deallocate(_grg2)
 
         # grad_slot_decay = sum(grad_slots_pre_norm * slots_in)
         grad_slot_decay = ttnn.mul(grad_slots_pre_norm, c["slots_in"])
-        grad_slot_decay = ttnn.sum(ttnn.sum(ttnn.sum(grad_slot_decay, dim=0), dim=0), dim=0)
+        # REVIEWED: nested sum reassignment leak — deallocate intermediates.
+        _gsd = ttnn.sum(grad_slot_decay, dim=0)
+        _safe_deallocate(grad_slot_decay)
+        _gsd2 = ttnn.sum(_gsd, dim=0)
+        _safe_deallocate(_gsd)
+        grad_slot_decay = ttnn.sum(_gsd2, dim=0)
+        _safe_deallocate(_gsd2)
 
         # --- Backward through read_out_proj = linear(read_out) ---
         grad_read_out = ttnn.linear(grad_read_out_proj, ttnn.transpose(self.read_out_weight, 0, 1))
@@ -2615,7 +3062,11 @@ class TTWorkspaceModule:
         rv = c["rv"]
         grad_read_attn = ttnn.matmul(grad_read_out_4d, ttnn.transpose(rv, -2, -1))  # (B, H, m, T)
         if extra_grad_read_attn is not None:
-            grad_read_attn = ttnn.add(grad_read_attn, extra_grad_read_attn)
+            # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+            _gra = ttnn.add(grad_read_attn, extra_grad_read_attn)
+            _safe_deallocate(grad_read_attn)
+            _safe_deallocate(extra_grad_read_attn)
+            grad_read_attn = _gra
         grad_rv = ttnn.matmul(ttnn.transpose(c["read_attn"], -2, -1), grad_read_out_4d)  # (B, H, T, d_h)
 
         # --- Backward through read_attn = softmax(read_scores * read_qk_scale) ---
@@ -2626,7 +3077,11 @@ class TTWorkspaceModule:
         read_mask = c["read_mask"]
         zeros_read = ttnn.zeros((B, H, m, T), dtype=ttnn.bfloat16,
                                  layout=ttnn.TILE_LAYOUT, device=device)
-        grad_read_scores = ttnn.where(read_mask, grad_read_scores, zeros_read)
+        # REVIEWED: reassignment leak — ttnn.where creates a new tensor.
+        _grs = ttnn.where(read_mask, grad_read_scores, zeros_read)
+        _safe_deallocate(grad_read_scores)
+        grad_read_scores = _grs
+        _safe_deallocate(zeros_read)
 
         # grad_qk_scale = sum(d(L)/d(scores) * scores_pre) — compute BEFORE
         # scaling (see the identical note in the write-pass backward above:
@@ -2637,18 +3092,29 @@ class TTWorkspaceModule:
         rk_norm = self._l2_normalize_heads(rk, B, H, T)
         read_scores_pre = ttnn.matmul(rq_norm, ttnn.transpose(rk_norm, -2, -1))
         # ttnn.sum with no `dim` reduces over ALL dims -> scalar (read_qk_scale is a scalar param).
-        grad_read_qk_scale = ttnn.sum(ttnn.mul(grad_read_scores, read_scores_pre))
+        _grs_mul = ttnn.mul(grad_read_scores, read_scores_pre)
+        grad_read_qk_scale = ttnn.sum(_grs_mul)
+        _safe_deallocate(_grs_mul)
+        _safe_deallocate(read_scores_pre)
 
         # Now scale: d(L)/d(scores_pre) = d(L)/d(scores) * qk_scale
-        grad_read_scores = ttnn.mul(grad_read_scores, self.read_qk_scale)
+        # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
+        _grs_scaled = ttnn.mul(grad_read_scores, self.read_qk_scale)
+        _safe_deallocate(grad_read_scores)
+        grad_read_scores = _grs_scaled
 
         # grad_rq_norm = d(L)/d(scores_pre) @ rk_norm, etc.
         grad_rq_norm = ttnn.matmul(grad_read_scores, rk_norm)               # (B, H, m, d_h)
         grad_rk_norm = ttnn.matmul(ttnn.transpose(grad_read_scores, -2, -1), rq_norm)  # (B, H, T, d_h)
+        _safe_deallocate(rq_norm)
+        _safe_deallocate(rk_norm)
 
         # --- Backward through QK-Norm: rq_norm = L2_normalize(rq), rk_norm = L2_normalize(rk) ---
         grad_rq = self._l2_normalize_backward(grad_rq_norm, rq, B, H, m)
         grad_rk = self._l2_normalize_backward(grad_rk_norm, rk, B, H, T)
+        # REVIEWED: grad_rq_norm/grad_rk_norm no longer needed after backward.
+        _safe_deallocate(grad_rq_norm)
+        _safe_deallocate(grad_rk_norm)
 
         # --- Backward through read projections ---
         grad_rq_3d = self._reshape_from_heads(grad_rq, B, m)
@@ -2669,8 +3135,19 @@ class TTWorkspaceModule:
         grad_x_from_rv = ttnn.reshape(ttnn.matmul(grad_rv_2d, ttnn.transpose(self.read_v_weight, 0, 1)), [B, T, D])
 
         # --- Total gradients ---
-        grad_x = ttnn.add(ttnn.add(grad_x_from_write, grad_x_from_wq), ttnn.add(grad_x_from_rk, grad_x_from_rv))
+        # REVIEWED: intermediate tensors must be explicitly deallocated.
+        _gx_write_wq = ttnn.add(grad_x_from_write, grad_x_from_wq)
+        _safe_deallocate(grad_x_from_write)
+        _safe_deallocate(grad_x_from_wq)
+        _gx_rk_rv = ttnn.add(grad_x_from_rk, grad_x_from_rv)
+        _safe_deallocate(grad_x_from_rk)
+        _safe_deallocate(grad_x_from_rv)
+        grad_x = ttnn.add(_gx_write_wq, _gx_rk_rv)
+        _safe_deallocate(_gx_write_wq)
+        _safe_deallocate(_gx_rk_rv)
         grad_slots_in = ttnn.add(grad_slots_in_from_read, grad_slots_from_rq)
+        _safe_deallocate(grad_slots_in_from_read)
+        _safe_deallocate(grad_slots_from_rq)
 
         # Un-permute grad_slots_in if slot permutation was applied in forward.
         # The forward did: slots_permuted = slots_original[perm]
@@ -2681,6 +3158,8 @@ class TTWorkspaceModule:
             inv_perm = torch.argsort(slot_perm)
             grad_slots_in_host = ttnn.to_torch(grad_slots_in)  # (B, m, D)
             grad_slots_in_host = grad_slots_in_host[:, inv_perm, :]  # un-permute slot dim
+            # REVIEWED: reassignment leak — old grad_slots_in is a device tensor.
+            _safe_deallocate(grad_slots_in)
             grad_slots_in = to_device(grad_slots_in_host, device)
 
         # If slots_in was from learned slot embeddings (slot_state was None), accumulate grad into slots param
@@ -2758,6 +3237,15 @@ class TTWorkspaceModule:
             "write_q_weight", "write_k_weight", "write_v_weight", "write_out_weight",
         ]
 
+        eps_tt = ttnn.from_torch(
+            torch.tensor([1e-6], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        bound_tt = ttnn.from_torch(
+            torch.tensor([self.spectral_norm_bound], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+
         for name in weight_names:
             W = getattr(self, name)  # (D, D) ttnn tensor
             D = self.d_model
@@ -2769,67 +3257,107 @@ class TTWorkspaceModule:
                 torch.randn(D, 1, dtype=torch.bfloat16) / math.sqrt(D),
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
             )
+            Wt = ttnn.transpose(W, 0, 1)  # cache transpose outside loop
 
             for _ in range(10):
                 # u = W @ v, then normalize
                 u = ttnn.matmul(W, v)  # (D, 1)
-                u_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(u, u)))  # scalar
-                u_norm = ttnn.maximum(u_norm, ttnn.from_torch(
-                    torch.tensor([1e-6], dtype=torch.bfloat16),
-                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-                ))
-                u = ttnn.mul(u, ttnn.reciprocal(u_norm))
+                u_sq = ttnn.mul(u, u)
+                u_norm = ttnn.sqrt(ttnn.sum(u_sq))
+                _safe_deallocate(u_sq)
+                u_norm_c = ttnn.maximum(u_norm, eps_tt)
+                _safe_deallocate(u_norm)
+                u_recip = ttnn.reciprocal(u_norm_c)
+                _safe_deallocate(u_norm_c)
+                u_new = ttnn.mul(u, u_recip)
+                _safe_deallocate(u)
+                _safe_deallocate(u_recip)
+                u = u_new
 
                 # v = W^T @ u, then normalize
-                v = ttnn.matmul(ttnn.transpose(W, 0, 1), u)  # (D, 1)
-                v_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(v, v)))
-                v_norm = ttnn.maximum(v_norm, ttnn.from_torch(
-                    torch.tensor([1e-6], dtype=torch.bfloat16),
-                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-                ))
-                v = ttnn.mul(v, ttnn.reciprocal(v_norm))
+                v_new = ttnn.matmul(Wt, u)  # (D, 1)
+                v_sq = ttnn.mul(v_new, v_new)
+                v_norm = ttnn.sqrt(ttnn.sum(v_sq))
+                _safe_deallocate(v_sq)
+                v_norm_c = ttnn.maximum(v_norm, eps_tt)
+                _safe_deallocate(v_norm)
+                v_recip = ttnn.reciprocal(v_norm_c)
+                _safe_deallocate(v_norm_c)
+                v_result = ttnn.mul(v_new, v_recip)
+                _safe_deallocate(v)
+                _safe_deallocate(v_new)
+                _safe_deallocate(v_recip)
+                v = v_result
+            _safe_deallocate(Wt)
+            _safe_deallocate(u)
 
             # σ_max = ||W @ v|| (v is now the top right singular vector)
             Wv = ttnn.matmul(W, v)  # (D, 1)
-            sigma = ttnn.sqrt(ttnn.sum(ttnn.mul(Wv, Wv)))
-            # Clamp sigma to avoid division by zero
-            sigma = ttnn.maximum(sigma, ttnn.from_torch(
-                torch.tensor([1e-6], dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-            ))
+            Wv_sq = ttnn.mul(Wv, Wv)
+            sigma = ttnn.sqrt(ttnn.sum(Wv_sq))
+            _safe_deallocate(Wv_sq)
+            sigma_c = ttnn.maximum(sigma, eps_tt)
+            _safe_deallocate(sigma)
 
             # Cap spectral norm at bound: if sigma > bound, scale down to bound.
             # If sigma <= bound, leave weights unchanged (cap, not target).
             # This lets the optimizer grow weights naturally up to the bound,
             # and prevents a sudden scaling jump when resuming from a checkpoint
             # saved with a different (or no) bound.
-            bound_tt = ttnn.from_torch(
-                torch.tensor([self.spectral_norm_bound], dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-            )
             # scale = min(1, bound/sigma) = bound / max(bound, sigma)
-            scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma)))
+            scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma_c)))
             W_normalized = ttnn.mul(W, scale_factor)
             _safe_deallocate(getattr(self, name))
             setattr(self, name, W_normalized)
             # Deallocate intermediates from power iteration
             _safe_deallocate(v)
-            _safe_deallocate(v_norm)
             _safe_deallocate(Wv)
-            _safe_deallocate(sigma)
-            _safe_deallocate(bound_tt)
+            _safe_deallocate(sigma_c)
             _safe_deallocate(scale_factor)
+
+        _safe_deallocate(eps_tt)
+        _safe_deallocate(bound_tt)
 
     def clear_caches(self):
         """Clear cached tensors from the last forward pass.
 
-        The cache contains references to both intermediates and model parameters
-        (gates, slots).  We just drop references and let gc.collect() reclaim
-        the intermediates.  Model parameters survive because they're still
+        Explicitly deallocate cached intermediates to free device buffers.
+        Model parameters (gates, slots, weights) survive because they're still
         referenced by self.read_gate, self.slots, etc.
         """
+        # Persistent tensors stored in cache that must NOT be deallocated:
+        # slots_in = self.slots (parameter), read_gate_val = self.read_gate,
+        # write_gate_val = self.write_gate
+        # REVIEWED: also exclude cached causal masks (stored in _mask_cache).
+        _persistent_ids = set()
+        if hasattr(self, 'slots') and self.slots is not None:
+            _persistent_ids.add(id(self.slots))
+        if hasattr(self, 'read_gate') and self.read_gate is not None:
+            _persistent_ids.add(id(self.read_gate))
+        if hasattr(self, 'write_gate') and self.write_gate is not None:
+            _persistent_ids.add(id(self.write_gate))
+        # Add cached causal mask tensors to persistent set
+        if hasattr(self, '_mask_cache'):
+            for rm, wm in self._mask_cache.values():
+                _persistent_ids.add(id(rm))
+                _persistent_ids.add(id(wm))
+        # Deallocate backward cache intermediates
+        for k, v in self._cache.items():
+            if id(v) not in _persistent_ids and hasattr(v, 'shape'):
+                _safe_deallocate(v)
         self._cache = {}
+        # Deallocate cache history from recurrent core iterations
+        self._deallocate_cache_history()
+        # Deallocate forward caches (regularizer intermediates)
+        for fc in self._forward_caches:
+            for k, v in fc.items():
+                if id(v) not in _persistent_ids and hasattr(v, 'shape'):
+                    _safe_deallocate(v)
         self._forward_caches = []
+        # REVIEWED: clear any unconsumed regularizer gradients (host-side
+        # PyTorch tensors). These should normally be empty after backward,
+        # but if forward/backward call counts mismatch, items can remain.
+        self._reg_grads = None
 
     def set_params(self, params: Dict[str, "ttnn.Tensor"]):
         # NOTE: params are matched to attributes generically via `hasattr` —
@@ -2906,6 +3434,16 @@ class AttentionResidual:
         # Cache for backward
         self._cache = {}
 
+    def _deallocate_cache(self):
+        """Deallocate cached intermediates, excluding persistent tensors."""
+        if not self._cache:
+            return
+        _skip_keys = {"query_b", "K_active", "B", "T", "D"}
+        for k, v in self._cache.items():
+            if k not in _skip_keys and hasattr(v, 'shape'):
+                _safe_deallocate(v)
+        self._cache = {}
+
     def _mask_scores(self, scores_list, K_active, B, T):
         """Apply mask to scores: set inactive iteration scores to -1e4.
 
@@ -2947,14 +3485,17 @@ class AttentionResidual:
         query_b = ttnn.reshape(self.query, [1, 1, D])
 
         # Compute scores: score_k = sum_d(x_k * query) for each (B, T) position
+        # REVIEWED: intermediates must be explicitly deallocated.
         scores_list = []
         scores_pre_scale = []  # before scale (for backward)
         for k, x_k in enumerate(x_outputs):
             # x_k: (B, T, D), query_b: (1, 1, D) → broadcast mul → (B, T, D)
             xq = ttnn.mul(x_k, query_b)  # (B, T, D)
             score_k = ttnn.sum(xq, dim=-1)  # (B, T) — drops last dim
+            _safe_deallocate(xq)
             # Reshape to (B, T, 1) for concat
             B_k, T_k = int(score_k.shape[0]), int(score_k.shape[1])
+            # REVIEWED: reshape may return a view — do NOT deallocate score_k.
             score_k = ttnn.reshape(score_k, [B_k, T_k, 1])
             scores_pre_scale.append(score_k)
             # Apply scale
@@ -2963,12 +3504,25 @@ class AttentionResidual:
 
         # Mask inactive iterations
         scores_masked = self._mask_scores(scores_list, K_active, int(x_outputs[0].shape[0]), int(x_outputs[0].shape[1]))
+        # REVIEWED: _mask_scores returns the same tensors for active iterations
+        # and new ttnn.full tensors for inactive ones. The original scaled scores
+        # for active iterations are now referenced by scores_masked, so we can
+        # safely deallocate the scores_list entries for inactive iterations
+        # (they've been replaced by ttnn.full tensors). However, since
+        # scores_masked[k] IS scores_list[k] for k <= K_active (same object),
+        # we must NOT deallocate those. The inactive ones (k > K_active) in
+        # scores_list are not referenced by scores_masked, so deallocate them.
+        for k in range(K_active + 1, len(scores_list)):
+            _safe_deallocate(scores_list[k])
 
         # Concat scores: (B, T, n_outputs)
         scores = ttnn.concat(scores_masked, dim=-1)
+        # REVIEWED: scores_masked items may be views/aliases — do NOT deallocate
+        # them individually. They'll be cleaned up in _deallocate_cache.
 
         # Softmax over the n_outputs dimension
         alpha = ttnn.softmax(scores, dim=-1)  # (B, T, n_outputs)
+        _safe_deallocate(scores)
 
         # Weighted sum: x_final = sum_k alpha_k * x_k
         B, T = int(x_outputs[0].shape[0]), int(x_outputs[0].shape[1])
@@ -2978,10 +3532,15 @@ class AttentionResidual:
             alpha_k = ttnn.slice(alpha, [0, 0, k], [B, T, k + 1])  # (B, T, 1)
             # Broadcast multiply: (B, T, D) * (B, T, 1) → (B, T, D)
             term = ttnn.mul(x_k, alpha_k)
+            _safe_deallocate(alpha_k)
             if x_final is None:
                 x_final = term
             else:
-                x_final = ttnn.add(x_final, term)
+                # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+                _xf_new = ttnn.add(x_final, term)
+                _safe_deallocate(x_final)
+                _safe_deallocate(term)
+                x_final = _xf_new
 
         # Cache for backward
         self._cache = {
@@ -3020,12 +3579,15 @@ class AttentionResidual:
         # --- Through x_final = sum_k alpha_k * x_k ---
         # grad_alpha_k = sum_d(grad_x_final * x_k) → (B, T, 1) per k
         # grad_x_k_from_v = alpha_k * grad_x_final → (B, T, D)
+        # REVIEWED: intermediates must be explicitly deallocated.
         grad_alpha_list = []
         grad_x_from_v = []
         for k, x_k in enumerate(x_outputs):
             # grad_alpha_k = (grad_x_final * x_k).sum(dim=-1)
             gx_xk = ttnn.mul(grad_x_final, x_k)  # (B, T, D)
             grad_alpha_k = ttnn.sum(gx_xk, dim=-1)  # (B, T)
+            _safe_deallocate(gx_xk)
+            # REVIEWED: reshape may return a view — do NOT deallocate grad_alpha_k.
             grad_alpha_k = ttnn.reshape(grad_alpha_k, [B, T, 1])
             grad_alpha_list.append(grad_alpha_k)
 
@@ -3039,10 +3601,17 @@ class AttentionResidual:
 
         # --- Through alpha = softmax(scores_masked) ---
         # Manual softmax backward: grad_scores = (grad_alpha - sum(grad_alpha*alpha, -1, keepdim)) * alpha
-        grad_sum = ttnn.sum(ttnn.mul(grad_alpha, alpha), dim=-1)  # (B, T)
+        # REVIEWED: intermediates must be explicitly deallocated.
+        _ga_mul = ttnn.mul(grad_alpha, alpha)
+        grad_sum = ttnn.sum(_ga_mul, dim=-1)  # (B, T)
+        _safe_deallocate(_ga_mul)
+        # REVIEWED: reshape/expand may return views — do NOT deallocate grad_sum.
         grad_sum = ttnn.reshape(grad_sum, [B, T, 1])
         grad_sum = ttnn.expand(grad_sum, [B, T, n_outputs])
-        grad_scores = ttnn.mul(ttnn.sub(grad_alpha, grad_sum), alpha)  # (B, T, n_outputs)
+        _ga_sub = ttnn.sub(grad_alpha, grad_sum)
+        _safe_deallocate(grad_sum)
+        grad_scores = ttnn.mul(_ga_sub, alpha)  # (B, T, n_outputs)
+        _safe_deallocate(_ga_sub)
 
         # --- Through scores_masked = scores_list * mask_or_keep ---
         # For active k: scores_masked_k = scores_list_k (no change)
@@ -3059,7 +3628,14 @@ class AttentionResidual:
             grad_score_k = ttnn.slice(grad_scores, [0, 0, k], [B, T, k + 1])  # (B, T, 1)
             if k <= K_active:
                 # grad_scale += grad_score_k * scores_pre_scale_k
-                grad_scale = ttnn.add(grad_scale, ttnn.sum(ttnn.mul(grad_score_k, scores_pre_scale[k])))
+                # REVIEWED: reassignment + intermediate leak.
+                _gs_mul = ttnn.mul(grad_score_k, scores_pre_scale[k])
+                _gs_sum = ttnn.sum(_gs_mul)
+                _safe_deallocate(_gs_mul)
+                _gs_new = ttnn.add(grad_scale, _gs_sum)
+                _safe_deallocate(grad_scale)
+                _safe_deallocate(_gs_sum)
+                grad_scale = _gs_new
                 # grad_scores_pre_scale_k = grad_score_k * scale
                 grad_spk = ttnn.mul(grad_score_k, self.scale)
             else:
@@ -3084,17 +3660,24 @@ class AttentionResidual:
             # grad_query += sum over (B, T) of grad_spk * x_k
             # grad_spk: (B, T, 1), x_k: (B, T, D) → mul → (B, T, D) → sum to (1, D)
             gq_term = ttnn.mul(grad_spk, x_k)  # (B, T, D)
-            # Sum over B and T dims
-            gq_term = ttnn.sum(gq_term, dim=0)  # (T, D) — wait, sum over dim=0
-            # Actually ttnn.sum reduces the specified dim. Need to sum over B (dim 0) and T (dim 1)
-            # After sum dim=0: shape depends on ttnn behavior. Let's sum both dims.
-            gq_term = ttnn.sum(gq_term, dim=0)  # sum remaining batch/spatial dim
-            # Reshape to (1, D) for accumulation
-            gq_term = ttnn.reshape(gq_term, [1, D])
-            grad_query = ttnn.add(grad_query, gq_term)
+            # REVIEWED: nested sum reassignment leak — deallocate intermediates.
+            gq_term_2 = ttnn.sum(gq_term, dim=0)
+            _safe_deallocate(gq_term)
+            gq_term_3 = ttnn.sum(gq_term_2, dim=0)
+            _safe_deallocate(gq_term_2)
+            # REVIEWED: reshape may return a view — do NOT deallocate gq_term_3.
+            gq_term = ttnn.reshape(gq_term_3, [1, D])
+            # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+            _gq_new = ttnn.add(grad_query, gq_term)
+            _safe_deallocate(grad_query)
+            _safe_deallocate(gq_term)
+            grad_query = _gq_new
 
             # Total grad_x_k = grad_x_k_from_v + grad_x_k_from_score
+            # REVIEWED: intermediate grad_xk_s must be deallocated after add.
             grad_x_k = ttnn.add(grad_x_from_v[k], grad_xk_s)
+            _safe_deallocate(grad_xk_s)
+            _safe_deallocate(grad_x_from_v[k])
             grad_x_list.append(grad_x_k)
 
         grads = {
@@ -3107,10 +3690,17 @@ class AttentionResidual:
     def clear_caches(self):
         """Clear cached tensors from the last forward pass.
 
-        Just drop references — gc.collect() in the training loop reclaims
-        intermediates.  Model parameters (query, scale) survive because
+        Explicitly deallocate cached intermediates (x_outputs, scores, alphas)
+        to free device buffers. Model parameters (query, scale) survive because
         they're still referenced by self.query, self.scale.
         """
+        # query_b is a reshape of self.query (parameter) — may share the same
+        # device buffer. Deallocating it would free self.query's buffer.
+        # K_active, B, T, D are ints (not tensors).
+        _skip_keys = {"query_b", "K_active", "B", "T", "D"}
+        for k, v in self._cache.items():
+            if k not in _skip_keys and hasattr(v, 'shape'):
+                _safe_deallocate(v)
         self._cache = {}
 
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
@@ -3195,11 +3785,13 @@ class TTMambaWorkspaceModel:
         self._cached_input_ids = input_ids
 
         # Embedding lookup
+        # REVIEWED: indices is a temporary device tensor — deallocate after embedding.
         indices = ttnn.from_torch(
             input_ids.to(torch.int32),
             dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device
         )
         x = ttnn.embedding(indices, self.token_emb_weight, layout=ttnn.TILE_LAYOUT)  # (B, T, d_model)
+        _safe_deallocate(indices)
 
         # Determine K for recurrent core
         if config.recurrent_core:
@@ -3353,34 +3945,41 @@ class TTMambaWorkspaceModel:
 
                     # Blend: active iterations partially update state (1/sqrt(K) scaling),
                     # padding iterations keep old state.
+                    # REVIEWED: intermediates must be explicitly deallocated.
+                    # Compute ones - active_tt once and reuse for both x and slot paths.
+                    ones_tt = ttnn.from_torch(
+                        torch.tensor([1.0], dtype=torch.bfloat16),
+                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+                    one_minus_active = ttnn.sub(ones_tt, active_tt)
+                    _safe_deallocate(ones_tt)
+
+                    # x = blend * x_new + (1 - blend) * x
+                    _a_xn = ttnn.mul(active_tt, x_new)
+                    _oma_x = ttnn.mul(one_minus_active, x)
+                    x_new_blended = ttnn.add(_a_xn, _oma_x)
+                    _safe_deallocate(_a_xn)
+                    _safe_deallocate(_oma_x)
+
                     if slot_state is None:
-                        # First iteration is always active (K >= 1)
-                        # Use scaled blend: x = blend * x_new + (1 - blend) * x
-                        x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
-                            ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                           dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                            active_tt), x))
                         slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
-                                              ttnn.mul(ttnn.sub(
-                                                  ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                                                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                                                  active_tt), slot_state_new))
+                                              ttnn.mul(one_minus_active, slot_state_new))
                     else:
-                        # x = blend * x_new + (1 - blend) * x
-                        x = ttnn.add(ttnn.mul(active_tt, x_new), ttnn.mul(ttnn.sub(
-                            ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                           dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                            active_tt), x))
-                        slot_state = ttnn.add(ttnn.mul(active_tt, slot_state_new),
-                                              ttnn.mul(ttnn.sub(
-                                                  ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                                                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                                                  active_tt), slot_state))
+                        _a_sn = ttnn.mul(active_tt, slot_state_new)
+                        _oma_s = ttnn.mul(one_minus_active, slot_state)
+                        slot_state_new_blended = ttnn.add(_a_sn, _oma_s)
+                        _safe_deallocate(_a_sn)
+                        _safe_deallocate(_oma_s)
+                        slot_state = slot_state_new_blended
+
+                    _safe_deallocate(one_minus_active)
+                    # Deallocate old x and slot_state_new (replaced by blended versions)
+                    _safe_deallocate(x_new)
+                    _safe_deallocate(slot_state_new)
+                    x = x_new_blended
 
                     self._core_blend_info.append({
                         "iteration": iteration, "active": active,
-                        "active_tt": active_tt,
-                        "slot_scale_tt": slot_scale_tt,
+                        "active_tt": active_tt, "slot_scale_tt": slot_scale_tt,
                     })
 
         # --- Phase 3: post-core layers (core_end..n_layers-1) ---
@@ -3400,6 +3999,8 @@ class TTMambaWorkspaceModel:
         x = self.norm.forward(x)
 
         # LM head (weight-tied: weight = embedding weight transposed)
+        # REVIEWED: ttnn.transpose may return a view of self.lm_head_weight
+        # (persistent parameter) — do NOT deallocate lm_head_w.
         lm_head_w = ttnn.transpose(self.lm_head_weight, 0, 1)  # (d_model, vocab_size)
         logits = ttnn.linear(x, lm_head_w)  # (B, T, vocab_size)
 
@@ -3555,9 +4156,13 @@ class TTMambaWorkspaceModel:
         grad_logits_2d = ttnn.reshape(grad_logits, [B * T, config.vocab_size])  # (B*T, V)
         # grad_lm_head = x_pre_2d^T @ grad_logits_2d = (d, B*T) @ (B*T, V) = (d, V)
         grad_lm_head = ttnn.matmul(ttnn.transpose(x_pre_2d, 0, 1), grad_logits_2d)  # (d, V)
+        # NOTE: Do NOT deallocate x_pre_2d or grad_logits_2d — ttnn.reshape()
+        # may return a view sharing the same device buffer as the original.
+        # Deallocating would free x_pre (needed by norm.backward) or grad_logits.
 
         # --- Backward through final RMS norm (on device using TTRMSNorm.backward) ---
         grad_x, grad_norm_w = self.norm.backward(grad_x_normed, x_pre)
+        _safe_deallocate(grad_x_normed)
 
         all_grads = {}
 
@@ -3566,7 +4171,10 @@ class TTMambaWorkspaceModel:
             for k, v in grads_dict.items():
                 key = f"layer_{layer_idx}_{k}"
                 if key in all_grads:
-                    all_grads[key] = ttnn.add(all_grads[key], v)
+                    old = all_grads[key]
+                    all_grads[key] = ttnn.add(old, v)
+                    _safe_deallocate(old)
+                    _safe_deallocate(v)
                 else:
                     all_grads[key] = v
 
@@ -3574,7 +4182,10 @@ class TTMambaWorkspaceModel:
             for k, v in grads_dict.items():
                 key = f"ws_{k}"
                 if key in all_grads:
-                    all_grads[key] = ttnn.add(all_grads[key], v)
+                    old = all_grads[key]
+                    all_grads[key] = ttnn.add(old, v)
+                    _safe_deallocate(old)
+                    _safe_deallocate(v)
                 else:
                     all_grads[key] = v
 
@@ -3640,12 +4251,19 @@ class TTMambaWorkspaceModel:
                 accum_ws_grads(ws_grads)
                 if was_none:
                     grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
+                    _safe_deallocate(grad_slots_in)
                     if "ws_slots" in all_grads:
-                        all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                        old_slots_grad = all_grads["ws_slots"]
+                        all_grads["ws_slots"] = ttnn.add(old_slots_grad, grad_slots_param)
+                        _safe_deallocate(old_slots_grad)
+                        _safe_deallocate(grad_slots_param)
                     else:
                         all_grads["ws_slots"] = grad_slots_param
                     grad_slot_state = None
                 else:
+                    # REVIEWED: old grad_slot_state is being orphaned — deallocate it.
+                    if grad_slot_state is not None:
+                        _safe_deallocate(grad_slot_state)
                     grad_slot_state = grad_slots_in
 
         # --- Backward through recurrent core (reverse iterations) ---
@@ -3717,7 +4335,14 @@ class TTMambaWorkspaceModel:
                     else:
                         # Scale chained gradient by 1/(K*safety) (slot_scale_tt
                         # for active iterations) before adding AR gradient
-                        grad_x = ttnn.add(ttnn.mul(slot_scale_tt, grad_x), ar_grad_x)
+                        scaled_chain = ttnn.mul(slot_scale_tt, grad_x)
+                        _safe_deallocate(grad_x)
+                        # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+                        # ar_grad_x is consumed and must be deallocated.
+                        _gx_new = ttnn.add(scaled_chain, ar_grad_x)
+                        _safe_deallocate(scaled_chain)
+                        _safe_deallocate(ar_grad_x)
+                        grad_x = _gx_new
 
                     # Backward through this iteration's entries (reverse)
                     # No blend — grad_x flows directly through core layers
@@ -3741,18 +4366,30 @@ class TTMambaWorkspaceModel:
                             accum_ws_grads(ws_grads)
                             if was_none:
                                 grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
+                                _safe_deallocate(grad_slots_in)
                                 if "ws_slots" in all_grads:
-                                    all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                                    old = all_grads["ws_slots"]
+                                    all_grads["ws_slots"] = ttnn.add(old, grad_slots_param)
+                                    _safe_deallocate(old)
+                                    _safe_deallocate(grad_slots_param)
                                 else:
                                     all_grads["ws_slots"] = grad_slots_param
                                 grad_slot_state = None
                             else:
                                 # Scale grad_slots_in by 1/K before chaining
                                 # (same as blend path — dampens slot chain amplification)
+                                # REVIEWED: reassignment leak — old grad_slot_state must be deallocated.
+                                if grad_slot_state is not None:
+                                    _safe_deallocate(grad_slot_state)
                                 grad_slot_state = ttnn.mul(slot_scale_tt, grad_slots_in)
+                                _safe_deallocate(grad_slots_in)
 
                 # After all iterations, add AR gradient for x_0 (pre-core output)
-                grad_x = ttnn.add(grad_x, grad_x_list[0])
+                # REVIEWED: grad_x_list[0] is consumed — deallocate it.
+                grad_x_final = ttnn.add(grad_x, grad_x_list[0])
+                _safe_deallocate(grad_x)
+                _safe_deallocate(grad_x_list[0])
+                grad_x = grad_x_final
 
             else:
                 # === Fixed blend core backward (original) ===
@@ -3802,13 +4439,19 @@ class TTMambaWorkspaceModel:
                     # grad_x_new = blend * grad_x  (flows into core layers)
                     # grad_x_old = (1 - blend) * grad_x  (flows to previous iteration or pre-core)
                     grad_x_new = ttnn.mul(active_tt, grad_x)
-                    grad_x_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_x)
+                    _safe_deallocate(grad_x)
+                    # REVIEWED: compute one_minus_active once, use for both x and slot paths.
+                    one_minus_active = ttnn.sub(ones_tt, active_tt)
+                    grad_x_old = ttnn.mul(one_minus_active, grad_x_new)
                     grad_slot_new = ttnn.mul(active_tt, grad_slot_state) if grad_slot_state is not None else None
-                    grad_slot_old = ttnn.mul(ttnn.sub(ones_tt, active_tt), grad_slot_state) if grad_slot_state is not None else None
+                    grad_slot_old = ttnn.mul(one_minus_active, grad_slot_state) if grad_slot_state is not None else None
+                    _safe_deallocate(one_minus_active)
                     # grad_x for the core iteration = grad_x_new
                     # grad_x_old accumulates into the previous iteration's output
                     grad_x = grad_x_new
                     if grad_slot_old is not None:
+                        # REVIEWED: old grad_slot_state is being orphaned — deallocate it.
+                        _safe_deallocate(grad_slot_state)
                         grad_slot_state = grad_slot_new
                         # grad_slot_old will be added to the previous iteration's grad
                         self._pending_grad_slot_old = grad_slot_old
@@ -3837,8 +4480,12 @@ class TTMambaWorkspaceModel:
                             accum_ws_grads(ws_grads)
                             if was_none:
                                 grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
+                                _safe_deallocate(grad_slots_in)
                                 if "ws_slots" in all_grads:
-                                    all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                                    old = all_grads["ws_slots"]
+                                    all_grads["ws_slots"] = ttnn.add(old, grad_slots_param)
+                                    _safe_deallocate(old)
+                                    _safe_deallocate(grad_slots_param)
                                 else:
                                     all_grads["ws_slots"] = grad_slots_param
                                 grad_slot_state = None
@@ -3852,18 +4499,28 @@ class TTMambaWorkspaceModel:
                                 # which is ≤1 for A ≤ sqrt(K) — much more robust than
                                 # the 1/sqrt(K) scaling which required A ≤ sqrt(K)
                                 # for the gain to be ≤1.
+                                # REVIEWED: reassignment leak — old grad_slot_state must be deallocated.
+                                if grad_slot_state is not None:
+                                    _safe_deallocate(grad_slot_state)
                                 grad_slot_state = ttnn.mul(slot_scale_tt, grad_slots_in)
+                                _safe_deallocate(grad_slots_in)
 
                     # After processing this iteration, add grad_x_old from blend.
                     # For iter_num > 0, grad_x_old flows to the previous iteration.
                     # For iter_num == 0, grad_x_old flows to the pre-core layers
                     # (it will be picked up by the pre-core backward below).
-                    grad_x = ttnn.add(grad_x, grad_x_old)
+                    grad_x_summed = ttnn.add(grad_x, grad_x_old)
+                    _safe_deallocate(grad_x)
+                    _safe_deallocate(grad_x_old)
+                    grad_x = grad_x_summed
                     if hasattr(self, '_pending_grad_slot_old') and self._pending_grad_slot_old is not None:
                         if grad_slot_state is None:
                             grad_slot_state = self._pending_grad_slot_old
                         else:
+                            old_slot_state = grad_slot_state
                             grad_slot_state = ttnn.add(grad_slot_state, self._pending_grad_slot_old)
+                            _safe_deallocate(old_slot_state)
+                            _safe_deallocate(self._pending_grad_slot_old)
                     self._pending_grad_slot_old = None
 
         # --- Backward through pre-core layers (reverse) ---
@@ -3886,12 +4543,19 @@ class TTMambaWorkspaceModel:
                 accum_ws_grads(ws_grads)
                 if was_none:
                     grad_slots_param = ttnn.sum(grad_slots_in, dim=0)
+                    _safe_deallocate(grad_slots_in)
                     if "ws_slots" in all_grads:
-                        all_grads["ws_slots"] = ttnn.add(all_grads["ws_slots"], grad_slots_param)
+                        old_slots_grad = all_grads["ws_slots"]
+                        all_grads["ws_slots"] = ttnn.add(old_slots_grad, grad_slots_param)
+                        _safe_deallocate(old_slots_grad)
+                        _safe_deallocate(grad_slots_param)
                     else:
                         all_grads["ws_slots"] = grad_slots_param
                     grad_slot_state = None
                 else:
+                    # REVIEWED: old grad_slot_state is being orphaned — deallocate it.
+                    if grad_slot_state is not None:
+                        _safe_deallocate(grad_slot_state)
                     grad_slot_state = grad_slots_in
 
         # --- Backward through embedding (on device via one-hot matmul) ---
@@ -3916,13 +4580,24 @@ class TTMambaWorkspaceModel:
 
         # grad_emb = one_hot^T @ grad_x_2d = (V, B*T) @ (B*T, d) = (V, d)
         grad_emb = ttnn.matmul(ttnn.transpose(one_hot, 0, 1), grad_x_2d)  # (V, d)
+        # NOTE: Do NOT deallocate one_hot, grad_x_2d, or the transpose results —
+        # ttnn.reshape/transpose may return views sharing the same device buffer.
 
         # Add LM head gradient (weight-tied): grad_emb += grad_lm_head^T
         # grad_lm_head is (d, V), so grad_lm_head^T is (V, d)
-        grad_emb = ttnn.add(grad_emb, ttnn.transpose(grad_lm_head, 0, 1))
+        # REVIEWED: transpose may return a view — do NOT deallocate grad_lm_head_t
+        # (would free grad_lm_head which is returned in all_grads).
+        grad_lm_head_t = ttnn.transpose(grad_lm_head, 0, 1)
+        # REVIEWED: reassignment leak — ttnn.add creates a new tensor.
+        _ge_new = ttnn.add(grad_emb, grad_lm_head_t)
+        _safe_deallocate(grad_emb)
+        grad_emb = _ge_new
 
         all_grads["token_emb_weight"] = grad_emb
         all_grads["norm_weight"] = grad_norm_w
+
+        # Deallocate the ones_tt created for blend backward
+        _safe_deallocate(ones_tt)
 
         # If gamma is frozen, drop gamma gradients so they don't enter
         # clip_grad_norm or the optimizer.  The backward pass still computes
@@ -3940,20 +4615,43 @@ class TTMambaWorkspaceModel:
     def clear_caches(self):
         """Clear all cached tensors from the last forward/backward pass.
 
-        Call this after backward() completes to drop references to intermediate
-        tensors that each layer cached for backward.  gc.collect() (called in
-        the training loop) then reclaims the device memory for intermediates
-        that are no longer referenced.  Model parameters survive because they're
-        still referenced by self.token_emb_weight, self.layers[i].gate, etc.
+        Explicitly deallocates cached intermediates to free device buffers,
+        then drops references. Model parameters survive because they're still
+        referenced by self.token_emb_weight, self.layers[i].gate, etc.
         """
+        _safe_deallocate(self._cached_x_pre_final_norm)
         self._cached_x_pre_final_norm = None
-        self._cached_input_ids = None
-        self._fwd_trace = []
+        self._cached_input_ids = None  # host tensor, no device dealloc
+        # Deallocate core x outputs and blend info (only exist with recurrent core)
+        for x_out in getattr(self, '_core_x_outputs', []):
+            _safe_deallocate(x_out)
         self._core_x_outputs = []
+        for blend in getattr(self, '_core_blend_info', []):
+            for k, v in blend.items():
+                if hasattr(v, 'shape'):  # skip ints/floats
+                    _safe_deallocate(v)
         self._core_blend_info = []
+        self._fwd_trace = []
         for layer in self.layers:
             if hasattr(layer, 'clear_caches'):
                 layer.clear_caches()
+            elif hasattr(layer, '_cache'):
+                # Retention/attention layers: deallocate cached intermediates.
+                # Exclude persistent tensors: scale_tt (self._scale_tt) and
+                # gate (self.gate) are model parameters reused across steps.
+                # REVIEWED: also clean cache_history for recurrent core layers.
+                _persistent = set()
+                if hasattr(layer, '_scale_tt'):
+                    _persistent.add(id(layer._scale_tt))
+                if hasattr(layer, 'gate'):
+                    _persistent.add(id(layer.gate))
+                for k, v in layer._cache.items():
+                    if id(v) not in _persistent and hasattr(v, 'shape'):
+                        _safe_deallocate(v)
+                layer._cache = {}
+                # Deallocate cache history from recurrent core iterations
+                if hasattr(layer, '_deallocate_cache_history'):
+                    layer._deallocate_cache_history()
         if self.workspace is not None:
             self.workspace.clear_caches()
         if self.attn_residual is not None:
@@ -4036,36 +4734,63 @@ class TTMambaWorkspaceModel:
                 W = getattr(inner, wname)
                 m, n = int(W.shape[0]), int(W.shape[1])
 
-                # Power iteration to estimate spectral norm (10 steps)
+                # Power iteration to estimate spectral norm (10 steps).
+                # Each iteration creates ~15 intermediate ttnn tensors; without
+                # explicit deallocation they accumulate in host RAM (ttnn wrapper
+                # metadata) and device DRAM until Python GC runs — but GC doesn't
+                # see the pressure because wrappers are tiny.  This was the
+                # dominant memory leak (~3 GB/hour) that OOM-killed training.
                 v = ttnn.from_torch(
                     torch.randn(n, 1, dtype=torch.bfloat16) / math.sqrt(n),
                     dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
                 )
+                Wt = ttnn.transpose(W, 0, 1)  # cache transpose outside loop
                 for _ in range(10):
                     u = ttnn.matmul(W, v)  # (m, 1)
-                    u_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(u, u)))
-                    u_norm = ttnn.maximum(u_norm, eps_tt)
-                    u = ttnn.mul(u, ttnn.reciprocal(u_norm))
+                    u_sq = ttnn.mul(u, u)
+                    u_norm = ttnn.sqrt(ttnn.sum(u_sq))
+                    _safe_deallocate(u_sq)
+                    u_norm_c = ttnn.maximum(u_norm, eps_tt)
+                    _safe_deallocate(u_norm)
+                    u_recip = ttnn.reciprocal(u_norm_c)
+                    _safe_deallocate(u_norm_c)
+                    u_new = ttnn.mul(u, u_recip)
+                    _safe_deallocate(u)
+                    _safe_deallocate(u_recip)
+                    u = u_new
 
-                    v = ttnn.matmul(ttnn.transpose(W, 0, 1), u)  # (n, 1)
-                    v_norm = ttnn.sqrt(ttnn.sum(ttnn.mul(v, v)))
-                    v_norm = ttnn.maximum(v_norm, eps_tt)
-                    v = ttnn.mul(v, ttnn.reciprocal(v_norm))
+                    v_new = ttnn.matmul(Wt, u)  # (n, 1)
+                    v_sq = ttnn.mul(v_new, v_new)
+                    v_norm = ttnn.sqrt(ttnn.sum(v_sq))
+                    _safe_deallocate(v_sq)
+                    v_norm_c = ttnn.maximum(v_norm, eps_tt)
+                    _safe_deallocate(v_norm)
+                    v_recip = ttnn.reciprocal(v_norm_c)
+                    _safe_deallocate(v_norm_c)
+                    v_result = ttnn.mul(v_new, v_recip)
+                    _safe_deallocate(v)  # old v from previous iteration
+                    _safe_deallocate(v_new)
+                    _safe_deallocate(v_recip)
+                    v = v_result
+                _safe_deallocate(Wt)
+                _safe_deallocate(u)
 
                 Wv = ttnn.matmul(W, v)
-                sigma = ttnn.sqrt(ttnn.sum(ttnn.mul(Wv, Wv)))
-                sigma = ttnn.maximum(sigma, eps_tt)
+                Wv_sq = ttnn.mul(Wv, Wv)
+                sigma = ttnn.sqrt(ttnn.sum(Wv_sq))
+                _safe_deallocate(Wv_sq)
+                sigma_c = ttnn.maximum(sigma, eps_tt)
+                _safe_deallocate(sigma)
 
                 # scale = min(1, bound/sigma) = bound / max(bound, sigma)
-                scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma)))
+                scale_factor = ttnn.mul(bound_tt, ttnn.reciprocal(ttnn.maximum(bound_tt, sigma_c)))
                 W_normalized = ttnn.mul(W, scale_factor)
                 _safe_deallocate(getattr(inner, wname))
                 setattr(inner, wname, W_normalized)
                 # Deallocate power iteration intermediates
                 _safe_deallocate(v)
-                _safe_deallocate(v_norm)
                 _safe_deallocate(Wv)
-                _safe_deallocate(sigma)
+                _safe_deallocate(sigma_c)
                 _safe_deallocate(scale_factor)
 
         _safe_deallocate(bound_tt)

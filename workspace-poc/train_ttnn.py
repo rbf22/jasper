@@ -385,7 +385,9 @@ class TTAdamW:
             # back is a place to check first. Use `wd_groups` in the config
             # (e.g. `wd_groups: {"suffix:_gate": 0.0}`) to exclude specific
             # params instead of changing this default.
-            param = ttnn.mul(param, 1.0 - lr * wd)
+            param_wd = ttnn.mul(param, 1.0 - lr * wd)
+            _safe_deallocate(param)
+            param = param_wd
 
             # Deallocate old optimizer state (replaced by new tensors above)
             _safe_deallocate(m_old)
@@ -574,7 +576,9 @@ def cross_entropy_loss(logits_tt, labels, ignore_index=-100):
     grad_shift = ttnn.mul(diff, inv_n_valid_tt)  # (B, T-1, V)
     _safe_deallocate(diff)
     _safe_deallocate(inv_n_valid_tt)
-    grad_shift = ttnn.mul(grad_shift, mask_tt)  # zero out invalid positions
+    grad_shift_masked = ttnn.mul(grad_shift, mask_tt)  # zero out invalid positions
+    _safe_deallocate(grad_shift)
+    grad_shift = grad_shift_masked
 
     # Pad to (B, T, V) — last position has zero gradient
     zeros_pad = ttnn.zeros((B, 1, V), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
