@@ -114,13 +114,18 @@ The architecture has evolved well beyond Mamba (retention layers + workspace
 
 ### Active runs
 
-All three cells are training in parallel on the synthetic tasks:
+All three cells are training in parallel on the synthetic tasks,
+restarted with memory leak fixes (memfix5, 2026-08-11):
 
 | Run | Device | Config | Checkpoint dir | Log |
 |-----|--------|--------|----------------|-----|
-| Cell A (backbone control) | 3 | `cell_a_tt.yaml` | `checkpoints/stability_fix_a/` | `logs/cell_a_stability_fix_20260810.log` |
-| Cell B (workspace) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b/` | `logs/cell_b_stability_fix_20260810.log` |
-| Cell C (AR + recurrent) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c/` | `logs/cell_c_stability_fix_20260810b.log` |
+| Cell A (backbone control) | 3 | `cell_a_tt.yaml` | `checkpoints/stability_fix_a/` | `logs/cell_a_memfix5_20260811.log` |
+| Cell B (workspace) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b/` | `logs/cell_b_memfix5_20260811.log` |
+| Cell C (AR + recurrent) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c/` | `logs/cell_c_memfix5_20260811.log` |
+
+Previous runs (memfix4) grew ~12-14 GB/hr and were killed at steps
+7100/7400/3200 respectively. These runs resume from those checkpoints
+with all leak fixes applied.
 
 ### Launch commands (from workspace-poc/):
 
@@ -130,23 +135,23 @@ cd /home/rfenwick/Documents/jasper/workspace-poc
 TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
     --config configs/cell_b_tt.yaml --device 0 \
     --checkpoint_dir checkpoints/stability_fix_b \
-    --resume checkpoints/stability_fix_b/cell_B_step2700.pt \
-    >> logs/cell_b_stability_fix_20260810.log 2>&1 &
+    --resume checkpoints/stability_fix_b/cell_B_step7400.pt \
+    >> logs/cell_b_memfix5_20260811.log 2>&1 &
 
 # Cell C — device 2
 TT_VISIBLE_DEVICES=2 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
     --config configs/cell_c_attn_residual.yaml --device 0 \
     --checkpoint_dir checkpoints/stability_fix_c \
-    --resume checkpoints/stability_fix_c/cell_C_step1300.pt \
-    >> logs/cell_c_stability_fix_20260810b.log 2>&1 &
+    --resume checkpoints/stability_fix_c/cell_C_step3200.pt \
+    >> logs/cell_c_memfix5_20260811.log 2>&1 &
 
 # Cell A — device 3 (P150, needs mesh graph descriptor)
 TT_VISIBLE_DEVICES=3 TT_MESH_GRAPH_DESC_PATH=/home/rfenwick/tt-boltz/env/lib/python3.12/site-packages/ttnn/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto \
 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
     --config configs/cell_a_tt.yaml --device 0 \
     --checkpoint_dir checkpoints/stability_fix_a \
-    --resume checkpoints/stability_fix_a/cell_A_step900.pt \
-    >> logs/cell_a_stability_fix_20260810.log 2>&1 &
+    --resume checkpoints/stability_fix_a/cell_A_step7100.pt \
+    >> logs/cell_a_memfix5_20260811.log 2>&1 &
 ```
 
 ### Critical divergence thresholds
