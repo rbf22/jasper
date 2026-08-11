@@ -3675,6 +3675,8 @@ class AttentionResidual:
             # grad_x_k_from_v = alpha_k * grad_x_final
             alpha_k = ttnn.slice(alpha, [0, 0, k], [B, T, k + 1])  # (B, T, 1)
             grad_xk_v = ttnn.mul(alpha_k, grad_x_final)  # (B, T, D)
+            # REVIEWED: slice creates a new tensor — deallocate after use.
+            _safe_deallocate(alpha_k)
             grad_x_from_v.append(grad_xk_v)
 
         # Concat grad_alpha: (B, T, n_outputs)
@@ -3725,6 +3727,8 @@ class AttentionResidual:
             else:
                 # Inactive: no gradient flows to scores_pre_scale
                 grad_spk = ttnn.zeros_like(grad_score_k)
+            # REVIEWED: slice creates a new tensor — deallocate after use.
+            _safe_deallocate(grad_score_k)
             grad_scores_pre_scale_list.append(grad_spk)
 
         # --- Through scores_pre_scale_k = sum_d(x_k * query) ---
