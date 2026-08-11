@@ -892,6 +892,14 @@ class TTAttentionLayer:
         self.d_head = config.d_model // config.n_heads
         self.scale = 1.0 / (self.d_head ** 0.5)
 
+        # Cache scale as a device tensor (avoids per-forward torch→device transfer)
+        # REVIEWED: from_torch in the hot path was leaking device tensors every
+        # forward call — the old scale_tt was cached in self._cache but a NEW
+        # one was created each time, orphaning the previous one on device.
+        self._scale_tt = ttnn.from_torch(
+            torch.tensor([self.scale], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
         # QKV projection: (d_model, 3*d_model)
         qkv_w = torch.randn(self.d_model, 3 * self.d_model, dtype=torch.bfloat16) * 0.02
         self.qkv_weight = to_device(qkv_w, device)
@@ -909,6 +917,9 @@ class TTAttentionLayer:
         self._rope_cos = None
         self._rope_sin = None
         self._rope_T = 0
+        # Causal mask caches (depend only on T, reused across forward/backward)
+        self._causal_mask_upper = None  # triu(ones, 1) — for forward (s > t → -inf)
+        self._causal_mask_lower = None  # tril(ones, 0) — for backward (s <= t → keep)
 
         self._cache = {}
         self._cache_history = []  # old caches from recurrent core iterations
@@ -920,6 +931,10 @@ class TTAttentionLayer:
         _persistent = set()
         if hasattr(self, '_scale_tt') and self._scale_tt is not None:
             _persistent.add(id(self._scale_tt))
+        if hasattr(self, '_causal_mask_upper') and self._causal_mask_upper is not None:
+            _persistent.add(id(self._causal_mask_upper))
+        if hasattr(self, '_causal_mask_lower') and self._causal_mask_lower is not None:
+            _persistent.add(id(self._causal_mask_lower))
         for v in self._cache.values():
             if id(v) not in _persistent and hasattr(v, 'shape'):
                 _safe_deallocate(v)
@@ -931,6 +946,10 @@ class TTAttentionLayer:
             _persistent = set()
             if hasattr(self, '_scale_tt') and self._scale_tt is not None:
                 _persistent.add(id(self._scale_tt))
+            if hasattr(self, '_causal_mask_upper') and self._causal_mask_upper is not None:
+                _persistent.add(id(self._causal_mask_upper))
+            if hasattr(self, '_causal_mask_lower') and self._causal_mask_lower is not None:
+                _persistent.add(id(self._causal_mask_lower))
             for v in old_cache.values():
                 if id(v) not in _persistent and hasattr(v, 'shape'):
                     _safe_deallocate(v)
@@ -940,6 +959,11 @@ class TTAttentionLayer:
         """Initialize RoPE cos/sin tables for sequence length T on device."""
         if self._rope_T == T and self._rope_cos is not None:
             return
+        # REVIEWED: deallocate old cached tensors before overwriting (reassignment leak)
+        _safe_deallocate(self._rope_cos)
+        _safe_deallocate(self._rope_sin)
+        _safe_deallocate(self._causal_mask_upper)
+        _safe_deallocate(self._causal_mask_lower)
         positions = torch.arange(T, dtype=torch.float32)
         angles = torch.outer(positions, self._rope_freqs)  # (T, d_rope/2)
         cos = torch.cos(angles).to(torch.bfloat16)  # (T, d_rope/2)
@@ -949,6 +973,14 @@ class TTAttentionLayer:
         sin_4d = sin.unsqueeze(0).unsqueeze(0)
         self._rope_cos = ttnn.from_torch(cos_4d, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
         self._rope_sin = ttnn.from_torch(sin_4d, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # REVIEWED: Cache causal masks per T — they were being recreated via
+        # from_torch + triu/tril on every forward AND backward call (2x per step
+        # per attention layer), leaking device tensors.
+        ones_tt = ttnn.from_torch(torch.ones(T, T, dtype=torch.bfloat16),
+                                   dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self._causal_mask_upper = ttnn.triu(ones_tt, diagonal=1)  # 1 for s > t
+        self._causal_mask_lower = ttnn.tril(ones_tt, diagonal=0)  # 1 for s <= t
+        _safe_deallocate(ones_tt)
         self._rope_T = T
 
     def _apply_rope(self, x: "ttnn.Tensor", B, H, T) -> "ttnn.Tensor":
@@ -1032,22 +1064,20 @@ class TTAttentionLayer:
         # Attention scores: (B, H, T, T) = Q @ K^T * scale
         # REVIEWED: intermediates must be explicitly deallocated.
         scores = ttnn.matmul(q_rope, ttnn.transpose(k_rope, -2, -1))  # (B, H, T, T)
-        scale_tt = ttnn.from_torch(torch.tensor([self.scale], dtype=torch.bfloat16),
-                                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # REVIEWED: use cached _scale_tt (persistent) instead of from_torch every call.
+        scale_tt = self._scale_tt
         # REVIEWED: reassignment leak — ttnn.mul creates a new tensor.
         scores_scaled = ttnn.mul(scores, scale_tt)
         _safe_deallocate(scores)
         scores = scores_scaled
 
         # Causal mask: upper triangular (s > t) -> -inf
-        ones_tt = ttnn.from_torch(torch.ones(T, T, dtype=torch.bfloat16),
-                                   dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        mask = ttnn.triu(ones_tt, diagonal=1)  # 1 for s > t
-        _safe_deallocate(ones_tt)
+        # REVIEWED: use cached _causal_mask_upper (persistent) instead of
+        # from_torch + triu every call.
+        mask = self._causal_mask_upper
         neg_inf = ttnn.full((B, H, T, T), -1e4, dtype=ttnn.bfloat16,
                             layout=ttnn.TILE_LAYOUT, device=device)
         scores_masked = ttnn.where(mask, neg_inf, scores)
-        _safe_deallocate(mask)
         _safe_deallocate(neg_inf)
 
         # Softmax over last dim
@@ -1130,17 +1160,15 @@ class TTAttentionLayer:
         # The gradient through where is: grad_scores is 0 for s > t (since attn=0 there).
         # No additional gradient needed — the where is already accounted for in softmax.
         # But we need to zero out grad_scores for s > t to avoid spurious gradients.
-        ones_tt = ttnn.from_torch(torch.ones(T, T, dtype=torch.bfloat16),
-                                   dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        mask_causal = ttnn.tril(ones_tt, diagonal=0)  # 1 for s <= t
-        _safe_deallocate(ones_tt)
+        # REVIEWED: use cached _causal_mask_lower (persistent) instead of
+        # from_torch + tril every backward call.
+        mask_causal = self._causal_mask_lower
         zeros_4d = ttnn.zeros((B, H, T, T), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
         # REVIEWED: reassignment leak — ttnn.where creates a new tensor,
         # old grad_scores must be explicitly deallocated.
         grad_scores_new = ttnn.where(mask_causal, grad_scores, zeros_4d)
         _safe_deallocate(grad_scores)
         grad_scores = grad_scores_new
-        _safe_deallocate(mask_causal)
         _safe_deallocate(zeros_4d)
 
         # --- Backward through scores = QK^T * scale ---
@@ -1284,6 +1312,7 @@ class TTRetentionLayer:
         self._rope_sin = None
         self._rope_cos_2d = None
         self._rope_sin_2d = None
+        self._rope_neg_sin_2d = None
         self._rope_T = 0
 
         # Decay matrix cache (diff and causal mask, precomputed per T on device)
@@ -1333,6 +1362,12 @@ class TTRetentionLayer:
         """Initialize RoPE cos/sin tables for sequence length T on device."""
         if self._rope_T == T and self._rope_cos is not None:
             return
+        # REVIEWED: deallocate old cached RoPE tables before overwriting (reassignment leak)
+        _safe_deallocate(self._rope_cos)
+        _safe_deallocate(self._rope_sin)
+        _safe_deallocate(self._rope_cos_2d)
+        _safe_deallocate(self._rope_sin_2d)
+        _safe_deallocate(self._rope_neg_sin_2d)
         positions = torch.arange(T, dtype=torch.float32)
         angles = torch.outer(positions, self._rope_freqs)
         cos = torch.cos(angles).to(torch.bfloat16)   # (T, d_head//2)
@@ -1480,6 +1515,10 @@ class TTRetentionLayer:
         """
         if self._pc_decay_T == T and self._pos_exp_neg is not None:
             return self._pos_exp_neg, self._pos_exp_pos
+
+        # REVIEWED: deallocate old cached scales before overwriting (reassignment leak)
+        _safe_deallocate(self._pos_exp_neg)
+        _safe_deallocate(self._pos_exp_pos)
 
         H, d_h = self.n_heads, self.d_head
         pos = torch.arange(T, dtype=torch.float32)  # (T,)
@@ -1904,6 +1943,9 @@ class TTRetentionLayer:
         """
         # Cache the diff matrix and causal mask on device per T
         if self._decay_T != T or self._diff_tt is None:
+            # REVIEWED: deallocate old cached tensors before overwriting (reassignment leak)
+            _safe_deallocate(self._diff_tt)
+            _safe_deallocate(self._causal_tt)
             H = self.n_heads
             pos = torch.arange(T, dtype=torch.float32)
             diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (T, T)
@@ -1924,6 +1966,8 @@ class TTRetentionLayer:
         log_gamma_4d = ttnn.reshape(self.gamma, [1, self.n_heads, 1, 1])
         # Convert to bf16 for the multiply (gamma is fp32, diff is bf16)
         log_gamma_bf16 = ttnn.typecast(log_gamma_4d, ttnn.bfloat16)
+        # REVIEWED: reshape may return a view of self.gamma (persistent) —
+        # do NOT deallocate log_gamma_4d (would free self.gamma's buffer).
         log_D = ttnn.mul(self._diff_tt, log_gamma_bf16)  # (1, H, T, T)
         _safe_deallocate(log_gamma_bf16)
         D = ttnn.exp(log_D)  # (1, H, T, T)
@@ -1985,6 +2029,8 @@ class TTRetentionLayer:
 
             # Ensure causal mask is initialized (needed for scores masking)
             if self._decay_T != T or self._causal_tt is None:
+                # REVIEWED: deallocate old _causal_tt before overwriting (reassignment leak)
+                _safe_deallocate(self._causal_tt)
                 pos_t = torch.arange(T, dtype=torch.float32)
                 diff = pos_t.unsqueeze(1) - pos_t.unsqueeze(0)
                 causal = (diff >= 0).to(torch.bfloat16)
@@ -2448,13 +2494,18 @@ class TTGatedResidualLayer:
             self.layer.clear_caches()
         elif hasattr(self.layer, '_cache'):
             # Retention/attention layers: deallocate cached intermediates.
-            # Exclude persistent tensors: scale_tt (self._scale_tt) and
-            # gate (self.gate) are model parameters reused across steps.
+            # Exclude persistent tensors: scale_tt (self._scale_tt),
+            # gate (self.gate), and cached causal masks are model parameters
+            # reused across steps.
             _persistent = set()
             if hasattr(self.layer, '_scale_tt'):
                 _persistent.add(id(self.layer._scale_tt))
             if hasattr(self.layer, 'gate'):
                 _persistent.add(id(self.layer.gate))
+            if hasattr(self.layer, '_causal_mask_upper') and self.layer._causal_mask_upper is not None:
+                _persistent.add(id(self.layer._causal_mask_upper))
+            if hasattr(self.layer, '_causal_mask_lower') and self.layer._causal_mask_lower is not None:
+                _persistent.add(id(self.layer._causal_mask_lower))
             for k, v in self.layer._cache.items():
                 if id(v) not in _persistent and hasattr(v, 'shape'):
                     _safe_deallocate(v)
@@ -4229,8 +4280,10 @@ class TTMambaWorkspaceModel:
 
         # --- Backward through post-core layers (reverse) ---
         grad_slot_state = None  # gradient w.r.t. slot_state
-        ones_tt = ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
-                                   dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # REVIEWED: ones_tt is only needed for the fixed blend core backward
+        # (non-AR recurrent path). Create lazily to avoid unnecessary device
+        # transfer for non-recurrent cells (A, B) or AR core cells (C).
+        ones_tt = None
 
         for entry in reversed(post_trace):
             if entry[0] == "layer":
@@ -4396,6 +4449,11 @@ class TTMambaWorkspaceModel:
                 # Group core_trace by iteration
                 # Each iteration has: ws calls for core layers, layer calls, ws at core_end
                 # We need to unroll in reverse iteration order
+
+                # REVIEWED: Create ones_tt lazily here — only the fixed blend
+                # core backward needs it (AR core doesn't).
+                ones_tt = ttnn.from_torch(torch.tensor([1.0], dtype=torch.bfloat16),
+                                           dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
                 # Split core_trace into per-iteration segments
                 iter_segments = []  # list of (iter_num, entries)
@@ -4596,8 +4654,9 @@ class TTMambaWorkspaceModel:
         all_grads["token_emb_weight"] = grad_emb
         all_grads["norm_weight"] = grad_norm_w
 
-        # Deallocate the ones_tt created for blend backward
-        _safe_deallocate(ones_tt)
+        # Deallocate the ones_tt created for blend backward (if any)
+        if ones_tt is not None:
+            _safe_deallocate(ones_tt)
 
         # If gamma is frozen, drop gamma gradients so they don't enter
         # clip_grad_norm or the optimizer.  The backward pass still computes
@@ -4637,14 +4696,19 @@ class TTMambaWorkspaceModel:
                 layer.clear_caches()
             elif hasattr(layer, '_cache'):
                 # Retention/attention layers: deallocate cached intermediates.
-                # Exclude persistent tensors: scale_tt (self._scale_tt) and
-                # gate (self.gate) are model parameters reused across steps.
+                # Exclude persistent tensors: scale_tt (self._scale_tt),
+                # gate (self.gate), and cached causal masks are model
+                # parameters reused across steps.
                 # REVIEWED: also clean cache_history for recurrent core layers.
                 _persistent = set()
                 if hasattr(layer, '_scale_tt'):
                     _persistent.add(id(layer._scale_tt))
                 if hasattr(layer, 'gate'):
                     _persistent.add(id(layer.gate))
+                if hasattr(layer, '_causal_mask_upper') and layer._causal_mask_upper is not None:
+                    _persistent.add(id(layer._causal_mask_upper))
+                if hasattr(layer, '_causal_mask_lower') and layer._causal_mask_lower is not None:
+                    _persistent.add(id(layer._causal_mask_lower))
                 for k, v in layer._cache.items():
                     if id(v) not in _persistent and hasattr(v, 'shape'):
                         _safe_deallocate(v)

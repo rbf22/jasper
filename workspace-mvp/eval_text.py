@@ -27,7 +27,7 @@ if not os.path.isdir(POC_DIR):
 sys.path.insert(0, POC_DIR)
 sys.path.insert(0, MVP_DIR)
 
-from train_ttnn import load_config, build_model_config
+from train_ttnn import load_config, build_model_config, _safe_deallocate
 from model_ttnn import TTMambaWorkspaceModel
 from text_data import BPETokenizer, TextDataset, make_eval_batches
 
@@ -54,11 +54,15 @@ def compute_perplexity(model, eval_batches, device, k_value=None):
         with torch.no_grad():
             logits_tt = model.forward(input_ids, k_value=k_value)
             logits = ttnn.to_torch(logits_tt)
+            # REVIEWED: Deallocate device logits after host transfer
+            _safe_deallocate(logits_tt)
             shift_logits = logits[:, :-1, :]
             shift_labels = labels[:, :-1]
             valid_mask = (shift_labels != -100)
             n_valid = valid_mask.sum().item()
             if n_valid == 0:
+                # REVIEWED: Still need to clear caches even if skipping loss
+                model.clear_caches()
                 continue
             loss = torch.nn.functional.cross_entropy(
                 shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
@@ -68,6 +72,8 @@ def compute_perplexity(model, eval_batches, device, k_value=None):
             loss = (loss * valid_mask.reshape(-1)).sum().item()
             total_loss += loss
             total_tokens += n_valid
+            # REVIEWED: Clear model caches after eval forward (no backward ran)
+            model.clear_caches()
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
     return avg_loss, perplexity
@@ -84,6 +90,8 @@ def generate_text(model, tokenizer, prompt, device, max_new_tokens=100,
         with torch.no_grad():
             logits_tt = model.forward(input_ids, k_value=k_value)
             logits = ttnn.to_torch(logits_tt)  # (1, T, V)
+            # REVIEWED: Deallocate device logits after host transfer
+            _safe_deallocate(logits_tt)
 
         # Get logits for last position
         next_logits = logits[0, -1, :].float() / temperature
@@ -92,6 +100,9 @@ def generate_text(model, tokenizer, prompt, device, max_new_tokens=100,
         # Sample
         next_token = torch.multinomial(probs, num_samples=1).item()
         generated.append(next_token)
+
+        # REVIEWED: Clear model caches after each generation step
+        model.clear_caches()
 
         # Stop at EOS
         if next_token == tokenizer.EOS:

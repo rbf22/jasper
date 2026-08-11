@@ -27,6 +27,7 @@ import sys
 import argparse
 import time
 import random
+import gc
 import yaml
 import torch
 import ttnn
@@ -53,6 +54,7 @@ from train_ttnn import (
     host_grads_to_tt,
     get_lr,
     Profiler,
+    _safe_deallocate,
 )
 from model_ttnn import TTMambaWorkspaceModel, ModelConfig
 
@@ -145,11 +147,22 @@ def cross_entropy_loss_scatter(logits_tt, labels, ignore_index=-100):
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
     )
 
+    # REVIEWED: reassignment leak — each ttnn op creates a new tensor;
+    # old values must be explicitly deallocated.
     grad = ttnn.mul(probs, inv_n_tt)  # (B, T, V) = probs / n_valid
-    grad = ttnn.scatter_add(grad, dim=-1, index=labels_tt, src=src_tt)  # subtract 1/n_valid at targets
-    grad = ttnn.mul(grad, mask_tt)  # zero out invalid positions (broadcasts (B,T,1) → (B,T,V))
+    _safe_deallocate(probs)
+    _safe_deallocate(inv_n_tt)
+    grad_scaled = ttnn.scatter_add(grad, dim=-1, index=labels_tt, src=src_tt)  # subtract 1/n_valid at targets
+    _safe_deallocate(grad)
+    _safe_deallocate(labels_tt)
+    _safe_deallocate(src_tt)
+    grad_final = ttnn.mul(grad_scaled, mask_tt)  # zero out invalid positions (broadcasts (B,T,1) → (B,T,V))
+    _safe_deallocate(grad_scaled)
+    _safe_deallocate(mask_tt)
+    # REVIEWED: target_probs_tt no longer needed (loss already computed on host)
+    _safe_deallocate(target_probs_tt)
 
-    return loss_value, grad
+    return loss_value, grad_final
 
 
 def cross_entropy_loss_host(logits_tt, labels, ignore_index=-100):
@@ -263,21 +276,24 @@ def evaluate_perplexity(model, eval_batches, device, k_value=None):
             logits_tt = model.forward(input_ids, k_value=k_value)
             # Compute loss manually (no gradient needed)
             logits = ttnn.to_torch(logits_tt)  # (B, T, V)
+            # REVIEWED: Deallocate device logits after host transfer
+            _safe_deallocate(logits_tt)
             shift_logits = logits[:, :-1, :]  # (B, T-1, V)
             shift_labels = labels[:, :-1]  # (B, T-1)
             valid_mask = (shift_labels != -100)
             n_valid = valid_mask.sum().item()
-            if n_valid == 0:
-                continue
-            # Cross-entropy loss
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
-                shift_labels.clamp(min=0).reshape(-1),
-                reduction="none",
-            )
-            loss = (loss * valid_mask.reshape(-1)).sum().item()
-            total_loss += loss
-            total_tokens += n_valid
+            if n_valid > 0:
+                # Cross-entropy loss
+                loss = torch.nn.functional.cross_entropy(
+                    shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
+                    shift_labels.clamp(min=0).reshape(-1),
+                    reduction="none",
+                )
+                loss = (loss * valid_mask.reshape(-1)).sum().item()
+                total_loss += loss
+                total_tokens += n_valid
+            # REVIEWED: Clear model caches after eval forward (no backward ran)
+            model.clear_caches()
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
     return avg_loss, perplexity
@@ -461,11 +477,24 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             loss_val, grad_logits = compute_loss(logits, labels, model_config.vocab_size, use_scatter=use_scatter)
             step_loss += loss_val
 
+            # REVIEWED: Deallocate logits (no longer needed after loss computation)
+            _safe_deallocate(logits)
+
             # Backward
             grads = model.backward(grad_logits)
 
+            # REVIEWED: Deallocate grad_logits (consumed by backward)
+            _safe_deallocate(grad_logits)
+
             # Accumulate gradients (host-side)
             accumulate_grads(accum_grads, grads, accum_steps)
+
+            # REVIEWED: Deallocate device-side gradient tensors (already copied to host)
+            for g in grads.values():
+                _safe_deallocate(g)
+
+            # REVIEWED: Clear model's forward/backward caches to free intermediate tensors
+            model.clear_caches()
 
         # Average loss over accumulation steps
         step_loss /= accum_steps
@@ -484,6 +513,11 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             print(f"  *** SKIP step {step}: grad_norm {grad_norm:.1f} > threshold {grad_norm_spike_threshold} ***",
                   flush=True)
             skipped_steps += 1
+            # REVIEWED: Deallocate tt_grads before skipping (device tensors)
+            for g in tt_grads.values():
+                _safe_deallocate(g)
+            del tt_grads
+            del accum_grads
             continue
 
         # Optimizer step
@@ -496,6 +530,16 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         if not model_config.freeze_gamma:
             model.clamp_retention_gammas()
             optimizer.sync_master_from_model(model)
+
+        # REVIEWED: Deallocate tt_grads (no longer needed after optimizer step)
+        for g in tt_grads.values():
+            _safe_deallocate(g)
+        del tt_grads
+        # Free host-side accumulated gradients
+        del accum_grads
+        # REVIEWED: Force garbage collection to reclaim any remaining orphaned
+        # ttnn wrapper objects. Without this, device DRAM grows until OOM.
+        gc.collect()
 
         t_step_end = time.time()
         step_time = t_step_end - t_step_start
