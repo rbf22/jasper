@@ -154,3 +154,39 @@ The `compute_loss()` function dispatches based on vocab size and method:
 The scatter loss is verified against the host-side loss in
 `test_scatter_loss.py` — loss values match within 0.3% relative error,
 gradients match within 1.6% mean relative error (bfloat16 noise floor).
+
+## Data preparation tools
+
+A set of standalone Python scripts in `tools/` generate the `.txt` corpora that
+`text_data.py` expects. Output always goes to `workspace-mvp/data/` by default.
+
+| Script | What it generates |
+|---|---|
+| `tools/prepare_tinystories.py` | Original TinyStories train/valid text files |
+| `tools/prepare_logic_puzzles.py` | Narrative multi-hop logic puzzles (location, arithmetic, swap, attribute) |
+| `tools/prepare_brainbashers_style.py` | Attribute-chain / elimination / position puzzles |
+| `tools/prepare_babi.py` | bAbI QA passages from HuggingFace `Muennighoff/babi` |
+| `tools/prepare_tiny_challenges.py` | 2M mixed challenge corpus (logic + BrainBashers + bAbI) |
+
+Run from `workspace-mvp/`:
+
+```bash
+python tools/prepare_tiny_challenges.py --n-train 2000000 --n-valid 20000
+```
+
+All scripts run in the same venv as the training code (`datasets`, `tiktoken`,
+and `torch` are not needed for data prep beyond the existing `tiktoken` import).
+
+## Reasoning corpus configs
+
+New `configs/` YAML files point `train_text.py` at the generated challenge corpora
+instead of TinyStories:
+
+- `configs/text_cell_c_logic.yaml` — `logic_puzzles_*.txt`
+- `configs/text_cell_c_brainbashers.yaml` — `brainbashers_*.txt`
+- `configs/text_cell_c_babi.yaml` — `babi_*.txt`
+- `configs/text_cell_c_tiny_challenges.yaml` — `tiny_challenges_*.txt`
+
+These are intended to test whether the workspace and recurrent core can solve
+small, multi-hop reasoning problems when the task is framed as answer
+continuation.
