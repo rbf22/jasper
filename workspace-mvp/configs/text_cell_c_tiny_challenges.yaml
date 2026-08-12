@@ -1,0 +1,96 @@
+# Text MVP — Cell C with Attention Residual Core on tiny-challenges.
+#
+# This config replaces TinyStories with a corpus of small, self-contained
+# reasoning problems. Every line is a short set of facts/clues, a question,
+# and its answer. The model must use the workspace to combine 2-4 clues and
+# generate the correct answer sentence.
+
+# Mix:
+#   40% narrative multi-hop logic puzzles (location, arithmetic, swaps, recall)
+#   55% BrainBashers-style attribute chains / elimination / ordering
+#   5%  bAbI QA passages
+
+cell: text
+d_model: 384
+n_layers: 13
+n_heads: 4
+vocab_size: 50257
+use_attention: true
+attention_positions: [5, 10]
+use_workspace: true
+n_workspace_slots: 16
+recurrent_core: true
+attention_residual_core: true
+core_start: 6
+core_end: 10
+k_train_max: 6
+k_inference: 6
+spectral_norm_bound: 5.0
+backbone_spectral_norm_bound: 2.0
+chain_scale_safety: 1.0
+freeze_gamma: true
+freeze_slot_decay: true
+ws_entropy_weight: 0.0
+ws_diversity_weight: 0.0
+gate_init: 0.0
+slot_decay_init: 1.0
+gate_clamp_bound: 0.3
+
+# Training
+lr: 1.0e-4
+lr_groups:
+  ws_read_gate: 10.0
+  ws_write_gate: 10.0
+  ws_read_qk_scale: 1.0
+  ws_write_qk_scale: 1.0
+  ws_ar_query: 1.0
+  ws_ar_scale: 1.0
+  ws_: 0.25
+  "suffix:_gamma": 0.01
+# 2M examples, ~77M tokens. 2000 steps x ~196k tokens/step = ~392M training tokens
+# (~5 epochs). Comparable scale to the TinyStories run.
+max_steps: 2000
+tokens_per_batch: 50000
+seq_len: 512
+warmup_steps: 500
+cosine_decay_steps: 1500
+cosine_min_ratio: 0.1
+weight_decay: 0.1
+wd_groups:
+  "suffix:_gate": 0.0
+beta2_groups:
+  "suffix:_gate": 0.999
+grad_clip: 1.0
+ws_grad_clip: 0.5
+spike_action: restore
+z_loss_coef: 1.0e-4
+eval_interval: 100
+log_interval: 20
+checkpoint_interval: 200
+seed: 42
+
+# Early stopping
+plateau_patience: 500
+plateau_min_delta: 1.0e-3
+
+# Data
+train_data: data/tiny_challenges_train.txt
+valid_data: data/tiny_challenges_valid.txt
+max_train_tokens: null
+eval_batches: 10
+
+# TT-specific
+use_gradient_checkpointing: false
+tt_compile: false
+
+micro_batch_size: 0  # auto-compute
+accum_steps: 0       # auto-compute
+
+# Wandb
+wandb: false
+wandb_project: mamba-workspace-text
+run_name: text-cell-c-tiny-challenges
+
+# Checkpointing
+ckpt_dir: checkpoints
+resume: false

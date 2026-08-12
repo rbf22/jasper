@@ -1,0 +1,90 @@
+# Text MVP — Cell C with Attention Residual Core on bAbI QA tasks.
+#
+# Same architecture as text_cell_c.yaml, but trained on the bAbI 20-task
+# question-answering benchmark. Each line is: passage + question + answer,
+# so the model learns to read the story, attend to the question, and emit
+# the answer token.
+
+cell: text
+d_model: 384
+n_layers: 13
+n_heads: 4
+vocab_size: 50257
+use_attention: true
+attention_positions: [5, 10]
+use_workspace: true
+n_workspace_slots: 16
+recurrent_core: true
+attention_residual_core: true
+core_start: 6
+core_end: 10
+k_train_max: 6
+k_inference: 6
+spectral_norm_bound: 5.0
+backbone_spectral_norm_bound: 2.0
+chain_scale_safety: 1.0
+freeze_gamma: true
+freeze_slot_decay: true
+ws_entropy_weight: 0.0
+ws_diversity_weight: 0.0
+gate_init: 0.0
+slot_decay_init: 1.0
+gate_clamp_bound: 0.3
+
+# Training
+lr: 1.0e-4
+lr_groups:
+  ws_read_gate: 10.0
+  ws_write_gate: 10.0
+  ws_read_qk_scale: 1.0
+  ws_write_qk_scale: 1.0
+  ws_ar_query: 1.0
+  ws_ar_scale: 1.0
+  ws_: 0.25
+  "suffix:_gamma": 0.01
+# bAbI train is only ~1.8M tokens, so fewer steps.
+max_steps: 500
+tokens_per_batch: 50000
+seq_len: 512
+warmup_steps: 50
+cosine_decay_steps: 400
+cosine_min_ratio: 0.1
+weight_decay: 0.1
+wd_groups:
+  "suffix:_gate": 0.0
+beta2_groups:
+  "suffix:_gate": 0.999
+grad_clip: 1.0
+ws_grad_clip: 0.5
+spike_action: restore
+z_loss_coef: 1.0e-4
+eval_interval: 50
+log_interval: 10
+checkpoint_interval: 100
+seed: 42
+
+# Early stopping
+plateau_patience: 200
+plateau_min_delta: 1.0e-3
+
+# Data
+train_data: data/babi_train.txt
+valid_data: data/babi_valid.txt
+max_train_tokens: null
+eval_batches: 10
+
+# TT-specific
+use_gradient_checkpointing: false
+tt_compile: false
+
+micro_batch_size: 0  # auto-compute
+accum_steps: 0       # auto-compute
+
+# Wandb
+wandb: false
+wandb_project: mamba-workspace-text
+run_name: text-cell-c-babi
+
+# Checkpointing
+ckpt_dir: checkpoints
+resume: false
