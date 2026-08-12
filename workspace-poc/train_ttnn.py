@@ -1260,9 +1260,23 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 gate_str = f"{ws_stats['read_gate']:>8.4f} {ws_stats['write_gate']:>8.4f} {ws_stats['slot_decay']:>8.4f}"
             else:
                 gate_str = f"{'-':>8} {'-':>8} {'-':>8}"
+            # Track device DRAM usage to monitor memory leaks
+            mem_str = ""
+            try:
+                mv = ttnn.get_memory_view(device)
+                # mv has .num_allocated_buffers and .total_allocated_bytes_per_bank
+                if hasattr(mv, 'num_allocated_buffers'):
+                    mem_str = f" {mv.num_allocated_buffers:>6}buf"
+                if hasattr(mv, 'total_allocated_bytes_per_bank'):
+                    banks = mv.total_allocated_bytes_per_bank
+                    if banks:
+                        total_bytes = sum(banks)
+                        mem_str += f" {total_bytes / 1e9:.2f}GB"
+            except Exception:
+                pass
             print(f"{step:>6} {step_loss:>10.4f} {current_lr:>10.6f} "
                   f"{step_time:>7.2f}s {tokens_per_sec:>10.0f} {grad_norm:>10.4f} "
-                  f"{step_entropy:>10.4f} {step_diversity:>10.4f} {gate_str}", flush=True)
+                  f"{step_entropy:>10.4f} {step_diversity:>10.4f} {gate_str}{mem_str}", flush=True)
 
         # Early stopping: track EMA of loss, stop if no improvement for plateau_patience steps.
         # Skip during warmup (LR is ramping, loss behavior is not representative).
