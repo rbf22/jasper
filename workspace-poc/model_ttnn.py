@@ -40,6 +40,16 @@ def _safe_deallocate(tensor):
     accumulate in device DRAM until Python GC runs — but ttnn wrapper objects
     are tiny so GC doesn't see the memory pressure.  This was the root cause
     of the OOM that killed the system when running 3 training processes.
+
+    NOTE: ttnn.deallocate defaults to force=False, which silently skips
+    deallocation when the tensor's shared_ptr use_count > 1 (e.g., views,
+    cached references, or pending async operations). We keep force=False
+    here because using force=True on a view of a persistent parameter would
+    free the parameter's device buffer. The 22 places in the codebase that
+    skip deallocation of reshape/permute results (which may be views) are
+    safe with force=False — if they ARE views, deallocation is correctly
+    skipped; if they are NOT views (independent buffers), use_count==1 and
+    deallocation proceeds normally.
     """
     if tensor is None:
         return
@@ -2975,6 +2985,10 @@ class TTWorkspaceModule:
         H, d_h, D = self.n_heads, self.d_head, self.d_model
         device = self.device
 
+        # REVIEWED: synchronize device so async command queue releases refs
+        # to forward intermediates before we start deallocating them.
+        ttnn.synchronize_device(device)
+
         # --- Backward through x_out = norm(x_pre_norm) ---
         grad_x_pre_norm, grad_norm_w = self.norm.backward(grad_x_out, c["x_pre_norm"])
 
@@ -4716,7 +4730,12 @@ class TTMambaWorkspaceModel:
         Explicitly deallocates cached intermediates to free device buffers,
         then drops references. Model parameters survive because they're still
         referenced by self.token_emb_weight, self.layers[i].gate, etc.
+
+        REVIEWED: synchronize device first so the async command queue releases
+        its references to cached tensors. Without this, ttnn.deallocate(force=False)
+        silently skips because use_count > 1 (queue still holds a ref).
         """
+        ttnn.synchronize_device(self.device)
         _safe_deallocate(self._cached_x_pre_final_norm)
         self._cached_x_pre_final_norm = None
         self._cached_input_ids = None  # host tensor, no device dealloc

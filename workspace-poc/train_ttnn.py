@@ -1076,6 +1076,10 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             step_loss += loss_val
 
             # Deallocate logits (no longer needed after loss computation)
+            # REVIEWED: synchronize device first so the async command queue
+            # releases its references — without this, ttnn.deallocate(force=False)
+            # silently skips because use_count > 1 (queue still holds a ref).
+            ttnn.synchronize_device(device)
             _safe_deallocate(logits)
 
             # Workspace regularizers (entropy + diversity)
@@ -1092,6 +1096,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 grads = model.backward(grad_logits)
 
             # Deallocate grad_logits (consumed by backward)
+            # REVIEWED: synchronize so async queue releases refs before dealloc.
+            ttnn.synchronize_device(device)
             _safe_deallocate(grad_logits)
 
             # Accumulate gradients (host-side) — transfers to host, then we
@@ -1107,6 +1113,8 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
                 _safe_deallocate(g)
 
             # Clear model's forward/backward caches to free intermediate tensors
+            # REVIEWED: synchronize so async queue releases refs to cached tensors.
+            ttnn.synchronize_device(device)
             model.clear_caches()
 
         # Average loss over accumulation steps
