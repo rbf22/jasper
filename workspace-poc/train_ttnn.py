@@ -760,12 +760,19 @@ def accumulate_grads(acc_grads: dict, new_grads: dict, accum_factor: int):
     new_grads: dict of name -> tt-nn gradient tensor
     accum_factor: divide new grads by this before adding
     """
+    inv_factor = 1.0 / accum_factor
     for name, tt_grad in new_grads.items():
-        grad_host = ttnn.to_torch(tt_grad).float() / accum_factor
+        # Transfer to host and convert to fp32. Explicitly del the
+        # to_torch intermediate to release the host-side mapping promptly.
+        host_raw = ttnn.to_torch(tt_grad)
+        grad_host = host_raw.float()
+        del host_raw
+        grad_host.mul_(inv_factor)  # in-place scale
         if name not in acc_grads:
             acc_grads[name] = grad_host.clone()
         else:
-            acc_grads[name] += grad_host
+            acc_grads[name].add_(grad_host)
+        del grad_host
 
 
 def host_grads_to_tt(acc_grads: dict, device) -> dict:
