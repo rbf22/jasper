@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate narrative multi-hop logic puzzles for the Jasper text-MVP.
+"""Generate narrative multi-hop logic puzzles for the WRAP text-MVP.
 
 Each line is one self-contained story that ends with a question and its
 answer. The model is trained with standard next-token prediction, so it must
@@ -226,7 +226,7 @@ def write_puzzles(n, out_path, seed):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate logic puzzle text data for Jasper")
+    parser = argparse.ArgumentParser(description="Generate logic puzzle text data for WRAP")
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data")
     parser.add_argument("--n-train", type=int, default=500_000)
     parser.add_argument("--n-valid", type=int, default=5_000)

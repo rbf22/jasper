@@ -15,7 +15,7 @@ import ttnn
 MVP_DIR = os.path.dirname(os.path.abspath(__file__))
 POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "workspace-poc"))
 if not os.path.isdir(POC_DIR):
-    POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "mamba-poc"))
+    POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "workspace-poc"))
 sys.path.insert(0, POC_DIR)
 sys.path.insert(0, MVP_DIR)
 

@@ -1,6 +1,6 @@
-# Infrastructure Setup Guide: Mamba + Workspace Proof-of-Concept
+# Infrastructure Setup Guide: WRAP + Workspace Proof-of-Concept
 
-## Companion to "Desktop Proof-of-Concept: Mamba + Engineered Workspace for Reasoning"
+## Companion to "Desktop Proof-of-Concept: WRAP + Engineered Workspace for Reasoning"
 
 *July 2026*
 
@@ -23,8 +23,8 @@ Skip AWS and GCP free tier for this experiment: GCP's free tier is CPU-only and 
 
 ```bash
 # Environment
-python3 -m venv mamba-poc
-source mamba-poc/bin/activate
+python3 -m venv wrap-poc
+source wrap-poc/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu  # MPS build ships in base torch on macOS
 pip install wandb einops numpy pytest
 
@@ -40,7 +40,7 @@ print(torch.backends.mps.is_available())  # should print True on M2/M3/M4
 
 Repo skeleton (hand this + the main plan's Sections 3–6 to Claude Code as the spec):
 ```
-mamba-poc/
+workspace-poc/
   data.py        # 3 task generators + verifiers + unit tests
   model.py        # 4 cells behind config flags: use_attention, use_workspace, recurrent_core, k_train_max
   train.py         # training loop, checkpoint every 15 min, wandb logging
@@ -67,7 +67,7 @@ Run the smoke test (5M params, Task 1 depth-4 only, ~10 min) before touching any
 ```bash
 !pip install -q mamba-ssm causal-conv1d wandb einops
 ```
-T4 is Turing — no bf16 support, so set `dtype=fp16` with gradient scaling in your training config. The `mamba-ssm` Triton kernels are occasionally flaky on T4; if you hit kernel errors, fall back to the pure-PyTorch Mamba2 path from Stage 1.
+T4 is Turing — no bf16 support, so set `dtype=fp16` with gradient scaling in your training config. The `mamba-ssm` Triton kernels are occasionally flaky on T4; if you hit kernel errors, fall back to the pure-PyTorch SSM path from Stage 1.
 
 5. Run **cell B** and **cell D** only (the pair that actually decides go/no-go) at the full ~2B-token budget — each takes roughly 12 hours on a T4, so budget one session per cell. Kaggle gives 30 GPU-hours/week, so both fit with margin.
 6. Log wandb runs with a consistent naming scheme (`cellB-seed1-kaggle`, etc.) so Stage 3 runs land in the same project and are directly comparable.
@@ -85,7 +85,7 @@ If sessions disconnect: your `train.py` resume logic handles it — just restart
 5. SSH in (RunPod gives you the command directly) or use their web terminal:
 ```bash
 git clone <your repo>
-cd mamba-poc
+cd workspace-poc
 pip install -r requirements.txt   # torch, mamba-ssm, causal-conv1d, wandb, einops
 wandb login   # paste your API key once
 ```

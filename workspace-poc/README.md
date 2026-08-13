@@ -1,14 +1,14 @@
-# Jasper POC — Code Guide
+# WRAP POC — Code Guide
 
-**Jasper** is a workspace-augmented retention network with recurrent core —
+**WRAP** is a workspace-augmented retention network with recurrent core —
 a novel architecture that combines RetNet-style linear attention, Perceiver-style
 external memory (workspace), depth-recurrent iteration, and attention residuals
 into a unified model. This is the code for a desktop-scale proof-of-concept that
-tests whether Jasper reasons better than parameter-matched controls. The
+tests whether WRAP reasons better than parameter-matched controls. The
 experiment takes ~1 week and ~$20–30, and produces a go/no-go decision for a
 $3–5K language-scale ablation.
 
-See the [root README](../README.md) for the project overview and [desktop-jasper-workspace-poc.md](../desktop-jasper-workspace-poc.md) for the full experiment design.
+See the [root README](../README.md) for the project overview and [desktop-wrap-poc.md](../desktop-wrap-poc.md) for the full experiment design.
 
 ---
 
@@ -17,8 +17,8 @@ See the [root README](../README.md) for the project overview and [desktop-jasper
 | File | What it does |
 |------|-------------|
 | `data.py` | Three synthetic task generators with verifiers, character-level vocabulary, batch generation, and unit tests. Each task has a depth knob `k` controlling reasoning steps. |
-| `model.py` | PyTorch reference model (`MambaWorkspaceModel`/`WorkspaceModule`) — no longer used for full training (`model_ttnn.py` is the active Jasper implementation), but kept as the CPU-side correctness reference for the workspace backward pass. |
-| `model_ttnn.py` | Jasper model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes the TTWorkspaceModule (perceiver-style workspace with QK-Norm and ReZero gates), custom fused kernels for RoPE, scale+decay, and gate backward, and the retention layer. |
+| `model.py` | PyTorch reference model (`WRAPModel`/`WorkspaceModule`) — no longer used for full training (`model_ttnn.py` is the active WRAP implementation), but kept as the CPU-side correctness reference for the workspace backward pass. |
+| `model_ttnn.py` | WRAP model implementation using `ttnn` ops (bfloat16). Same architecture as `model.py` but compiled for Blackhole chips. Includes the TTWorkspaceModule (perceiver-style workspace with QK-Norm and ReZero gates), custom fused kernels for RoPE, scale+decay, and gate backward, and the retention layer. |
 | `retention_reference.py` | PyTorch reference implementation of the retention layer (decayed linear attention + RoPE). Used for parity testing. |
 | `train_ttnn.py` | Tenstorrent-native training loop. Runs on Blackhole chips via `ttnn`, bfloat16-native computation. Used for the current Quietbox 2 experiments. |
 | `eval_ttnn.py` | Checkpoint evaluation script for Tenstorrent. Loads a `.pt` checkpoint, runs the model on generated eval examples, reports accuracy per task and per depth. Supports JSON output for automated tracking. |
@@ -46,7 +46,7 @@ runners), `diagnose_explosion.py`/`diagnose_workspace.py`/`monitor_dynamics.py`/
 instability issues that are now fixed and documented in `AGENTS.md`), and `loader.py` (an
 unrelated, misplaced Tenstorrent Forge model-loader file with no references in this project).
 Also removed: orphaned `run_A/`, `run_B/`, `run_C/` directories (symlinks pointing at the
-pre-rename `mamba-poc/` path, which no longer exists), a stray venv accidentally created inside
+pre-rename `mamba-poc/` path (old name, now `workspace-poc/`, which no longer exists at the old path), a stray venv accidentally created inside
 this directory, and superseded checkpoints (`causal_fix_b/`, `causal_fix_c/`, and loose
 pre-retention-layer `cell_{A,B,C}_step*.pt` files).
 
@@ -93,19 +93,19 @@ Exists purely for the selective-ablation test (R4): the J-space signature requir
 
 All cells are ~25–30M parameters, `d_model=384`, vocabulary ~128 (character-level). They form an ablation ladder — each adds one component so marginal contributions are isolated.
 
-> **Rename note (2026-07-31):** Cells were renamed after the pure-Mamba2 (old A) and Mamba2+attention (old B) cells were deprecated and removed. Old E→A, old C→B, old D→C. See AGENTS.md for details.
+> **Rename note (2026-07-31):** Cells were renamed after the pure-SSM (old A) and SSM+attention (old B) cells were deprecated and removed. Old E→A, old C→B, old D→C. See AGENTS.md for details.
 
 | Cell | Architecture | Config flags | Key params |
 |------|-------------|--------------|------------|
-| **A** | Hybrid (Mamba-3 + 2 attention at positions 5, 10), no workspace | `use_attention=true, use_workspace=false, recurrent_core=false` | The no-workspace control — isolates workspace effect |
-| **B** | Hybrid + workspace (Mamba-3 + 2 attention + 16-slot perceiver workspace with QK-Norm + ReZero gates) | `use_attention=true, use_workspace=true, recurrent_core=false` | Does an engineered workspace help without recurrence? |
+| **A** | Hybrid (retention + 2 attention at positions 5, 10), no workspace | `use_attention=true, use_workspace=false, recurrent_core=false` | The no-workspace control — isolates workspace effect |
+| **B** | Hybrid + workspace (retention + 2 attention + 16-slot perceiver workspace with QK-Norm + ReZero gates) | `use_attention=true, use_workspace=true, recurrent_core=false` | Does an engineered workspace help without recurrence? |
 | **C** | Full architecture (hybrid + workspace + layers 6–9 looped K=6 times with attention residuals) | `use_attention=true, use_workspace=true, recurrent_core=true, attention_residual_core=true` | The go/no-go cell |
 
 Cell C's recurrent core (layers 6–9) is applied K times per forward pass. During training, K is sampled uniformly from {1…6} per batch. At inference, K can be swept (the `k_inference` config field or `--k_override` in code). K was temporarily reduced from 6 to 3 to limit gradient amplification, then restored to 6 after fixing the slot-state gradient scaling (see "Training stabilization" below).
 
 The primary Cell C config is `cell_c_attn_residual.yaml`, which uses an **attention residual core** (Kimi K3-style) instead of the fixed blend. This stores all K iteration outputs and computes learned softmax attention over them, bounding output magnitude and providing consistent gradient magnitude across iterations. See "Attention Residual Core" below.
 
-Cell B removes one Mamba layer (13 vs 14) to compensate for the ~2M workspace parameters, keeping cells parameter-matched.
+Cell B removes one SSM layer (13 vs 14) to compensate for the ~2M workspace parameters, keeping cells parameter-matched.
 
 ### Comparison logic
 
@@ -434,12 +434,12 @@ accuracy. Do not compare loss across configurations without keeping this in mind
 **Mac / NVIDIA (PyTorch path):**
 ```bash
 # From the repo root
-python3 -m venv mamba-poc
-source mamba-poc/bin/activate
-pip install -r mamba-poc/requirements.txt
+python3 -m venv wrap-poc
+source wrap-poc/bin/activate
+pip install -r wrap-poc/requirements.txt
 ```
 
-On Mac (MPS): `torch` ships with MPS support — no special install needed. The `mamba-ssm` CUDA kernels won't install; the pure-PyTorch Mamba2 layer in `model.py` works on MPS directly.
+On Mac (MPS): `torch` ships with MPS support — no special install needed. The `mamba-ssm` CUDA kernels won't install; the pure-PyTorch SSM layer in `model.py` works on MPS directly.
 
 On NVIDIA (CUDA): optionally `pip install mamba-ssm causal-conv1d` for faster kernels, though the pure-PyTorch path works everywhere.
 
@@ -554,12 +554,12 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `d_model` | 384 | Hidden dimension |
 | `n_layers` | 14 (A) or 13 (B/C) | Total layer count |
 | `vocab_size` | 128 | Character-level vocabulary (padded) |
-| `d_state` | 64 | Mamba2 state dimension |
-| `d_conv` | 4 | Mamba2 conv1d width |
-| `expand` | 4 | Mamba2 expansion factor |
-| `n_heads` | 4 | Attention heads (shared by Mamba2 SSD and attention) |
+| `d_state` | 64 | SSM state dimension |
+| `d_conv` | 4 | SSM conv1d width |
+| `expand` | 4 | SSM expansion factor |
+| `n_heads` | 4 | Attention heads (shared by SSM and attention) |
 | `use_attention` | false | Whether to include attention layers |
-| `attention_positions` | [5, 10] | Which layer indices are attention (rest are Mamba2) |
+| `attention_positions` | [5, 10] | Which layer indices are attention (rest are SSM) |
 | `use_workspace` | false | Whether to include the perceiver workspace module |
 | `n_workspace_slots` | 16 | Number of workspace slot vectors |
 | `recurrent_core` | false | Whether layers `core_start` to `core_end` are looped K times |
@@ -599,7 +599,7 @@ All fields in the YAML configs can override `ModelConfig` defaults in `model.py`
 | `plateau_min_delta` | 1e-3 | Early stopping: minimum relative improvement to reset patience (0.1%) |
 | `seed` | 42 | Random seed for data generation |
 | `wandb` | false | Enable wandb logging |
-| `wandb_project` | `mamba-workspace-poc` | Wandb project name |
+| `wandb_project` | `wrap-poc` | Wandb project name |
 | `run_name` | `cellX-seed1` | Wandb run name |
 | `ckpt_dir` | `checkpoints` | Checkpoint directory |
 | `resume` | true | Auto-resume from latest checkpoint |
@@ -646,7 +646,7 @@ not a runnable training path. See
 
 ## Current experimental status (as of August 2026)
 
-Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). The model is **Jasper** — a workspace-augmented retention network with recurrent core.
+Training is running on a Tenstorrent Quietbox 2 (4× Blackhole chips, bfloat16-native). The model is **WRAP** — a workspace-augmented retention network with recurrent core.
 
 ### Synthetic training (workspace-poc/)
 
@@ -667,7 +667,7 @@ All previous runs showed grad norm oscillation by step 200. This run is stable �
 
 ### Text POC (workspace-mvp/)
 
-A text training pipeline has been set up in `workspace-mvp/` to test Jasper on real language data. It uses TinyStories (~480M tokens, GPT-2 BPE tokenization) with the same Cell C AR architecture. The model is 29.8M params (10.5M architecture + 19.3M embedding for the 50K vocab).
+A text training pipeline has been set up in `workspace-mvp/` to test WRAP on real language data. It uses TinyStories (~480M tokens, GPT-2 BPE tokenization) with the same Cell C AR architecture. The model is 29.8M params (10.5M architecture + 19.3M embedding for the 50K vocab).
 
 Smoke-tested (200 steps): loss 10.92 → 9.24, perplexity ~50K → 10,595, grad norm stable at 1.2-2.9. Ready for full training launch after the synthetic Cell C run validates the architecture.
 
@@ -675,7 +675,7 @@ See AGENTS.md for full details on the text POC setup.
 
 ### Architecture changes since the original plan
 
-1. **Mamba-2 → Retention**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. Implemented as `TTRetentionLayer` in `model_ttnn.py`.
+1. **SSM → Retention**: The selective scan SSM was replaced with decayed linear attention (RetNet-style). This is simpler, faster on tt-nn, and avoids the causal conv1d issues with ttnn. The decay matrix D[t,s] = gamma^(t-s) is computed on-device. Implemented as `TTRetentionLayer` in `model_ttnn.py`.
 
 2. **Custom fused kernels**: Three custom tt-metal kernels eliminate intermediate DRAM writes and reduce op dispatch overhead:
    - **Fused RoPE**: Full rotation (rot1 = x1*cos - x2*sin, rot2 = x1*sin + x2*cos) in a single kernel pass. Uses split-RoPE optimization to avoid expensive sub-tile concat/slice when d_half=48 is not tile-aligned.
@@ -702,6 +702,6 @@ See AGENTS.md for full details on the text POC setup.
 - **Cell B with gate clamping**: Cell B (with `gate_clamp_bound: 0.3`, reduced gate LR 3x, `freeze_slot_decay: true`) is at step 600+ with gates growing 3x slower than the diverged run and no spikes.
 - **Cell A vs Cell B**: The clean workspace comparison (same LR=2e-4, A has no workspace). If B beats A on Task 1, the workspace is doing real work.
 - **Cell C convergence**: The full architecture (workspace + recurrence) is ~2x slower per step. Will it converge within the training budget?
-- **Text POC convergence**: Does Jasper learn coherent language on TinyStories? If so, the workspace + recurrent core works on real text, not just synthetic tasks.
+- **Text POC convergence**: Does WRAP learn coherent language on TinyStories? If so, the workspace + recurrent core works on real text, not just synthetic tasks.
 - **Cell C K-sweep (R2)**: Does increasing K at inference improve accuracy on hard problems?
 - **Selective ablation (R4)**: Does replacing workspace slots with their mean collapse Tasks 1–2 while leaving Task 3 intact?

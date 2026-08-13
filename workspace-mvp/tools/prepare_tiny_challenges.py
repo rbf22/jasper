@@ -40,7 +40,7 @@ def load_lines(path, max_n=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare tiny-challenges corpus for Jasper")
+    parser = argparse.ArgumentParser(description="Prepare tiny-challenges corpus for WRAP")
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data")
     parser.add_argument("--n-train", type=int, default=2_000_000)
     parser.add_argument("--n-valid", type=int, default=20_000)

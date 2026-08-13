@@ -1,5 +1,5 @@
 """
-Data generators, verifiers, and vocabulary for the Mamba + Workspace POC.
+Data generators, verifiers, and vocabulary for the WRAP Workspace POC.
 
 Three synthetic tasks with controllable depth:
   Task 1: Chained assignment arithmetic (multi-hop composition) — mod 97

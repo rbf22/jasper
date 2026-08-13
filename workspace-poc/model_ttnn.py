@@ -1,5 +1,5 @@
 """
-Tenstorrent native (tt-nn) implementation of the Mamba + Workspace model.
+Tenstorrent native (tt-nn) implementation of the WRAP model.
 
 This is a rewrite of model.py using tt-nn operations directly, bypassing
 PyTorch/XLA entirely. The forward pass uses tt-nn ops on the Blackhole device.
@@ -96,15 +96,15 @@ class ModelConfig:
     slot_permutation: bool = False      # randomly permute slot indices each forward pass (breaks fixed routing)
     gate_schedule_steps: int = 0        # >0: anneal gates from gate_init to 0 over this many steps (no-op with ReZero)
     gate_clamp_bound: float = 0.0       # >0: clamp ReZero gates to [-bound, bound] after each optimizer step. Prevents RMSNorm cancellation when gates grow large negative (causal masking makes workspace contribution noise → model suppresses it → gate grows negative → pre-norm residual cancels → 1/RMS amplifies gradient). 0.0 = disabled (backward compat).
-    # --- Mamba-3 MIMO config ---
+    # --- SSM MIMO config ---
     headdim: int = 64                   # SSM head dimension (d_inner // headdim = nheads)
-    d_state_m3: int = 64                # SSM state size for Mamba-3 (can differ from d_state)
+    d_state_ssm: int = 64                # SSM state size (can differ from d_state)
     mimo_rank: int = 4                  # MIMO rank R (parallel SSMs per head)
     rope_fraction: float = 0.5          # fraction of d_state to apply RoPE to
     ngroups: int = 1                    # number of BC heads (1 = shared B/C across all heads)
     # --- Kimi K3 architectural updates ---
     short_conv: bool = False            # depthwise causal conv1d (kernel=3) before QKV in retention
-    short_conv_kernel: int = 3          # conv kernel size (3 = standard in KDA/Mamba2)
+    short_conv_kernel: int = 3          # conv kernel size (3 = standard in KDA)
     per_channel_decay: bool = False     # per-channel gamma: (n_heads, d_head) instead of (n_heads,)
 
     @property
@@ -116,14 +116,14 @@ class ModelConfig:
         return self.d_inner // self.n_heads
 
     @property
-    def nheads_m3(self):
-        """Number of SSM heads for Mamba-3 (d_inner // headdim)."""
+    def nheads_ssm(self):
+        """Number of SSM heads (d_inner // headdim)."""
         return self.d_inner // self.headdim
 
     @property
     def num_rope_angles(self):
-        """Number of RoPE angles for Mamba-3 complex SSM."""
-        split = int(self.d_state_m3 * self.rope_fraction)
+        """Number of RoPE angles for complex SSM."""
+        split = int(self.d_state_ssm * self.rope_fraction)
         if split % 2 != 0:
             split -= 1
         return split // 2
@@ -3819,7 +3819,7 @@ class AttentionResidual:
             self.scale = params["ar_scale"]
 
 
-class TTMambaWorkspaceModel:
+class TTWRAPModel:
     """Full model using tt-nn operations.
 
     Supports Cell A (Mamba2 + attention, no workspace — control),
@@ -5063,7 +5063,7 @@ class TTMambaWorkspaceModel:
                 "n_layers": self.config.n_layers,
                 "vocab_size": self.config.vocab_size,
                 "headdim": self.config.headdim,
-                "d_state_m3": self.config.d_state_m3,
+                "d_state_ssm": self.config.d_state_ssm,
                 "mimo_rank": self.config.mimo_rank,
                 "rope_fraction": self.config.rope_fraction,
                 "ngroups": self.config.ngroups,

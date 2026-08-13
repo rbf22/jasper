@@ -1,13 +1,13 @@
-# Jasper MVP — Text POC
+# WRAP MVP — Text POC
 
 ## Overview
 
-Text training pipeline for **Jasper** — a workspace-augmented retention
-network with recurrent core. Jasper combines RetNet-style linear attention,
+Text training pipeline for **WRAP** — a workspace-augmented retention
+network with recurrent core. WRAP combines RetNet-style linear attention,
 Perceiver-style external memory (workspace), depth-recurrent iteration, and
 attention residuals into a unified architecture.
 
-This directory trains the same Jasper model as `workspace-poc/` but on real
+This directory trains the same WRAP model as `workspace-poc/` but on real
 text (TinyStories) instead of synthetic arithmetic tasks. The goal is to
 validate that the architecture can learn coherent language before scaling
 to larger models and reasoning datasets.
@@ -38,7 +38,7 @@ of the model code.
 
 ## Architecture
 
-Same Jasper architecture as `workspace-poc/` Cell C AR:
+Same WRAP architecture as `workspace-poc/` Cell C AR:
 - 13 layers, d_model=384, n_heads=4
 - Retention layers (decayed linear attention) for non-attention positions
 - Attention at layers 5 and 10

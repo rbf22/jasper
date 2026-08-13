@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Download the TinyStories dataset and format it for the Jasper text-MVP.
+"""Download the TinyStories dataset and format it for the WRAP text-MVP.
 
 Output:
     jasper/workspace-mvp/data/tinystories_train.txt
     jasper/workspace-mvp/data/tinystories_valid.txt
 
-Each line is one story. The Jasper TextDataset will tokenize these files
+Each line is one story. The WRAP TextDataset will tokenize these files
 with GPT-2 BPE and cache them as .tokens.pt on first use.
 """
 
@@ -52,7 +52,7 @@ def write_split(split_data, out_path, text_field):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare TinyStories for Jasper")
+    parser = argparse.ArgumentParser(description="Prepare TinyStories for WRAP")
     parser.add_argument(
         "--dataset",
         type=str,

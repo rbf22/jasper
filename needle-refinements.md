@@ -1,6 +1,6 @@
 # Refinements from Cactus Needle (Simple Attention Networks)
 
-*Analysis of Needle by Cactus Compute — a 26M parameter attention-only function-calling model — and its implications for Jasper's architecture. Revised after a codebase review: verdicts and full implementation instructions below.*
+*Analysis of Needle by Cactus Compute — a 26M parameter attention-only function-calling model — and its implications for WRAP's architecture. Revised after a codebase review: verdicts and full implementation instructions below.*
 
 Source: [cactus-compute/needle](https://github.com/cactus-compute/needle), [HN discussion](https://news.ycombinator.com/item?id=48111896), [Simple Attention Networks doc](https://github.com/cactus-compute/needle/blob/main/docs/simple_attention_networks.md)
 
@@ -13,22 +13,22 @@ Source: [cactus-compute/needle](https://github.com/cactus-compute/needle), [HN d
 | 1. Gated residuals | **ADOPT** | Bigger than stated: the trunk currently has *no* residuals at all |
 | 2. ZCRMSNorm | **ADOPT** | Trivial, pairs with #1; only makes sense with residuals in place |
 | 3. z-loss | **ADOPT** | Cheap insurance; fp16 AMP + recurrent loop + reactive-only NaN guard |
-| 4. Muon optimizer | **DEFER** | Collapse premise weak here: only 2 attention layers, Mamba is full of SiLU nonlinearities. Revisit only if #1–#2 don't stabilize Cell D |
-| 5. INT4 QAT during training | **DEFER to 1B plan** | Needle's rationale is overfitting regularization; Jasper generates fresh data every batch, so it doesn't apply. Keep in 1B Phase 3 |
+| 4. Muon optimizer | **DEFER** | Collapse premise weak here: only 2 attention layers, the SSM is full of SiLU nonlinearities. Revisit only if #1–#2 don't stabilize Cell D |
+| 5. INT4 QAT during training | **DEFER to 1B plan** | Needle's rationale is overfitting regularization; WRAP generates fresh data every batch, so it doesn't apply. Keep in 1B Phase 3 |
 | 6. Token-level loss weighting | **SKIP** | Already done: `data.py` masks all non-answer positions with `-100` (prompt weight = 0, the extreme version) |
 | 7. No-FFN core layers | **SKIP for POC / ablation for 1B** | POC has no FFN blocks anywhere. 1B plan does spec SwiGLU MLPs — keep as an ablation there, not a default |
 
-The three ADOPT items are implemented together below. **They change the architecture, so old checkpoints are incompatible — delete `mamba-poc/checkpoints/cell*_latest.pt` or set `resume: false` before retraining.**
+The three ADOPT items are implemented together below. **They change the architecture, so old checkpoints are incompatible — delete `workspace-poc/checkpoints/cell*_latest.pt` or set `resume: false` before retraining.**
 
 ---
 
 # Implementation guide
 
-All changes are in `mamba-poc/model.py` and `mamba-poc/train.py`. Do them in order; steps 1 and 2 are one coherent change.
+All changes are in `workspace-poc/model.py` and `workspace-poc/train.py`. Do them in order; steps 1 and 2 are one coherent change.
 
 ## Step 1: ZCRMSNorm (`model.py`)
 
-Replace the `RMSNorm` class body. Keep the class name `RMSNorm` so all call sites (`Mamba2Layer.norm`, `WorkspaceModule.norm`/`slot_norm`, final `MambaWorkspaceModel.norm`) pick it up unchanged.
+Replace the `RMSNorm` class body. Keep the class name `RMSNorm` so all call sites (`SSMLayer.norm`, `WorkspaceModule.norm`/`slot_norm`, final `WRAPModel.norm`) pick it up unchanged.
 
 Current code (`model.py`, ~line 59):
 
@@ -61,7 +61,7 @@ class RMSNorm(nn.Module):
 ```
 
 Notes:
-- `self.weight` is an `nn.Parameter`, not an `nn.Linear`, so `MambaWorkspaceModel._init_weights` will not clobber the zero init. No other change needed.
+- `self.weight` is an `nn.Parameter`, not an `nn.Linear`, so `WRAPModel._init_weights` will not clobber the zero init. No other change needed.
 - Parameter count is unchanged.
 
 ## Step 2: Gated residuals + trunk residuals (`model.py`)
@@ -90,7 +90,7 @@ class GatedBlock(nn.Module):
         return x + torch.sigmoid(self.gate) * self.layer(self.norm(x))
 ```
 
-### 2b. Wrap trunk layers in `MambaWorkspaceModel.__init__`
+### 2b. Wrap trunk layers in `WRAPModel.__init__`
 
 Current code (~line 339):
 
@@ -100,7 +100,7 @@ for i in range(config.n_layers):
     if config.use_attention and i in config.attention_positions:
         self.layers.append(AttentionLayer(config))
     else:
-        self.layers.append(Mamba2Layer(config))
+        self.layers.append(SSMLayer(config))
 ```
 
 Replace with:
@@ -111,11 +111,11 @@ for i in range(config.n_layers):
     if config.use_attention and i in config.attention_positions:
         inner = AttentionLayer(config)
     else:
-        inner = Mamba2Layer(config)
+        inner = SSMLayer(config)
     self.layers.append(GatedBlock(inner, config.d_model))
 ```
 
-No change is needed in `MambaWorkspaceModel.forward` — every `x = self.layers[i](x)` call site now goes through the gated residual automatically, including the K-loop in Phase 2.
+No change is needed in `WRAPModel.forward` — every `x = self.layers[i](x)` call site now goes through the gated residual automatically, including the K-loop in Phase 2.
 
 ### 2c. Gate the workspace residuals in `WorkspaceModule`
 
@@ -199,7 +199,7 @@ Notes:
 
 ```bash
 # 1. Param counts still ~30M and matched across cells
-cd mamba-poc && python model.py
+cd workspace-poc && python model.py
 
 # 2. End-to-end smoke test (Cell D with recurrence, 200 steps, no wandb)
 python train.py --config configs/cell_d.yaml --smoke-test
@@ -221,7 +221,7 @@ To measure the effect: run Cell D before/after on the same config and compare `d
 
 Needle uses `x = x + sigmoid(gate) * Attn(Norm(x))` with `gate` initialized to 0.
 
-**Correction from code review:** the doc originally claimed Jasper uses standard `x = x + layer(x)` residuals. It doesn't — the trunk has *no* residual connections (layer outputs replace the stream). This makes the change more valuable than originally scoped: it is closer to a bug fix. The recurrent core (Cell D) re-applies the same layers K times; gated residuals let the model dampen or sharpen specific layers per iteration, directly addressing the stability of the recurrent depth loop.
+**Correction from code review:** the doc originally claimed WRAP uses standard `x = x + layer(x)` residuals. It doesn't — the trunk has *no* residual connections (layer outputs replace the stream). This makes the change more valuable than originally scoped: it is closer to a bug fix. The recurrent core (Cell D) re-applies the same layers K times; gated residuals let the model dampen or sharpen specific layers per iteration, directly addressing the stability of the recurrent depth loop.
 
 ## 2. ZCRMSNorm — ADOPTED
 
@@ -229,7 +229,7 @@ Needle uses `x = x + sigmoid(gate) * Attn(Norm(x))` with `gate` initialized to 0
 
 ## 3. Muon Optimizer — DEFERRED
 
-Needle's argument: without FFN nonlinearities between attention layers, deep attention stacks suffer representation collapse, and Muon's orthogonalized updates prevent it. Jasper has only 2 attention layers and the Mamba2 layers are saturated with SiLU and gating, so the collapse premise doesn't cleanly transfer. A dual optimizer also complicates `save_checkpoint`/`load_checkpoint`/scheduler logic for uncertain gain at 30M scale. Revisit only if Cell D remains unstable after steps 1–3.
+Needle's argument: without FFN nonlinearities between attention layers, deep attention stacks suffer representation collapse, and Muon's orthogonalized updates prevent it. WRAP has only 2 attention layers and the SSM layers are saturated with SiLU and gating, so the collapse premise doesn't cleanly transfer. A dual optimizer also complicates `save_checkpoint`/`load_checkpoint`/scheduler logic for uncertain gain at 30M scale. Revisit only if Cell D remains unstable after steps 1–3.
 
 ## 4. z-loss — ADOPTED
 
@@ -237,12 +237,12 @@ Training uses fp16 AMP on CUDA with tied embeddings, and NaN handling is purely 
 
 ## 5. INT4 QAT During Training — DEFERRED to 1B plan
 
-Needle's rationale is that quantization noise regularizes small models with high overfitting risk. Jasper's POC generates fresh data every batch — there is no overfitting to regularize. The deployment-robustness argument is real but belongs where it already is: `workspace-recurrent-1b-plan.md` Phase 3. Adding QAT to the POC would also add noise to the A/B/C/D comparison, which is the POC's purpose.
+Needle's rationale is that quantization noise regularizes small models with high overfitting risk. WRAP's POC generates fresh data every batch — there is no overfitting to regularize. The deployment-robustness argument is real but belongs where it already is: `workspace-recurrent-1b-plan.md` Phase 3. Adding QAT to the POC would also add noise to the A/B/C/D comparison, which is the POC's purpose.
 
 ## 6. Token-Level Loss Weighting — SKIPPED
 
-Needle weights loss by token type (structure 1x, values 4x). Jasper already masks all non-answer positions with `-100` in `data.py` — prompt tokens get zero weight, the extreme version of this idea. Answers are a few characters, so intra-answer weighting has nothing to differentiate.
+Needle weights loss by token type (structure 1x, values 4x). WRAP already masks all non-answer positions with `-100` in `data.py` — prompt tokens get zero weight, the extreme version of this idea. Answers are a few characters, so intra-answer weighting has nothing to differentiate.
 
 ## 7. No-FFN Parameter Budget — SKIPPED for POC, ablation for 1B
 
-Needle's finding: at <50M scale on structured tasks, FFN params are wasted. The POC has no FFN blocks anywhere (`Mamba2Layer`'s expand-4 `in_proj`/gating plays that role internally; `AttentionLayer` has no MLP), so there is nothing to remove. The 1B plan (`workspace-recurrent-1b-plan.md` §2.1) does spec SwiGLU MLPs at 8/3 expansion — removing FFN from the 4 recurrent-core layers is a legitimate ablation there (cheaper K-loops, freed param budget), but Needle's evidence is at <50M scale on retrieval-style tasks, so treat it as an experiment, not a default.
+Needle's finding: at <50M scale on structured tasks, FFN params are wasted. The POC has no FFN blocks anywhere (the deprecated SSM layer's expand-4 `in_proj`/gating plays that role internally; `AttentionLayer` has no MLP), so there is nothing to remove. The 1B plan (`workspace-recurrent-1b-plan.md` §2.1) does spec SwiGLU MLPs at 8/3 expansion — removing FFN from the 4 recurrent-core layers is a legitimate ablation there (cheaper K-loops, freed param budget), but Needle's evidence is at <50M scale on retrieval-style tasks, so treat it as an experiment, not a default.

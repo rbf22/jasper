@@ -81,7 +81,7 @@ accum_steps: 0       # auto-compute
 
 # Wandb
 wandb: false
-wandb_project: mamba-workspace-text
+wandb_project: wrap-text
 run_name: text-cell-c-brainbashers
 
 # Checkpointing

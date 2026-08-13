@@ -1,7 +1,7 @@
 # Cell A on Tenstorrent Quietbox 2 — CONTROL for workspace comparison
-# Mamba2 + attention, no workspace, learning rate 2e-4.
+# Retention + attention, no workspace, learning rate 2e-4.
 #
-# Renamed from the old "Cell E" (2026-07-31, once the pytorch-Mamba2
+# Renamed from the old "Cell E" (2026-07-31, once the pytorch-SSM
 # cells A/B were deprecated and removed — see AGENTS.md).
 #
 # Comparison:
@@ -57,7 +57,7 @@ micro_batch_size: 0
 
 # Wandb
 wandb: false
-wandb_project: mamba-workspace-poc
+wandb_project: wrap-poc
 run_name: cellA-tt-seed1
 
 # Checkpointing — local only (no Google Drive on QB2)

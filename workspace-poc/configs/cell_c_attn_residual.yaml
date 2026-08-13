@@ -126,7 +126,7 @@ micro_batch_size: 0
 
 # Wandb
 wandb: false
-wandb_project: mamba-workspace-poc
+wandb_project: wrap-poc
 run_name: cellC-tt-attn-residual
 
 # Checkpointing

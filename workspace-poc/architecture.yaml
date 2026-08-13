@@ -1,4 +1,4 @@
-# Jasper Architecture Manifest
+# WRAP Architecture Manifest
 # Code-as-Data (CaD) Framework — Structural Architecture Manifest
 #
 # This is the single source of truth for the system's high-level structure.
@@ -11,7 +11,7 @@
 # data flow) MUST be reflected here before merging.
 
 manifest_version: 1
-project: jasper
+project: wrap
 description: >
   Workspace-augmented retention network with recurrent core. Combines
   RetNet-style linear attention, Perceiver-style external memory (workspace),
@@ -61,11 +61,11 @@ data_flows:
     flow:
       - source: data.py:sample_batch
         produces: "(input_ids, labels, task_ids) — torch.Tensor on host"
-      - step: model_ttnn.py:TTMambaWorkspaceModel.forward
+      - step: model_ttnn.py:TTWRAPModel.forward
         transforms: "input_ids -> logits (B, T, vocab_size) on device"
       - step: train_ttnn.py:cross_entropy_loss
         transforms: "logits + labels -> scalar loss on device"
-      - step: model_ttnn.py:TTMambaWorkspaceModel.backward
+      - step: model_ttnn.py:TTWRAPModel.backward
         transforms: "grad_loss -> per-parameter gradients on device"
       - step: train_ttnn.py:clip_grad_norm
         transforms: "gradients -> clipped gradients + grad_norm scalar"
@@ -83,11 +83,11 @@ data_flows:
     flow:
       - source: text_data.py:sample_text_batch
         produces: "(input_ids, labels, task_ids) — torch.Tensor on host"
-      - step: model_ttnn.py:TTMambaWorkspaceModel.forward
+      - step: model_ttnn.py:TTWRAPModel.forward
         transforms: "input_ids -> logits (B, T, 50257) on device"
       - step: train_text.py:cross_entropy_loss_host
         transforms: "logits + labels -> scalar loss on host (float32)"
-      - step: model_ttnn.py:TTMambaWorkspaceModel.backward
+      - step: model_ttnn.py:TTWRAPModel.backward
         transforms: "grad_loss -> per-parameter gradients on device"
       - step: train_ttnn.py:clip_grad_norm
         transforms: "gradients -> clipped gradients"
@@ -99,7 +99,7 @@ data_flows:
     flow:
       - source: data.py:generate_eval_set
         produces: "fixed eval examples with known answers"
-      - step: model_ttnn.py:TTMambaWorkspaceModel.forward
+      - step: model_ttnn.py:TTWRAPModel.forward
         transforms: "input_ids -> logits"
       - step: eval_ttnn.py:evaluate
         transforms: "logits -> predictions -> accuracy via data.py verifiers"

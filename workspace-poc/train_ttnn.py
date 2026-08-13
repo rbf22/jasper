@@ -1,7 +1,7 @@
 """
 Tenstorrent native training script using tt-nn.
 
-Trains the Mamba2 model directly on TT hardware using tt-nn ops,
+Trains the WRAP model directly on TT hardware using tt-nn ops,
 bypassing PyTorch/XLA entirely. Forward pass runs on device, backward
 pass uses a hybrid approach (tt-nn ops + host autograd for SSD), and
 the optimizer is AdamW implemented on host.
@@ -103,7 +103,7 @@ logger.remove()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from model_ttnn import TTMambaWorkspaceModel, ModelConfig
+from model_ttnn import TTWRAPModel, ModelConfig
 
 # Cache for identity matrix on device (avoids recreating every step)
 _identity_cache = {}  # (V, device_id) -> ttnn.Tensor
@@ -304,7 +304,7 @@ class TTAdamW:
         """Get the effective LR for a parameter, applying group multipliers."""
         return self.lr * self.param_lr_mult.get(name, 1.0)
 
-    def step(self, grads: dict, model: TTMambaWorkspaceModel):
+    def step(self, grads: dict, model: TTWRAPModel):
         """Apply one optimizer step — fully on device, fp32 master weights.
 
         grads: dict of name -> tt-nn gradient tensor
@@ -312,6 +312,25 @@ class TTAdamW:
         """
         self.step_count += 1
         device = self.device
+
+        # Pre-create fp32 scalar tensors for all scalar multiplications.
+        # WORKAROUND: ttnn.mul(tensor, python_float) has a program-cache bug
+        # where the first call's result is cached and returned for all
+        # subsequent calls with the same tensor shape, regardless of the
+        # scalar value. Using tensor-tensor mul avoids this.
+        b1_base, b2_base = self.beta1, self.beta2
+        bc1 = 1.0 - b1_base ** self.step_count
+        bc2 = 1.0 - b2_base ** self.step_count
+        _b1_tt = ttnn.from_torch(torch.tensor([b1_base], dtype=torch.float32),
+                                  dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        _1mb1_tt = ttnn.from_torch(torch.tensor([1.0 - b1_base], dtype=torch.float32),
+                                    dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        _inv_bc1_tt = ttnn.from_torch(torch.tensor([1.0 / bc1], dtype=torch.float32),
+                                       dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        _inv_bc2_tt = ttnn.from_torch(torch.tensor([1.0 / bc2], dtype=torch.float32),
+                                       dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        _eps_tt = ttnn.from_torch(torch.tensor([self.eps], dtype=torch.float32),
+                                   dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
 
         for name in self.param_names:
             if name not in grads:
@@ -332,41 +351,49 @@ class TTAdamW:
                 grad_for_update = grad
 
             lr = self.get_param_lr(name)
-            b1, b2, eps = self.beta1, self.param_beta2.get(name, self.beta2), self.eps
+            b2 = self.param_beta2.get(name, self.beta2)
             wd = self.param_wd.get(name, self.weight_decay)
 
+            # Per-param scalar tensors (b2 and wd can vary by param group)
+            _b2_tt = ttnn.from_torch(torch.tensor([b2], dtype=torch.float32),
+                                      dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+            _1mb2_tt = ttnn.from_torch(torch.tensor([1.0 - b2], dtype=torch.float32),
+                                        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+            _lr_tt = ttnn.from_torch(torch.tensor([lr], dtype=torch.float32),
+                                      dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+            _wd_scale_tt = ttnn.from_torch(torch.tensor([1.0 - lr * wd], dtype=torch.float32),
+                                            dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
             # m = b1*m + (1-b1)*g  — deallocate intermediates
-            m_b1 = ttnn.mul(m_old, b1)
-            g_1mb1 = ttnn.mul(grad_for_update, 1.0 - b1)
+            m_b1 = ttnn.mul(m_old, _b1_tt)
+            g_1mb1 = ttnn.mul(grad_for_update, _1mb1_tt)
             m = ttnn.add(m_b1, g_1mb1)
             _safe_deallocate(m_b1)
             _safe_deallocate(g_1mb1)
 
             # v = b2*v + (1-b2)*g^2
             g_sq = ttnn.mul(grad_for_update, grad_for_update)
-            v_b2 = ttnn.mul(v_old, b2)
-            g_sq_1mb2 = ttnn.mul(g_sq, 1.0 - b2)
+            v_b2 = ttnn.mul(v_old, _b2_tt)
+            g_sq_1mb2 = ttnn.mul(g_sq, _1mb2_tt)
             v = ttnn.add(v_b2, g_sq_1mb2)
             _safe_deallocate(g_sq)
             _safe_deallocate(v_b2)
             _safe_deallocate(g_sq_1mb2)
 
             # bias correction
-            bc1 = 1.0 - b1 ** self.step_count
-            bc2 = 1.0 - b2 ** self.step_count
-            m_hat = ttnn.mul(m, 1.0 / bc1)
-            v_hat = ttnn.mul(v, 1.0 / bc2)
+            m_hat = ttnn.mul(m, _inv_bc1_tt)
+            v_hat = ttnn.mul(v, _inv_bc2_tt)
 
             # param -= lr * m_hat / (sqrt(v_hat) + eps)
             sqrt_v = ttnn.sqrt(v_hat)
-            denom = ttnn.add(sqrt_v, eps)
+            denom = ttnn.add(sqrt_v, _eps_tt)
             update = ttnn.div(m_hat, denom)
             _safe_deallocate(sqrt_v)
             _safe_deallocate(denom)
             _safe_deallocate(m_hat)
             _safe_deallocate(v_hat)
 
-            update_scaled = ttnn.mul(update, lr)
+            update_scaled = ttnn.mul(update, _lr_tt)
             _safe_deallocate(update)
             param = ttnn.sub(param_old, update_scaled)
             _safe_deallocate(update_scaled)
@@ -385,9 +412,15 @@ class TTAdamW:
             # back is a place to check first. Use `wd_groups` in the config
             # (e.g. `wd_groups: {"suffix:_gate": 0.0}`) to exclude specific
             # params instead of changing this default.
-            param_wd = ttnn.mul(param, 1.0 - lr * wd)
+            param_wd = ttnn.mul(param, _wd_scale_tt)
             _safe_deallocate(param)
             param = param_wd
+
+            # Deallocate per-param scalar tensors
+            _safe_deallocate(_b2_tt)
+            _safe_deallocate(_1mb2_tt)
+            _safe_deallocate(_lr_tt)
+            _safe_deallocate(_wd_scale_tt)
 
             # Deallocate old optimizer state (replaced by new tensors above)
             _safe_deallocate(m_old)
@@ -413,7 +446,14 @@ class TTAdamW:
                     dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=param.device())
             self._set_model_param(model, name, param_bf16)
 
-    def _set_model_param(self, model: TTMambaWorkspaceModel, name: str, param: "ttnn.Tensor"):
+        # Deallocate step-level scalar tensors
+        _safe_deallocate(_b1_tt)
+        _safe_deallocate(_1mb1_tt)
+        _safe_deallocate(_inv_bc1_tt)
+        _safe_deallocate(_inv_bc2_tt)
+        _safe_deallocate(_eps_tt)
+
+    def _set_model_param(self, model: TTWRAPModel, name: str, param: "ttnn.Tensor"):
         """Update a model parameter from a device tensor (no transfer)."""
         if name == "token_emb_weight":
             _safe_deallocate(model.token_emb_weight)
@@ -446,7 +486,7 @@ class TTAdamW:
             "master": {k: ttnn.to_torch(v).clone() for k, v in self.master.items()},
         }
 
-    def sync_master_from_model(self, model: TTMambaWorkspaceModel, names: set = None):
+    def sync_master_from_model(self, model: TTWRAPModel, names: set = None):
         """Re-sync fp32 master copies from the model's current parameters.
 
         Call this after any operation that modifies model parameters outside
@@ -478,7 +518,7 @@ class TTAdamW:
                 self.master[name] = new_master
                 _safe_deallocate(old_master)
 
-    def load_state(self, state: dict, model: TTMambaWorkspaceModel):
+    def load_state(self, state: dict, model: TTWRAPModel):
         """Load optimizer state from checkpoint (transfers to device, in fp32)."""
         self.step_count = state.get("step_count", 0)
         self.lr = state.get("lr", self.base_lr)
@@ -932,7 +972,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     # (all cells now supported)
 
     # Create model
-    model = TTMambaWorkspaceModel(model_config, device)
+    model = TTWRAPModel(model_config, device)
     n_params = model.get_num_params()
     print(f"Model: {model_config.n_layers} layers, d_model={model_config.d_model}, "
           f"n_heads={model_config.n_heads}", flush=True)

@@ -1,0 +1,80 @@
+heap_v2/524288
+  t*: 1: 82338 [0: 0]
+  t0: 1: 82338 [0: 0]
+@ 0x7c1875a9db86 0x7c1875a9eacc 0x7c1875a9b389 0x7c1875a241af 0x7c18752b738f 0x7c1875d3d71f 0x7c1875d3d824 0x7c1875d575a0
+  t*: 1: 82338 [0: 0]
+  t0: 1: 82338 [0: 0]
+
+MAPPED_LIBRARIES:
+00400000-00420000 r--p 00000000 103:02 27787372                          /usr/bin/python3.12
+00420000-00703000 r-xp 00020000 103:02 27787372                          /usr/bin/python3.12
+00703000-00a28000 r--p 00303000 103:02 27787372                          /usr/bin/python3.12
+00a28000-00a29000 r--p 00627000 103:02 27787372                          /usr/bin/python3.12
+00a29000-00ba7000 rw-p 00628000 103:02 27787372                          /usr/bin/python3.12
+00ba7000-00bab000 rw-p 00000000 00:00 0 
+7c1874080000-7c1874300000 rw-p 00000000 00:00 0 
+7c1874300000-7c1874400000 rw-p 00000000 00:00 0 
+7c1874400000-7c1874975000 r--p 00000000 103:02 27787344                  /usr/lib/locale/locale-archive
+7c1874a00000-7c1875200000 rw-p 00000000 00:00 0 
+7c1875200000-7c187529d000 r--p 00000000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c187529d000-7c18753e5000 r-xp 0009d000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c18753e5000-7c187546c000 r--p 001e5000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c187546c000-7c1875477000 r--p 0026b000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c1875477000-7c187547a000 rw-p 00276000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c187547a000-7c187547e000 rw-p 00000000 00:00 0 
+7c1875500000-7c1875600000 rw-p 00000000 00:00 0 
+7c1875600000-7c1875628000 r--p 00000000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c1875628000-7c18757b0000 r-xp 00028000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c18757b0000-7c18757ff000 r--p 001b0000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c18757ff000-7c1875803000 r--p 001fe000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c1875803000-7c1875805000 rw-p 00202000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c1875805000-7c1875812000 rw-p 00000000 00:00 0 
+7c187589a000-7c18758a0000 r--p 00000000 103:02 27801206                  /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+7c18758a0000-7c18758b2000 r-xp 00006000 103:02 27801206                  /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+7c18758b2000-7c18758b8000 r--p 00018000 103:02 27801206                  /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+7c18758b8000-7c18758b9000 r--p 0001d000 103:02 27801206                  /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+7c18758b9000-7c18758bd000 rw-p 0001e000 103:02 27801206                  /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+7c18758bd000-7c18758c1000 r--p 00000000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c18758c1000-7c18758e5000 r-xp 00004000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c18758e5000-7c18758e9000 r--p 00028000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c18758e9000-7c18758ea000 r--p 0002b000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c18758ea000-7c18758eb000 rw-p 0002c000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c18758eb000-7c18758ef000 r--p 00000000 103:02 27787371                  /usr/lib/x86_64-linux-gnu/libexpat.so.1.9.1
+7c18758ef000-7c187590c000 r-xp 00004000 103:02 27787371                  /usr/lib/x86_64-linux-gnu/libexpat.so.1.9.1
+7c187590c000-7c1875914000 r--p 00021000 103:02 27787371                  /usr/lib/x86_64-linux-gnu/libexpat.so.1.9.1
+7c1875914000-7c1875916000 r--p 00028000 103:02 27787371                  /usr/lib/x86_64-linux-gnu/libexpat.so.1.9.1
+7c1875916000-7c1875917000 rw-p 0002a000 103:02 27787371                  /usr/lib/x86_64-linux-gnu/libexpat.so.1.9.1
+7c1875917000-7c1875927000 r--p 00000000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c1875927000-7c18759a6000 r-xp 00010000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c18759a6000-7c18759fe000 r--p 0008f000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c18759fe000-7c18759ff000 r--p 000e7000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c18759ff000-7c1875a00000 rw-p 000e8000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c1875a00000-7c1875a09000 r--p 00000000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c1875a09000-7c1875ab6000 r-xp 00009000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c1875ab6000-7c1875ac4000 r--p 000b6000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c1875ac4000-7c1875aca000 r--p 000c4000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c1875aca000-7c1875acb000 rw-p 000ca000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c1875acb000-7c1875cea000 rw-p 00000000 00:00 0 
+7c1875cec000-7c1875cee000 r--p 00000000 103:02 27798863                  /usr/lib/x86_64-linux-gnu/libffi.so.8.1.4
+7c1875cee000-7c1875cf5000 r-xp 00002000 103:02 27798863                  /usr/lib/x86_64-linux-gnu/libffi.so.8.1.4
+7c1875cf5000-7c1875cf6000 r--p 00009000 103:02 27798863                  /usr/lib/x86_64-linux-gnu/libffi.so.8.1.4
+7c1875cf6000-7c1875cf7000 r--p 0000a000 103:02 27798863                  /usr/lib/x86_64-linux-gnu/libffi.so.8.1.4
+7c1875cf7000-7c1875cf8000 rw-p 0000b000 103:02 27798863                  /usr/lib/x86_64-linux-gnu/libffi.so.8.1.4
+7c1875cf8000-7c1875d01000 rw-p 00000000 00:00 0 
+7c1875d01000-7c1875d03000 r--p 00000000 103:02 27799418                  /usr/lib/x86_64-linux-gnu/libz.so.1.3
+7c1875d03000-7c1875d15000 r-xp 00002000 103:02 27799418                  /usr/lib/x86_64-linux-gnu/libz.so.1.3
+7c1875d15000-7c1875d1b000 r--p 00014000 103:02 27799418                  /usr/lib/x86_64-linux-gnu/libz.so.1.3
+7c1875d1b000-7c1875d1c000 r--p 0001a000 103:02 27799418                  /usr/lib/x86_64-linux-gnu/libz.so.1.3
+7c1875d1c000-7c1875d1d000 rw-p 0001b000 103:02 27799418                  /usr/lib/x86_64-linux-gnu/libz.so.1.3
+7c1875d27000-7c1875d2e000 r--s 00000000 103:02 27814594                  /usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache
+7c1875d2e000-7c1875d30000 rw-p 00000000 00:00 0 
+7c1875d30000-7c1875d34000 r--p 00000000 00:00 0                          [vvar]
+7c1875d34000-7c1875d36000 r--p 00000000 00:00 0                          [vvar_vclock]
+7c1875d36000-7c1875d38000 r-xp 00000000 00:00 0                          [vdso]
+7c1875d38000-7c1875d39000 r--p 00000000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c1875d39000-7c1875d64000 r-xp 00001000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c1875d64000-7c1875d6e000 r--p 0002c000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c1875d6e000-7c1875d70000 r--p 00036000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c1875d70000-7c1875d72000 rw-p 00038000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffe24832000-7ffe24853000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]

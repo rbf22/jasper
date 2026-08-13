@@ -1,7 +1,7 @@
 # Cell B on Tenstorrent Quietbox 2 — hybrid + workspace (perceiver)
 # Blackhole bfloat16-native, single chip, no fp16 AMP / GradScaler needed
 #
-# Renamed from the old "Cell C" (2026-07-31, once the pytorch-Mamba2
+# Renamed from the old "Cell C" (2026-07-31, once the pytorch-SSM
 # cells A/B were deprecated and removed — see AGENTS.md).
 #
 # Architecture v2 (2026-08-02): QK-Norm + ReZero gates + component-wise clipping
@@ -130,7 +130,7 @@ micro_batch_size: 0
 
 # Wandb
 wandb: false
-wandb_project: mamba-workspace-poc
+wandb_project: wrap-poc
 run_name: cellB-tt-qknorm-rezero
 
 # Checkpointing — local only (no Google Drive on QB2)

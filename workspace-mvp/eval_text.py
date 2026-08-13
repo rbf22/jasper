@@ -23,12 +23,12 @@ import ttnn
 MVP_DIR = os.path.dirname(os.path.abspath(__file__))
 POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "workspace-poc"))
 if not os.path.isdir(POC_DIR):
-    POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "mamba-poc"))
+    POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "workspace-poc"))
 sys.path.insert(0, POC_DIR)
 sys.path.insert(0, MVP_DIR)
 
 from train_ttnn import load_config, build_model_config, _safe_deallocate
-from model_ttnn import TTMambaWorkspaceModel
+from model_ttnn import TTWRAPModel
 from text_data import BPETokenizer, TextDataset, make_eval_batches
 
 
@@ -129,7 +129,7 @@ def main():
     model_config = build_model_config(cfg)
 
     device = ttnn.open_device(device_id=args.device)
-    model = TTMambaWorkspaceModel(model_config, device)
+    model = TTWRAPModel(model_config, device)
 
     # Load checkpoint
     model.load_checkpoint(args.checkpoint, device=device)

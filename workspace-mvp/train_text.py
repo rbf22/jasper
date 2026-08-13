@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Train the Mamba Workspace model on text data (TinyStories).
+"""Train the WRAP Workspace model on text data (TinyStories).
 
-Adapted from mamba-poc/train_ttnn.py — same training loop, optimizer,
+Adapted from workspace-poc/train_ttnn.py — same training loop, optimizer,
 gradient clipping, and checkpoint logic, but uses a real text dataset
 (TinyStories, GPT-2 BPE) instead of synthetic arithmetic tasks.
 
@@ -35,10 +35,10 @@ import ttnn
 # Set up paths — workspace-mvp symlinks to workspace-poc for model code
 # We need to import from both directories
 MVP_DIR = os.path.dirname(os.path.abspath(__file__))
-# Find the POC directory: try sibling "workspace-poc" (current) or "mamba-poc" (legacy)
+# Find the POC directory: try sibling "workspace-poc" (current) or "workspace-poc" (legacy)
 POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "workspace-poc"))
 if not os.path.isdir(POC_DIR):
-    POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "mamba-poc"))
+    POC_DIR = os.path.realpath(os.path.join(MVP_DIR, "..", "workspace-poc"))
 
 # Insert POC dir first so train_ttnn's internal imports work
 sys.path.insert(0, POC_DIR)
@@ -56,7 +56,7 @@ from train_ttnn import (
     Profiler,
     _safe_deallocate,
 )
-from model_ttnn import TTMambaWorkspaceModel, ModelConfig
+from model_ttnn import TTWRAPModel, ModelConfig
 
 # Import text data pipeline
 from text_data import BPETokenizer, TextDataset, sample_text_batch, make_eval_batches
@@ -365,7 +365,7 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     # Build model
     model_config = build_model_config(cfg)
     model_config.slot_permutation = False  # deterministic for text
-    model = TTMambaWorkspaceModel(model_config, device)
+    model = TTWRAPModel(model_config, device)
     print(f"Cell: {cell}, Params: {model.get_num_params() / 1e6:.2f}M", flush=True)
 
     # Optimizer

@@ -1,4 +1,4 @@
-# Jasper Test Traceability Map
+# WRAP Test Traceability Map
 # Code-as-Data (CaD) Framework — Bi-Directional Traceability
 #
 # Maps every test to the functions/modules it verifies, and every key
@@ -10,7 +10,7 @@
 #              When adding a function, check if it needs test coverage.
 
 manifest_version: 1
-project: jasper
+project: wrap
 
 # ---------------------------------------------------------------------------
 # Test -> Function mapping
@@ -73,7 +73,7 @@ tests:
     framework: standalone
     hardware: true
     covers:
-      - function: model_ttnn.py:TTMambaWorkspaceModel.clamp_workspace_gates
+      - function: model_ttnn.py:TTWRAPModel.clamp_workspace_gates
       - function: model_ttnn.py:ModelConfig.gate_clamp_bound
 
   # --- Fused RoPE kernel (requires TT device) ---
@@ -181,7 +181,7 @@ functions:
     tested_by: [test_ws_qknorm_gradcheck.py]
     coverage: full
 
-  - function: model_ttnn.py:TTMambaWorkspaceModel.clamp_workspace_gates
+  - function: model_ttnn.py:TTWRAPModel.clamp_workspace_gates
     tested_by: [test_gate_clamp.py]
     coverage: full
 
@@ -209,12 +209,12 @@ functions:
     coverage: none
     note: "Config parsing untested"
 
-  - function: model_ttnn.py:TTMambaWorkspaceModel.forward
+  - function: model_ttnn.py:TTWRAPModel.forward
     tested_by: []
     coverage: smoke_only
     note: "3-step smoke tests only, no integration test"
 
-  - function: model_ttnn.py:TTMambaWorkspaceModel.backward
+  - function: model_ttnn.py:TTWRAPModel.backward
     tested_by: []
     coverage: smoke_only
     note: "3-step smoke tests only"

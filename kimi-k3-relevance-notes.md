@@ -1,4 +1,4 @@
-# Kimi K3 Architecture — Relevance to Jasper
+# Kimi K3 Architecture — Relevance to WRAP
 
 Source: SemiAnalysis, "Kimi K3, The Manos, The Mythos, The Legendos" (2026-08-03)
 https://newsletter.semianalysis.com/p/kimi-k3-the-manos-the-mythos-the
@@ -7,7 +7,7 @@ https://newsletter.semianalysis.com/p/kimi-k3-the-manos-the-mythos-the
 
 The Kimi K3 article describes four major architectural innovations: Kimi Delta
 Attention (KDA), Attention Residuals, LatentMoE, and Quantile load balancing.
-Several of these directly validate design choices we already made in Jasper,
+Several of these directly validate design choices we already made in WRAP,
 and one (Attention Residuals) suggests a potentially better solution to the
 gradient amplification problem in Cell C's recurrent core.
 
@@ -19,7 +19,7 @@ gradient amplification problem in Cell C's recurrent core.
 of the transition and the output matrices." This is standard in K3, Kimi Linear,
 and modern frontier models.
 
-**Jasper**: We implemented exactly this in `TTWorkspaceModule._l2_normalize_heads`
+**WRAP**: We implemented exactly this in `TTWorkspaceModule._l2_normalize_heads`
 with learnable `read_qk_scale` / `write_qk_scale` (init 1/sqrt(d_head)). This was
 the key fix that eliminated the entropy collapse / ill-conditioned QK^T causing
 training divergence (see AGENTS.md, "Architecture v2 fixes").
@@ -54,7 +54,7 @@ Key benefits reported:
 - Bounded output magnitude (unlike standard residuals where output grows with depth)
 - Consistent gradient magnitude across depth
 
-**Jasper relevance**: Cell C's recurrent core currently blends iterations with
+**WRAP relevance**: Cell C's recurrent core currently blends iterations with
 `x = blend * x_new + (1 - blend) * x` (1/sqrt(K) for x, 1/K for slots). This is
 a fixed linear combination — every iteration contributes equally, and the
 gradient amplification through the slot chain required the conservative 1/K
@@ -83,8 +83,8 @@ for large K it would need the block variant.
 before the linear attention computation, "effectively capturing local token
 dependencies."
 
-**Jasper**: Our `TTRetentionLayer` (the production linear attention layer) does
-NOT have short convolution. The deprecated `TTMamba2Layer` has `d_conv=4` but
+**WRAP**: Our `TTRetentionLayer` (the production linear attention layer) does
+NOT have short convolution. The deprecated SSM layer has `d_conv=4` but
 retention goes straight from `x` → linear projection → RoPE → attention. Adding
 a short depthwise conv (kernel 3-4) before the QKV projection could improve
 local token modeling, which matters for arithmetic reasoning where individual
@@ -104,7 +104,7 @@ update `S_t = S_{t-1} + beta_t * v_t * k_t^T` with the Delta Rule:
 **targeted removal** of irrelevant associations, regularizing the growth of S
 and improving long-range recall.
 
-**Jasper**: Our retention layer uses simple decayed accumulation
+**WRAP**: Our retention layer uses simple decayed accumulation
 (`D[t,s] = gamma^(t-s)`), which is closer to linear attention than DeltaNet.
 The Delta Rule could improve the retention layer's ability to overwrite stale
 information — relevant for multi-step reasoning where intermediate results
@@ -122,7 +122,7 @@ tested as a drop-in replacement for one layer.
 into a **diagonal matrix** enabling fine-grained per-channel memory decay and
 positional awareness.
 
-**Jasper**: Our retention layer uses per-head gamma scalar
+**WRAP**: Our retention layer uses per-head gamma scalar
 (`gamma[h]` for head h). KDA's per-channel decay would give `gamma[h, d]` for
 each channel within each head — d_head times more granularity. This could allow
 different feature dimensions to have different memory horizons (e.g., position
@@ -140,7 +140,7 @@ increase, straightforward implementation.
 performance and efficiency. KDA also serves as a position-aware operator,
 replacing RoPE in MLA layers.
 
-**Jasper**: We have 13 layers (Cell B/C) with attention at positions [5, 10],
+**WRAP**: We have 13 layers (Cell B/C) with attention at positions [5, 10],
 giving **11:2 ≈ 5.5:1** linear:attention ratio. We're significantly more
 linear-heavy than Kimi's optimum. Our retention layer uses RoPE (KDA replaces
 it), so we're also carrying RoPE's overhead.
@@ -159,7 +159,7 @@ after aggregation. Quantile Balancing (QB) is a hyperparameter-free, aux-loss-fr
 load balancing technique that computes router biases directly from the
 distribution of router scores.
 
-**Jasper**: Not applicable to current architecture (no MoE). Noted for future
+**WRAP**: Not applicable to current architecture (no MoE). Noted for future
 scaling if we add mixture-of-experts. QB in particular is interesting because
 it eliminates the load-balancing loss hyperparameter that's notoriously hard
 to tune.
@@ -173,14 +173,14 @@ using a UT transform and Neumann factorization for the inverse. Two-kernel
 design (K1: chunk prep, K2: recurrent compute). Prefill is O(T*D^2), decode is
 constant.
 
-**Jasper**: Our ttnn kernels already fuse element-wise ops to reduce DRAM
+**WRAP**: Our ttnn kernels already fuse element-wise ops to reduce DRAM
 traffic (see AGENTS.md, "Custom fused kernels"). The chunked parallel
 formulation could inspire optimizations if we need to scale to longer sequences
 (currently T=128, where the simple matmul approach is fine).
 
 ---
 
-## Priority Ranking for Jasper
+## Priority Ranking for WRAP
 
 | Priority | Idea | Effort | Expected Impact |
 |----------|------|--------|-----------------|

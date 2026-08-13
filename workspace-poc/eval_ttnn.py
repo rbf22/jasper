@@ -74,7 +74,7 @@ def main():
     os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from model_ttnn import TTMambaWorkspaceModel, ModelConfig
+    from model_ttnn import TTWRAPModel, ModelConfig
     from data import Vocab, generate_eval_set, TASK_VERIFIERS
     from train_ttnn import build_model_config
 
@@ -97,7 +97,7 @@ def main():
     # The permutation is a training-time augmentation; at eval we want
     # consistent slot ordering to measure the model's learned routing.
     model_config.slot_permutation = False
-    model = TTMambaWorkspaceModel(model_config, device)
+    model = TTWRAPModel(model_config, device)
     print(f"Cell: {cell}, Params: {model.get_num_params() / 1e6:.2f}M")
 
     # Load checkpoint

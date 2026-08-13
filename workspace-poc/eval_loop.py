@@ -235,7 +235,7 @@ def main():
     parser.add_argument("--n-per-task", type=int, default=5, help="Eval examples per task per depth")
     parser.add_argument("--depths", type=int, nargs="+", default=[2, 4, 6, 8])
     parser.add_argument("--once", action="store_true", help="Eval all existing checkpoints once, then exit")
-    parser.add_argument("--base-dir", default="/home/rfenwick/Documents/jasper/mamba-poc")
+    parser.add_argument("--base-dir", default="/home/rfenwick/Documents/jasper/workspace-poc")
     parser.add_argument("--eval-timeout", type=int, default=900, help="Timeout per eval in seconds")
     args = parser.parse_args()
 

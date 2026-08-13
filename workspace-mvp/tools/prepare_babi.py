@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Download the bAbI QA dataset and reformat it for the Jasper text pipeline.
+"""Download the bAbI QA dataset and reformat it for the WRAP text pipeline.
 
 Each output line is one self-contained example: the passage sentences, the
-question, and the answer, separated by spaces. Jasper's TextDataset will
+question, and the answer, separated by spaces. WRAP's TextDataset will
 pack these with EOS and train next-token prediction so the model learns to
 output the answer after the question.
 
@@ -37,7 +37,7 @@ def write_split(split, out_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare bAbI for Jasper")
+    parser = argparse.ArgumentParser(description="Prepare bAbI for WRAP")
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data")
     parser.add_argument("--dataset", type=str, default="Muennighoff/babi")
     args = parser.parse_args()

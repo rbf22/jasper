@@ -1,8 +1,8 @@
-# Jasper — Workspace-Recurrent Reasoning for In-Browser Inference
+# WRAP — Workspace-Recurrent Reasoning for In-Browser Inference
 
 ## What this project is
 
-Jasper is a research project building toward a ~1B-parameter reasoning model that can run in a web browser. The core architectural bet: **an explicitly engineered workspace (analogous to Anthropic's J-space finding) combined with a recurrent core (TRM / recurrent-depth transformers) lets a small model trade inference-time compute depth for parameter count, while keeping memory flat for browser deployment.**
+WRAP is a research project building toward a ~1B-parameter reasoning model that can run in a web browser. The core architectural bet: **an explicitly engineered workspace (analogous to Anthropic's J-space finding) combined with a recurrent core (TRM / recurrent-depth transformers) lets a small model trade inference-time compute depth for parameter count, while keeping memory flat for browser deployment.**
 
 This repo contains two things:
 
@@ -23,14 +23,14 @@ Reasoning-critical machinery in language models appears to be small (Anthropic's
 jasper/
 ├── README.md                          ← you are here
 ├── workspace-recurrent-1b-plan.md     ← the full 1B architecture spec & cost assessment
-├── desktop-mamba-workspace-poc.md     ← the desktop POC experiment plan
+├── desktop-wrap-poc.md                ← the desktop POC experiment plan
 ├── infra-setup-guide.md               ← infrastructure ladder (Mac → Kaggle → RunPod → Lambda)
 ├── kimi-k3-relevance-notes.md         ← Kimi K3 architecture analysis (informs the AR core design)
 ├── workspace-poc/                     ← synthetic task training (the code)
 │   ├── README.md                      ← practical guide to the code (start here for running things)
 │   ├── AGENTS.md                      ← project notes, architecture history, debugging guide
 │   ├── data.py                        ← 3 synthetic task generators + verifiers + unit tests
-│   ├── model_ttnn.py                  ← Jasper model (ttnn, bfloat16) — the active implementation
+│   ├── model_ttnn.py                  ← WRAP model (ttnn, bfloat16) — the active implementation
 │   ├── train_ttnn.py                  ← Tenstorrent-native training loop
 │   ├── eval_ttnn.py                   ← checkpoint evaluation (per-task, per-depth accuracy)
 │   ├── probe.py                       ← R2/R3/R4 analysis (K sweep, linear probes, ablation)
@@ -131,7 +131,7 @@ A caution: synthetic-task wins at 30M have a real history of not transferring to
 | If you want to understand... | Read this |
 |------------------------------|-----------|
 | The full 1B architecture spec, training pipeline, and cost assessment | [`workspace-recurrent-1b-plan.md`](workspace-recurrent-1b-plan.md) |
-| The desktop POC experiment design (tasks, cells, measurements, timeline) | [`desktop-mamba-workspace-poc.md`](desktop-mamba-workspace-poc.md) |
+| The desktop POC experiment design (tasks, cells, measurements, timeline) | [`desktop-wrap-poc.md`](desktop-wrap-poc.md) |
 | How to set up infrastructure (Mac → Kaggle → RunPod → Lambda) | [`infra-setup-guide.md`](infra-setup-guide.md) |
 | How the code works and how to run it | [`workspace-poc/README.md`](workspace-poc/README.md) |
 | Architecture history, debugging guide, and gradient instability fixes | [`workspace-poc/AGENTS.md`](workspace-poc/AGENTS.md) |

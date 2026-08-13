@@ -6,7 +6,7 @@ the pre-norm residual `decay * slots + gate * read_out` experiences
 cancellation, making RMS(slots_pre_norm) very small. RMSNorm backward divides
 by RMS, amplifying the gradient by 1/RMS → gradient explosion.
 
-This test verifies that `TTMambaWorkspaceModel.clamp_workspace_gates()`:
+This test verifies that `TTWRAPModel.clamp_workspace_gates()`:
   1. Exists and clamps gates to [-gate_clamp_bound, gate_clamp_bound]
   2. Does nothing when gates are within bounds
   3. Actually clips when gates exceed bounds
@@ -61,7 +61,7 @@ import torch
 import ttnn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model_ttnn import ModelConfig, TTMambaWorkspaceModel
+from model_ttnn import ModelConfig, TTWRAPModel
 
 print("Opening device...", flush=True)
 device = ttnn.open_device(device_id=0)
@@ -79,7 +79,7 @@ try:
         recurrent_core=False,
         gate_clamp_bound=GATE_CLAMP_BOUND,
     )
-    model = TTMambaWorkspaceModel(config, device)
+    model = TTWRAPModel(config, device)
 
     assert hasattr(model, "clamp_workspace_gates"), \
         "FAIL: model.clamp_workspace_gates does not exist"
@@ -143,7 +143,7 @@ try:
     print("Test 4 PASS: gate_clamp_bound defaults to 0.0 (disabled)", flush=True)
 
     # --- Test 5: clamp is a no-op when gate_clamp_bound=0.0 ---
-    model_no_clamp = TTMambaWorkspaceModel(config_no_clamp, device)
+    model_no_clamp = TTWRAPModel(config_no_clamp, device)
     ws_nc = model_no_clamp.workspace
     ws_nc.read_gate = ttnn.from_torch(
         torch.tensor([-0.50], dtype=torch.bfloat16),

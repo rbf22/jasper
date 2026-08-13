@@ -7,7 +7,7 @@ autograd can produce exact gradients. It exists purely for validation:
   * Stage 1: tt-nn forward vs. this reference forward.
   * Stage 2: tt-nn backward vs. autograd on this reference.
 
-Retention replaces Mamba-3's selective scan with decayed linear attention:
+Retention replaces the SSM selective scan with decayed linear attention:
 D[t,s] = gamma^(t-s) for s <= t. The decay gamma is a single learned scalar
 per head (stored as log(gamma)), precomputed into a T x T matrix. No softmax,
 no cumsum of learned A*dt, no diagonal correction, no MIMO ranks.

@@ -1,0 +1,55 @@
+heap_v2/524288
+  t*: 1: 82338 [0: 0]
+  t0: 1: 82338 [0: 0]
+@ 0x7c9886a9db86 0x7c9886a9eacc 0x7c9886a9b389 0x7c9886a241af 0x7c98862b738f 0x7c9886ef371f 0x7c9886ef3824 0x7c9886f0d5a0
+  t*: 1: 82338 [0: 0]
+  t0: 1: 82338 [0: 0]
+
+MAPPED_LIBRARIES:
+00400000-00404000 r--p 00000000 103:02 203818579                         /opt/tenstorrent/sfpi/compiler/bin/riscv-tt-elf-g++
+00404000-00569000 r-xp 00004000 103:02 203818579                         /opt/tenstorrent/sfpi/compiler/bin/riscv-tt-elf-g++
+00569000-006a3000 r--p 00169000 103:02 203818579                         /opt/tenstorrent/sfpi/compiler/bin/riscv-tt-elf-g++
+006a3000-006ac000 r--p 002a2000 103:02 203818579                         /opt/tenstorrent/sfpi/compiler/bin/riscv-tt-elf-g++
+006ac000-006ae000 rw-p 002ab000 103:02 203818579                         /opt/tenstorrent/sfpi/compiler/bin/riscv-tt-elf-g++
+006ae000-006b4000 rw-p 00000000 00:00 0 
+7c9885a00000-7c9886200000 rw-p 00000000 00:00 0 
+7c9886200000-7c988629d000 r--p 00000000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c988629d000-7c98863e5000 r-xp 0009d000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c98863e5000-7c988646c000 r--p 001e5000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c988646c000-7c9886477000 r--p 0026b000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c9886477000-7c988647a000 rw-p 00276000 103:02 27790083                  /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7c988647a000-7c988647e000 rw-p 00000000 00:00 0 
+7c9886600000-7c9886628000 r--p 00000000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c9886628000-7c98867b0000 r-xp 00028000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c98867b0000-7c98867ff000 r--p 001b0000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c98867ff000-7c9886803000 r--p 001fe000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c9886803000-7c9886805000 rw-p 00202000 103:02 27814631                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7c9886805000-7c9886812000 rw-p 00000000 00:00 0 
+7c9886a00000-7c9886a09000 r--p 00000000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c9886a09000-7c9886ab6000 r-xp 00009000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c9886ab6000-7c9886ac4000 r--p 000b6000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c9886ac4000-7c9886aca000 r--p 000c4000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c9886aca000-7c9886acb000 rw-p 000ca000 103:02 27787848                  /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7c9886acb000-7c9886cea000 rw-p 00000000 00:00 0 
+7c9886db5000-7c9886dbc000 rw-p 00000000 00:00 0 
+7c9886dbc000-7c9886dc0000 r--p 00000000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c9886dc0000-7c9886de4000 r-xp 00004000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c9886de4000-7c9886de8000 r--p 00028000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c9886de8000-7c9886de9000 r--p 0002b000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c9886de9000-7c9886dea000 rw-p 0002c000 103:02 27790106                  /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7c9886dea000-7c9886dfa000 r--p 00000000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c9886dfa000-7c9886e79000 r-xp 00010000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c9886e79000-7c9886ed1000 r--p 0008f000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c9886ed1000-7c9886ed2000 r--p 000e7000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c9886ed2000-7c9886ed3000 rw-p 000e8000 103:02 27814655                  /usr/lib/x86_64-linux-gnu/libm.so.6
+7c9886ee4000-7c9886ee6000 rw-p 00000000 00:00 0 
+7c9886ee6000-7c9886eea000 r--p 00000000 00:00 0                          [vvar]
+7c9886eea000-7c9886eec000 r--p 00000000 00:00 0                          [vvar_vclock]
+7c9886eec000-7c9886eee000 r-xp 00000000 00:00 0                          [vdso]
+7c9886eee000-7c9886eef000 r--p 00000000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c9886eef000-7c9886f1a000 r-xp 00001000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c9886f1a000-7c9886f24000 r--p 0002c000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c9886f24000-7c9886f26000 r--p 00036000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7c9886f26000-7c9886f28000 rw-p 00038000 103:02 27814625                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7fff32947000-7fff32968000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]

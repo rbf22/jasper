@@ -1,6 +1,6 @@
-"""Text data pipeline for the Mamba MVP — TinyStories with GPT-2 BPE tokenization.
+"""Text data pipeline for the WRAP MVP — TinyStories with GPT-2 BPE tokenization.
 
-Provides the same interface as mamba-poc/data.py's sample_batch() so the
+Provides the same interface as workspace-poc/data.py's sample_batch() so the
 training loop in train_text.py can use it as a drop-in replacement:
 
     input_ids, labels, task_ids = sample_text_batch(...)
