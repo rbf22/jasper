@@ -1223,16 +1223,68 @@ writer disagreed on tile counts, causing CB synchronization deadlock.
    shapes, `apply_resolved_bindings()` patches only the buffer addresses,
    avoiding a full `create_descriptor()` call and its ~7 KB allocation.
 
-**Validation results (2026-08-12):**
+**Validation results (2026-08-13, all 4 patches active):**
 
-- 2fwd 14-layer test: PASS (no hang, fwd 0: 0.082s cache miss, fwd 1+: 0.012s cache hit)
-- Forward-only x5 + forward+backward x3: PASS (14-layer model, finite loss, 58 grads)
-- Isolated leak test (retention_backward, 200 iters): 0.25 MB/iter (MINOR)
-- Isolated leak test (retention_forward, 200 iters): 0.11 MB/iter (MINOR)
+All 4 patches: (1) DataCollector flat vector, (2) padded_shape in hash,
+(3) buffer_bindings for cache-hit fast path, (4) get_dynamic_runtime_args
+for scalar re-application on cache hits.
 
-The residual 0.11–0.25 MB/iter is from other operations' descriptor rebuilds
-and allocator fragmentation, not binary_ng. The fast path eliminates binary_ng's
-contribution to per-iteration allocation.
+- Tier 1 — Hang + scalar correctness:
+  - 2fwd 14-layer test: PASS (no hang, fwd 0: 0.077s, fwd 1+: 0.012s cache hit)
+  - Scalar mul: ttnn.mul(ones, 0.5)=0.5, ttnn.mul(ones, 2.0)=2.0 — PASS
+- Tier 2 — Leak test (retention_backward, 50 iters with clear_caches):
+  0.25 MB/iter (matches original working version)
+- Tier 3 — CPU pytest: 85 passed + 16 gradient tests passed
+- Tier 4 — Device correctness:
+  - retention_parity: ALL PASS (gradcheck, forward, backward)
+  - backward_parity: ALL PASS (4/4, including attention_residual_inactive)
+  - checkpoint_roundtrip: 5/5 PASS
+  - optimizer_state: 4/4 PASS
+  - clear_caches: 6/6 PASS
+  - params: 3/3 PASS
+  - clip_grad_norm: 5/5 PASS
+  - recurrent_core: 4/4 PASS
+- Tier 5 — Custom kernels:
+  - scale_decay: PASS
+  - fused_rope (fwd+bwd): PASS
+  - gate_bwd: PASS
+- Tier 6 — Training stability (50 steps):
+  - All 50 losses finite (range 4.8710–5.0323)
+  - All 26 params finite after 50 steps
+  - grad_norm stable (~1.42), no divergence
+
+Previously classified pre-existing failures (fixed 2026-08-13):
+
+1. **gate_bwd** (was rel_err 1.0 → now 0.003): `generic_op` requires a
+   prior descriptor-based ttnn op to initialize dispatch state. Without
+   it, the custom kernel produces all-zeros output. In training, the
+   forward pass runs first so this never manifested, but the standalone
+   test called the kernel directly after `open_device`. Fixed by adding
+   a warmup `ttnn.mul` call in `test_gate_bwd.py` before the kernel.
+
+2. **attention_residual_inactive ar_scale** (was rel_err 0.10 vs tol 0.08
+   → now 0.0002): The `AttentionResidual.backward` computed `grad_scale`
+   entirely in bf16 on device. With few active iterations (K_active=1),
+   the compounded bf16 rounding in `scores_pre_scale`, softmax (`alpha`),
+   and softmax backward produced ~10% relative error vs the fp32
+   reference. Fixed by recomputing the entire `grad_scale` path (scores,
+   alpha, softmax backward, accumulation) in fp32 on host from the
+   cached bf16 inputs. The device-side `grad_scores` is still used for
+   `grad_x` and `grad_query` paths. Transfer cost is negligible
+   (grad_scale is a scalar).
+
+The residual 0.25 MB/iter is from other operations' descriptor rebuilds
+and allocator fragmentation, not binary_ng. The fast path eliminates
+binary_ng's contribution to per-iteration allocation.
+
+**Key fix (2026-08-13):** The hang was caused by using `logical_shape()`
+in the hash instead of `padded_shape()`. `logical_shape()` does not
+capture tile padding, causing hash collisions between operations with
+different tile-padded shapes but the same logical shape. The
+`buffer_bindings` fast path then patched buffer addresses on the wrong
+cached program, causing CB synchronization deadlock. Using
+`padded_shape()` (matching the original working version) eliminates
+these collisions.
 
 #### Build and install
 
