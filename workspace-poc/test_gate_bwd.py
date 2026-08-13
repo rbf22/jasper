@@ -12,6 +12,15 @@ print("Opening device...", flush=True)
 device = ttnn.open_device(device_id=0)
 print("Device opened!", flush=True)
 
+# Warmup: generic_op requires a prior descriptor-based op to initialize
+# global dispatch state. Without this, the custom kernel produces zeros.
+_warmup_a = ttnn.from_torch(torch.ones(1, 32, 32, dtype=torch.bfloat16),
+                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+_warmup_b = ttnn.mul(_warmup_a, _warmup_a)
+ttnn.synchronize_device(device)
+ttnn.deallocate(_warmup_a)
+ttnn.deallocate(_warmup_b)
+
 try:
     config = ModelConfig(d_model=64, n_heads=2)
     layer = TTRetentionLayer(config, device, use_fused_rope=True)
