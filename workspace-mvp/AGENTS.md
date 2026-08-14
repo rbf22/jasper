@@ -7,10 +7,13 @@ network with recurrent core. WRAP combines RetNet-style linear attention,
 Perceiver-style external memory (workspace), depth-recurrent iteration, and
 attention residuals into a unified architecture.
 
-This directory trains the same WRAP model as `workspace-poc/` but on real
-text (TinyStories) instead of synthetic arithmetic tasks. The goal is to
-validate that the architecture can learn coherent language before scaling
-to larger models and reasoning datasets.
+This directory trains the same WRAP model as `workspace-poc/` but on text
+data with GPT-2 BPE tokenization. The current active dataset is the
+**tiny challenges** corpus — a 2M-example mixed reasoning dataset
+(narrative logic puzzles, BrainBashers-style puzzles, and bAbI QA) —
+replacing the earlier TinyStories-only approach. The goal is to test
+whether the workspace and recurrent core can learn multi-hop reasoning
+when the task is framed as text continuation.
 
 ## Environment
 
@@ -28,13 +31,16 @@ of the model code.
 
 | File | What it does |
 |------|-------------|
-| `text_data.py` | GPT-2 BPE tokenizer wrapper, TinyStories dataset (pre-tokenized cache), batch sampling, eval batch generation |
-| `train_text.py` | Training loop — imports shared infrastructure from `workspace-poc/train_ttnn.py`, adds host-side loss for large vocab |
+| `text_data.py` | GPT-2 BPE tokenizer wrapper, dataset loading (TinyStories or tiny challenges), pre-tokenized cache, batch sampling, eval batch generation |
+| `train_text.py` | Training loop — imports shared infrastructure from `workspace-poc/train_ttnn.py`, adds host-side loss for large vocab, gate freeze logic |
 | `eval_text.py` | Perplexity evaluation + autoregressive text generation |
-| `configs/text_cell_c.yaml` | Cell C AR config adapted for text (vocab=50257, seq_len=512, lr=1e-4) |
+| `configs/text_cell_c.yaml` | Cell C AR config on TinyStories (legacy) |
+| `configs/text_cell_c_tiny_challenges.yaml` | Cell C AR config on tiny challenges (active) |
 | `test_text_data.py` | Pytest tests for `text_data.py` (tokenizer, dataset loading, packed-stream labels). CPU-only. |
-| `data/tinystories_train.txt` | 1.9GB, ~480M tokens (pre-tokenized cache at `.tokens.pt`) |
-| `data/tinystories_valid.txt` | 19MB, ~4.8M tokens |
+| `data/tiny_challenges_train.txt` | ~292 MB, 78.7M tokens (pre-tokenized cache at `.tokens.pt`) |
+| `data/tiny_challenges_valid.txt` | ~3 MB, 787K tokens |
+| `data/tinystories_train.txt` | 1.9GB, ~480M tokens (legacy, unused in current run) |
+| `data/tinystories_valid.txt` | 19MB, ~4.8M tokens (legacy) |
 
 ## Architecture
 
@@ -68,11 +74,20 @@ Same WRAP architecture as `workspace-poc/` Cell C AR:
   beta2 for stable normalization of high-variance gate gradients
 - `spike_action: restore` — reload last checkpoint on grad spike instead
   of skipping (skip-on-spike freezes model in bad state permanently)
+- **`gate_freeze_steps: 600`** — workspace gates held at exactly 0 for
+  the first 600 steps, making the workspace a true no-op while the
+  backbone learns. After step 600, gates learn freely at 1x LR. This
+  prevents the workspace from destabilizing the backbone before it has
+  learned useful representations. See `workspace-poc/AGENTS.md` § "Gate
+  freeze fix" for details.
+- Gate/AR LR reduced from 10x to 1x base LR (controlled gate opening
+  after unfreeze)
 - 10.5M architecture params + 19.3M embedding = **29.8M total**
 
 The model code is symlinked from `workspace-poc/`, so all architecture
-fixes apply automatically. Only the config (`configs/text_cell_c.yaml`)
-needs to be kept in sync with new config fields.
+fixes apply automatically. The config
+(`configs/text_cell_c_tiny_challenges.yaml`) needs to be kept in sync
+with new config fields.
 
 ## Key differences from synthetic training
 
@@ -89,38 +104,91 @@ needs to be kept in sync with new config fields.
 
 ## Dataset choice
 
-TinyStories was chosen over reasoning datasets (OpenThoughts, NuminaMath,
-etc.) because a 10M param model is too small for complex CoT traces — it
-would memorize surface patterns without understanding reasoning.
-TinyStories is the only dataset designed for <10M param models.
+The current active dataset is the **tiny challenges** corpus — a 2M-example
+mixed reasoning dataset inspired by Enigmata-style synthetic reasoning
+training. The mixture:
 
-Planned two-stage approach:
-1. **Stage 1 (now)**: TinyStories — validate architecture learns language
-2. **Stage 2 (future)**: Fine-tune on OpenThoughts-114k (metadata config)
-   to test workspace's multi-hop reasoning capability
+| Component | Fraction | Description |
+|-----------|----------|-------------|
+| Narrative logic puzzles | 40% | Multi-hop location, arithmetic, swap, attribute puzzles |
+| BrainBashers-style puzzles | 55% | Attribute-chain, elimination, ordering puzzles |
+| bAbI QA | 5% | HuggingFace `Muennighoff/babi` passages |
+
+- Train: 2,000,000 examples (~292 MB, 78.7M tokens)
+- Validation: 20,000 examples (~3 MB, 787K tokens)
+
+### Rationale for the shift from TinyStories
+
+TinyStories was the original Stage 1 dataset, chosen because it was the
+only dataset designed for <10M param models. However, evaluation of the
+synthetic POC tasks showed that **none of the cells (A, B, or C) learned
+Task 1** (chained assignment arithmetic) — even A at step 9600 got 0%.
+The multi-hop reasoning task was beyond what a 10M retention model could
+learn from synthetic character-level data.
+
+The tiny challenges corpus tests whether framing multi-hop reasoning as
+**text continuation** — with the workspace and recurrent core — can
+learn reasoning that the synthetic POC could not. The puzzles are
+designed to require multi-hop reasoning but are expressed in natural
+language, which may be easier for the model to learn from than the
+compressed character-level format.
+
+### Previous two-stage plan (superseded)
+
+The original plan was:
+1. Stage 1: TinyStories — validate architecture learns language
+2. Stage 2: Fine-tune on OpenThoughts-114k for multi-hop reasoning
+
+The tiny challenges corpus merges these stages: it tests reasoning
+directly in the text format, without a separate language pretraining
+stage. If the architecture can learn from this corpus, it validates both
+language learning and reasoning in a single run.
 
 ## Running
 
 ```bash
 # Smoke test (3 steps)
 TT_VISIBLE_DEVICES=1 python train_text.py \
-    --config configs/text_cell_c.yaml --steps 3 \
+    --config configs/text_cell_c_tiny_challenges.yaml --steps 3 \
     --micro_batch 4 --accum_steps 1 \
     --checkpoint_dir /tmp/text_test --device 0
 
-# Full training (5000 steps)
+# Full training (tiny challenges, 2000 steps)
 cd /home/rfenwick/Documents/jasper/workspace-mvp
-TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
-    --config configs/text_cell_c.yaml --device 0 \
-    --checkpoint_dir checkpoints \
-    > logs/text_cell_c.log 2>&1 &
+TT_VISIBLE_DEVICES=3 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
+    --config configs/text_cell_c_tiny_challenges.yaml --device 0 \
+    --checkpoint_dir checkpoints/tiny_challenges \
+    > logs/text_tiny_challenges_20260813.log 2>&1 &
 
 # Evaluation (perplexity + generation)
 TT_VISIBLE_DEVICES=1 python eval_text.py \
-    --checkpoint checkpoints/cell_text_step500.pt \
-    --config configs/text_cell_c.yaml --device 0 \
+    --checkpoint checkpoints/tiny_challenges/cell_text_step500.pt \
+    --config configs/text_cell_c_tiny_challenges.yaml --device 0 \
     --generate --prompt "Once upon a time"
 ```
+
+### Current training configuration
+
+- Config: `configs/text_cell_c_tiny_challenges.yaml`
+- Device: 3
+- micro_batch=8, accum_steps=48, effective_batch=384
+- seq_len=512, effective_tokens/step=196,608
+- lr=1e-4, max_steps=2000
+- gate_freeze_steps=600
+- Initial loss: 10.92 (≈log(50257), correct random init)
+- Initial grad_norm: 1.5, gates 0.0 (frozen)
+- Speed: ~112s/step (K=6 recurrent core on 30M model)
+- Estimated total: ~62 hours for 2000 steps
+
+### Gate freeze in text training
+
+`train_text.py` has its own training loop (it does not call the
+`train_ttnn.py` loop), so gate freeze logic was added separately:
+- Reads `gate_freeze_steps` from the config
+- Calls `model.freeze_workspace_gates()` after each optimizer step while
+  `step < gate_freeze_steps`
+- Clamps gates to `[-gate_clamp_bound, gate_clamp_bound]` after unfreeze
+- Syncs optimizer fp32 master copies after gate modifications
 
 ## Loss computation
 

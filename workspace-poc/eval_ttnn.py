@@ -144,7 +144,7 @@ def main():
 
         with torch.no_grad():
             for i, ex in enumerate(eval_set):
-                input_ids = ex["input_ids"].unsqueeze(0)  # (1, T) — full padded sequence
+                input_ids_1 = ex["input_ids"].unsqueeze(0)  # (1, T) — full padded sequence
                 task_id = ex["task_id"]
                 depth = ex["depth"]
                 prompt = ex["prompt"]
@@ -154,6 +154,11 @@ def main():
                 prompt_ids = vocab.encode(prompt)
                 prompt_len = len(prompt_ids) - 1  # exclude EOS so model predicts first answer char
 
+                # TT-Metal matmul requires batch >= 2 (tile alignment).
+                # Replicate the single example to batch size 4 and use row 0.
+                BATCH_PAD = 4
+                input_ids = input_ids_1.expand(BATCH_PAD, -1).contiguous()  # (4, T)
+
                 # Generate answer tokens autoregressively.
                 # IMPORTANT: use the full padded 128-token sequence (same as training),
                 # not a truncated prompt. The workspace's cross-attention between slots
@@ -161,16 +166,17 @@ def main():
                 # pattern and causes the model to fail. We overwrite tokens at positions
                 # prompt_len..prompt_len+max_new with generated tokens, keeping the rest
                 # as padding.
-                generated = input_ids.clone()  # (1, T) full padded sequence
+                generated = input_ids.clone()  # (4, T) full padded sequence
                 generated_tokens = []
 
                 for gen_step in range(args.max_new):
                     logits_tt = model.forward(generated, k_value=k_value)
-                    logits = ttnn.to_torch(logits_tt)  # (1, T, V)
+                    logits = ttnn.to_torch(logits_tt)  # (4, T, V)
                     # Logit at position (prompt_len + gen_step - 1) predicts token at (prompt_len + gen_step)
-                    next_logits = logits[:, prompt_len + gen_step - 1, :]
+                    # Use only row 0 (the actual example)
+                    next_logits = logits[:1, prompt_len + gen_step - 1, :]
                     next_token = next_logits.argmax(dim=-1, keepdim=True)
-                    generated[:, prompt_len + gen_step] = next_token
+                    generated[:1, prompt_len + gen_step] = next_token
                     generated_tokens.append(next_token.item())
                     if next_token.item() == vocab.EOS:
                         break
@@ -187,14 +193,15 @@ def main():
                 # padded sequence format it was trained on.
                 answer_tokens = [vocab.stoi[c] for c in answer_str if c in vocab.stoi]
                 if answer_tokens:
-                    tf_input = input_ids.clone()  # (1, T) full padded
+                    tf_input = input_ids.clone()  # (4, T) full padded
                     for j, tok in enumerate(answer_tokens):
                         if prompt_len + j < tf_input.shape[1]:
-                            tf_input[:, prompt_len + j] = tok
-                    tf_logits = ttnn.to_torch(model.forward(tf_input, k_value=k_value))  # (1, T, V)
+                            tf_input[:1, prompt_len + j] = tok
+                    tf_logits = ttnn.to_torch(model.forward(tf_input, k_value=k_value))  # (4, T, V)
                     n_tok_ok = 0
                     for j, gold in enumerate(answer_tokens):
                         # logit at index (prompt_len + j - 1) predicts token at prompt_len + j
+                        # Use row 0 (the actual example)
                         pred = tf_logits[0, prompt_len + j - 1].argmax().item()
                         n_tok_ok += int(pred == gold)
                     tf_tok_correct[task_id] += n_tok_ok
@@ -224,6 +231,15 @@ def main():
                           f"prompt: {prompt[:60]}{'...' if len(prompt) > 60 else ''}")
                     print(f"    predicted: '{response}'  expected: '{answer_str}'")
                     samples_shown += 1
+
+                # Clear model caches between examples to avoid device memory leaks.
+                # The autoregressive generation runs multiple forward passes per
+                # example, accumulating cached tensors. Without clearing, device
+                # DRAM fills up after ~5 examples.
+                try:
+                    model.clear_caches()
+                except Exception:
+                    pass
 
         # Compute summary stats
         gen_all = sum(correct.values()) / max(sum(total.values()), 1)

@@ -329,6 +329,11 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     checkpoint_interval = cfg.get("checkpoint_interval", 500)
     ckpt_dir = checkpoint_dir_override or cfg.get("ckpt_dir", "checkpoints")
 
+    # Gate freeze: keep workspace gates at 0 for the first N steps
+    gate_freeze_steps = cfg.get("gate_freeze_steps", 0)
+    if gate_freeze_steps > 0:
+        print(f"Gate freeze: gates held at 0 for first {gate_freeze_steps} steps", flush=True)
+
     # Data config
     train_data_path = cfg.get("train_data", "data/tinystories_train.txt")
     valid_data_path = cfg.get("valid_data", "data/tinystories_valid.txt")
@@ -530,6 +535,19 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
         if not model_config.freeze_gamma:
             model.clamp_retention_gammas()
             optimizer.sync_master_from_model(model)
+
+        # Clamp workspace gates and sync master
+        if model_config.use_workspace:
+            model.clamp_workspace_gates()
+            if model_config.gate_clamp_bound > 0:
+                optimizer.sync_master_from_model(
+                    model, names={"ws_read_gate", "ws_write_gate"})
+
+            # Gate freeze: force gates to 0 during freeze period
+            if gate_freeze_steps > 0 and step < gate_freeze_steps:
+                model.freeze_workspace_gates()
+                optimizer.sync_master_from_model(
+                    model, names={"ws_read_gate", "ws_write_gate"})
 
         # REVIEWED: Deallocate tt_grads (no longer needed after optimizer step)
         for g in tt_grads.values():

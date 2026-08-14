@@ -56,24 +56,28 @@ slot_decay_init: 1.0
 # dynamics change unexpectedly.
 gate_clamp_bound: 0.3
 
+# Gate freeze: keep workspace gates at 0 for the first 3000 steps.
+# Same approach as Cell B v2 — let the backbone train cleanly first,
+# then unfreeze gates. For Cell C, this also means the recurrent core
+# iterations are identity passes during freeze (gate=0 → no workspace
+# contribution, AR sees identical inputs → uniform attention). After
+# unfreeze, the workspace + AR can learn to use the recurrent iterations.
+gate_freeze_steps: 3000
+
 # Training
 lr: 2.0e-4
 # Per-parameter LR groups: workspace gets 0.25x base LR.
-# Gates get 10x base LR — matching Cell B's successful config. The 3x used
-# in run 3 starved the workspace (gates only reached 0.10 vs Cell B's 0.66,
-# loss plateaued at 1.36 vs Cell B's 0.035). Now that the optimizer bug is
-# fixed and the AR is actually learning, it should compensate for faster
-# gate growth.
-# Attention residual params get 10x base LR — the AR must learn fast
-# enough to down-weight unstable iterations before gates open. With
-# scale init=1.0 (not 1/sqrt(D)), the softmax has real gradient signal.
+# Gates and AR params get 1x base LR (same as backbone). With gate_freeze_steps,
+# the backbone is already trained by the time gates unfreeze, so there's no
+# need to rush gate/AR opening. 1x lets them learn gently.
+# Previously 10x, which caused gates to spike and destabilize the backbone.
 lr_groups:
-  ws_read_gate: 10.0
-  ws_write_gate: 10.0
+  ws_read_gate: 1.0
+  ws_write_gate: 1.0
   ws_read_qk_scale: 1.0
   ws_write_qk_scale: 1.0
-  ws_ar_query: 10.0
-  ws_ar_scale: 10.0
+  ws_ar_query: 1.0
+  ws_ar_scale: 1.0
   ws_: 0.25
   "suffix:_gamma": 0.01
 max_steps: 10000

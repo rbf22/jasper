@@ -36,11 +36,22 @@ gate_init: 0.0
 slot_decay_init: 1.0
 gate_clamp_bound: 0.3
 
+# Gate freeze: keep workspace gates at 0 for the first 600 steps.
+# Same approach as the POC configs — let the backbone learn first, then
+# unfreeze gates. Scaled down from 3000 (POC) because text training is
+# shorter (2000 steps) and the examples are simpler.
+gate_freeze_steps: 600
+
 # Training
 lr: 1.0e-4
+# Per-parameter LR groups: workspace gets 0.25x base LR.
+# Gates get 1x base LR (same as backbone). With gate_freeze_steps,
+# the backbone is already trained by the time gates unfreeze, so
+# there's no need to rush gate opening. Previously 10x, which caused
+# gates to spike and destabilize the backbone.
 lr_groups:
-  ws_read_gate: 10.0
-  ws_write_gate: 10.0
+  ws_read_gate: 1.0
+  ws_write_gate: 1.0
   ws_read_qk_scale: 1.0
   ws_write_qk_scale: 1.0
   ws_ar_query: 1.0

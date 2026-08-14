@@ -4771,7 +4771,7 @@ class TTWRAPModel:
         silently skips because use_count > 1 (queue still holds a ref).
         """
         ttnn.synchronize_device(self.device)
-        _safe_deallocate(self._cached_x_pre_final_norm)
+        _safe_deallocate(getattr(self, '_cached_x_pre_final_norm', None))
         self._cached_x_pre_final_norm = None
         self._cached_input_ids = None  # host tensor, no device dealloc
         # Deallocate core x outputs and blend info (only exist with recurrent core)
@@ -5081,6 +5081,28 @@ class TTWRAPModel:
         # freely from step 0. This method is kept for backward compatibility
         # with configs that set gate_schedule_steps > 0.
         # (Previously annealed sigmoid gates from gate_init to 0.)
+
+    def freeze_workspace_gates(self):
+        """Force workspace ReZero gates to exactly 0.
+
+        Used during the gate freeze period to ensure the workspace is a
+        true no-op (identity), so the backbone trains as if the workspace
+        doesn't exist. After the freeze, gates learn freely via the optimizer.
+        """
+        if self.workspace is None:
+            return
+        zero_tt = ttnn.from_torch(
+            torch.tensor([0.0], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        )
+        _safe_deallocate(self.workspace.read_gate)
+        self.workspace.read_gate = zero_tt
+        zero_tt2 = ttnn.from_torch(
+            torch.tensor([0.0], dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        )
+        _safe_deallocate(self.workspace.write_gate)
+        self.workspace.write_gate = zero_tt2
 
     def save_checkpoint(self, path: str, optimizer_state: dict = None, step: int = 0):
         """Save model checkpoint to a PyTorch state dict file.

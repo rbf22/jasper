@@ -52,19 +52,24 @@ freeze_slot_decay: true
 # is a safe bound that doesn't constrain normal learning.
 gate_clamp_bound: 0.3
 
+# Gate freeze: keep workspace gates at 0 for the first 3000 steps.
+# This lets the backbone train as if the workspace doesn't exist (ReZero
+# gates at 0 = identity), matching Cell A's training dynamics. After the
+# freeze, gates learn freely — if the workspace doesn't help, gates stay
+# near 0 and B ≈ A. If the workspace helps, gates open naturally.
+gate_freeze_steps: 3000
+
 # Training
 lr: 2.0e-4
 # Per-parameter LR groups: workspace gets 0.25x base LR (5e-5) to prevent
-# gradient explosion at warmup peak. Gates get 3x base LR (6e-4) so they
-# open fast enough to contribute within the training budget.
-# Reduced from 10x to 3x on 2026-08-09: with causal masking, the workspace's
-# past-only contribution is noise for Cell B (no recurrent core), so the model
-# suppresses it → gates grow negative. At 10x LR, gates reached -0.43 by step
-# 2100, causing RMSNorm cancellation and gradient explosion. 3x gives more
-# time to learn before hitting the clamp bound.
+# gradient explosion at warmup peak. Gates get 1x base LR (same as backbone)
+# — with gate_freeze_steps, the backbone is already trained by the time
+# gates unfreeze, so there's no need to rush gate opening. 1x lets gates
+# open gently only when the workspace provides useful gradient signal.
+# Previously 3x, which caused gates to spike immediately after unfreezing.
 lr_groups:
-  ws_read_gate: 3.0
-  ws_write_gate: 3.0
+  ws_read_gate: 1.0
+  ws_write_gate: 1.0
   ws_read_qk_scale: 1.0
   ws_write_qk_scale: 1.0
   ws_: 0.25

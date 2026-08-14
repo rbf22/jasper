@@ -1038,6 +1038,14 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
     # Gate schedule config
     gate_schedule_steps = cfg.get("gate_schedule_steps", 0)
     gate_init_val = cfg.get("gate_init", 0.0)
+    # Gate freeze: keep workspace gates at 0 for the first N steps.
+    # This lets the backbone train as if the workspace doesn't exist
+    # (ReZero gates at 0 = identity), preventing gradient amplification
+    # from destabilizing the backbone before the workspace has learned
+    # useful representations. After the freeze, gates learn freely.
+    gate_freeze_steps = cfg.get("gate_freeze_steps", 0)
+    if gate_freeze_steps > 0 and model_config.use_workspace:
+        print(f"  Gate freeze: gates held at 0 for first {gate_freeze_steps} steps", flush=True)
     if gate_schedule_steps > 0 and model_config.use_workspace:
         print(f"  Gate schedule: anneal from {gate_init_val} to 0.0 over {gate_schedule_steps} steps", flush=True)
 
@@ -1289,6 +1297,15 @@ def train(config_path: str, steps_override=None, micro_batch_override=None,
             # No-op when gate_clamp_bound is 0.0 (default / backward compat).
             model.clamp_workspace_gates()
             if model_config.gate_clamp_bound > 0 and model.workspace is not None:
+                optimizer.sync_master_from_model(
+                    model, names={"ws_read_gate", "ws_write_gate"})
+
+            # Gate freeze: during the freeze period, force gates back to 0
+            # after each optimizer step. This ensures the workspace is a
+            # true no-op (ReZero identity) during the freeze, so the backbone
+            # trains as if the workspace doesn't exist.
+            if gate_freeze_steps > 0 and step < gate_freeze_steps and model.workspace is not None:
+                model.freeze_workspace_gates()
                 optimizer.sync_master_from_model(
                     model, names={"ws_read_gate", "ws_write_gate"})
 
