@@ -176,50 +176,54 @@ Changes:
 - `configs/text_cell_c_tiny_challenges.yaml`: `gate_freeze_steps: 600`,
   gate/AR LR 10x → 1x
 
-### Active runs
+### Active runs (2026-08-14, resumed with Tracy leak fix)
 
 Cell A completed training (step 9999, loss 0.83). Cells B and C were
-restarted from scratch with the gate freeze fix. Device 3 is now used
-for the text MVP (tiny challenges corpus).
+restarted from scratch with the gate freeze fix on 2026-08-13, but were
+killed by the Tracy profiler OOM leak (see "Tracy profiler leak" below).
+On 2026-08-14, the Tracy leak was fixed by rebuilding with
+`ENABLE_TRACY=OFF`. B and C resumed from their last checkpoints; the
+text MVP restarted from scratch (it had no saved checkpoints).
 
 | Run | Device | Config | Checkpoint dir | Log |
 |-----|--------|--------|----------------|-----|
 | Cell A (completed) | 3 | `cell_a_tt.yaml` | `checkpoints/stability_fix_a/` | `logs/cell_a_wrap_20260812.log` |
-| Cell B v2 (fresh start) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b_v2/` | `logs/cell_b_v2_20260813.log` |
-| Cell C v2 (fresh start) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c_v2/` | `logs/cell_c_v2_20260813.log` |
-| Text MVP (tiny challenges) | 3 | `text_cell_c_tiny_challenges.yaml` | `checkpoints/tiny_challenges/` | `logs/text_tiny_challenges_20260813.log` |
+| Cell B v2 (resumed step 1900) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b_v2/` | `logs/cell_b_v2_20260814.log` |
+| Cell C v2 (resumed step 800) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c_v2/` | `logs/cell_c_v2_20260814.log` |
+| Text MVP (fresh start) | 3 | `text_cell_c_tiny_challenges.yaml` | `checkpoints/tiny_challenges/` | `logs/text_tiny_challenges_20260814.log` |
 
-Old B and C checkpoints were deleted (13 GB + 6.1 GB). The old runs'
-results are invalid — they trained without gate freeze, causing the
-workspace to destabilize the backbone.
+Training health at resume (2026-08-14):
+- Cell B v2: loss 1.03, grad_norm 1.5 — stable, gates frozen at 0
+- Cell C v2: loss 1.26, grad_norm 1.1 — stable, gates frozen at 0
+- Text MVP: loss 10.99, grad_norm 1.5 — stable, gates frozen at 0
 
-Training health at start (all gates at 0.0, grad_norm ~8.8 matching A):
-- Cell B v2: loss 7.25, grad_norm 8.8 — stable, gates frozen
-- Cell C v2: loss 7.30, grad_norm 8.8 — stable, gates frozen
-- Text MVP: loss 10.9, grad_norm 1.5 — stable, gates frozen
-
-### Launch commands
+### Launch commands (2026-08-14, with Tracy leak fix)
 
 ```bash
-# Cell B v2 — device 1 (fresh start, gate freeze)
+# Cell B v2 — device 1 (resumed from step 1900, leak-free runtime)
 cd /home/rfenwick/Documents/jasper/workspace-poc
-TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
+TT_VISIBLE_DEVICES=1 TT_METAL_HOME=/home/rfenwick/Documents/tt-metal-src \
+nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
     --config configs/cell_b_tt.yaml --device 0 \
     --checkpoint_dir checkpoints/stability_fix_b_v2 \
-    >> logs/cell_b_v2_20260813.log 2>&1 &
+    --resume checkpoints/stability_fix_b_v2/cell_B_step1900.pt \
+    >> logs/cell_b_v2_20260814.log 2>&1 &
 
-# Cell C v2 — device 2 (fresh start, gate freeze)
-TT_VISIBLE_DEVICES=2 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
+# Cell C v2 — device 2 (resumed from step 800, leak-free runtime)
+TT_VISIBLE_DEVICES=2 TT_METAL_HOME=/home/rfenwick/Documents/tt-metal-src \
+nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
     --config configs/cell_c_attn_residual.yaml --device 0 \
     --checkpoint_dir checkpoints/stability_fix_c_v2 \
-    >> logs/cell_c_v2_20260813.log 2>&1 &
+    --resume checkpoints/stability_fix_c_v2/cell_C_step800.pt \
+    >> logs/cell_c_v2_20260814.log 2>&1 &
 
-# Text MVP — device 3 (tiny challenges corpus)
+# Text MVP — device 3 (fresh start, leak-free runtime)
 cd /home/rfenwick/Documents/jasper/workspace-mvp
-TT_VISIBLE_DEVICES=3 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
+TT_VISIBLE_DEVICES=3 TT_METAL_HOME=/home/rfenwick/Documents/tt-metal-src \
+nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
     --config configs/text_cell_c_tiny_challenges.yaml --device 0 \
     --checkpoint_dir checkpoints/tiny_challenges \
-    > logs/text_tiny_challenges_20260813.log 2>&1 &
+    > logs/text_tiny_challenges_20260814.log 2>&1 &
 ```
 
 ### Evaluation
