@@ -124,74 +124,131 @@ Key functions in `data.py` and `text_data.py` have semantic docstring
 decorators (`@Pure`, `@Idempotent`, `@Deterministic`) indicating their
 contractual properties for testability and reasoning.
 
-## Current training run (2026-08-04, AR core + chain scaling fix)
+## Current training run (2026-08-13, gate freeze + fresh restart)
 
-### Directory rename
+### Evaluation results (2026-08-13)
+
+The existing `eval_ttnn.py` evaluator was fixed (batch-size-1 TT-Metal
+matmul limitation — padded to batch 4) and run on all three cells'
+latest checkpoints before the v2 restart.
+
+| Cell | Step | Task 1 (chain) | Task 2 (2-var) | Task 3 (recall) | Overall | Depth 2 | Depth 8 |
+|------|------|----------------|----------------|-----------------|---------|---------|---------|
+| A | 9600 | 0.0% | 97.5% | 100.0% | 65.8% | 66.7% | 63.3% |
+| B | 8800 | 0.0% | 42.5% | 5.0% | 15.8% | 30.0% | 3.3% |
+| C | 4100 | 2.5% | 40.0% | 40.0% | 27.5% | 43.3% | 20.0% |
+
+Key findings:
+- **None of the cells learned Task 1** (chained assignment arithmetic).
+  Even A at step 9600 gets 0%. The multi-hop reasoning task is beyond
+  what a 10M retention model can learn at any configuration tested.
+- **B is worse than A** on Tasks 2 and 3 — the workspace actively hurt
+  the backbone. 119 out of ~950 step attempts were wasted on
+  restores/skips (12% of training time). Grad norm 250-2100 vs A's ~8.
+- **C is better than B** (27.5% vs 15.8% overall) and has stable
+  gradients (0 restores), but is still worse than A on Tasks 2/3.
+- Teacher-forced accuracy matches free-generation accuracy for all cells,
+  confirming the failures are reasoning failures, not decoding artifacts.
+
+### Gate freeze fix (2026-08-13)
+
+**Root cause of B underperforming A:** With ReZero gates initialized at
+0, B should start as exactly A (workspace is a no-op at gate=0). But
+the 3x gate LR caused gates to drift open due to noisy gradients before
+the workspace had learned useful representations, destabilizing the
+backbone through the workspace's gradient amplification paths.
+
+**Fix:** Added `gate_freeze_steps` config option. During the freeze
+period, `model.freeze_workspace_gates()` forces gates back to 0 after
+each optimizer step, and the fp32 master is synced. The workspace is a
+true no-op (identity) during freeze, so the backbone trains as if the
+workspace doesn't exist. After the freeze, gates learn freely at 1x LR
+(reduced from 3x/10x).
+
+Changes:
+- `model_ttnn.py`: Added `freeze_workspace_gates()` method to `TTWRAPModel`
+- `train_ttnn.py`: Added `gate_freeze_steps` config reading and post-step
+  freeze logic
+- `train_text.py`: Same gate freeze logic added to the text training loop
+- `configs/cell_b_tt.yaml`: `gate_freeze_steps: 3000`, gate LR 3x → 1x
+- `configs/cell_c_attn_residual.yaml`: `gate_freeze_steps: 3000`,
+  gate/AR LR 10x → 1x
+- `configs/text_cell_c_tiny_challenges.yaml`: `gate_freeze_steps: 600`,
+  gate/AR LR 10x → 1x
+
+### Active runs
+
+Cell A completed training (step 9999, loss 0.83). Cells B and C were
+restarted from scratch with the gate freeze fix. Device 3 is now used
+for the text MVP (tiny challenges corpus).
+
+| Run | Device | Config | Checkpoint dir | Log |
+|-----|--------|--------|----------------|-----|
+| Cell A (completed) | 3 | `cell_a_tt.yaml` | `checkpoints/stability_fix_a/` | `logs/cell_a_wrap_20260812.log` |
+| Cell B v2 (fresh start) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b_v2/` | `logs/cell_b_v2_20260813.log` |
+| Cell C v2 (fresh start) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c_v2/` | `logs/cell_c_v2_20260813.log` |
+| Text MVP (tiny challenges) | 3 | `text_cell_c_tiny_challenges.yaml` | `checkpoints/tiny_challenges/` | `logs/text_tiny_challenges_20260813.log` |
+
+Old B and C checkpoints were deleted (13 GB + 6.1 GB). The old runs'
+results are invalid — they trained without gate freeze, causing the
+workspace to destabilize the backbone.
+
+Training health at start (all gates at 0.0, grad_norm ~8.8 matching A):
+- Cell B v2: loss 7.25, grad_norm 8.8 — stable, gates frozen
+- Cell C v2: loss 7.30, grad_norm 8.8 — stable, gates frozen
+- Text MVP: loss 10.9, grad_norm 1.5 — stable, gates frozen
+
+### Launch commands
+
+```bash
+# Cell B v2 — device 1 (fresh start, gate freeze)
+cd /home/rfenwick/Documents/jasper/workspace-poc
+TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
+    --config configs/cell_b_tt.yaml --device 0 \
+    --checkpoint_dir checkpoints/stability_fix_b_v2 \
+    >> logs/cell_b_v2_20260813.log 2>&1 &
+
+# Cell C v2 — device 2 (fresh start, gate freeze)
+TT_VISIBLE_DEVICES=2 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
+    --config configs/cell_c_attn_residual.yaml --device 0 \
+    --checkpoint_dir checkpoints/stability_fix_c_v2 \
+    >> logs/cell_c_v2_20260813.log 2>&1 &
+
+# Text MVP — device 3 (tiny challenges corpus)
+cd /home/rfenwick/Documents/jasper/workspace-mvp
+TT_VISIBLE_DEVICES=3 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
+    --config configs/text_cell_c_tiny_challenges.yaml --device 0 \
+    --checkpoint_dir checkpoints/tiny_challenges \
+    > logs/text_tiny_challenges_20260813.log 2>&1 &
+```
+
+### Evaluation
+
+The evaluator (`eval_ttnn.py`) was fixed to handle TT-Metal's batch-size-1
+matmul limitation (padded to batch 4, using row 0 only). It also now
+calls `model.clear_caches()` between examples to prevent device DRAM
+leaks during autoregressive generation.
+
+```bash
+cd /home/rfenwick/Documents/jasper/workspace-poc
+TT_VISIBLE_DEVICES=0 /home/rfenwick/Documents/jasper/.tt-venv/bin/python eval_ttnn.py \
+    --config configs/cell_b_tt.yaml --device 0 \
+    --checkpoint checkpoints/stability_fix_b_v2/cell_B_stepXXXX.pt \
+    --n-per-task 10 --depths 2 4 6 8 --show-samples 5
+```
+
+`eval_loop.py` provides automated checkpoint monitoring and evaluation,
+with plateau detection (no Task 1 improvement over 3 consecutive evals).
+
+### Directory rename (2026-08-04)
 
 The project directories were renamed on 2026-08-04:
 - `mamba-poc` → **`workspace-poc`** (synthetic arithmetic training)
-- `mamba-mvp` → **`workspace-mvp`** (text POC — TinyStories)
+- `mamba-mvp` → **`workspace-mvp`** (text POC)
 
 The architecture has evolved well beyond Mamba (retention layers + workspace
 + recurrent core), so the "mamba" prefix was dropped. All symlinks in
 `workspace-mvp/` point to `workspace-poc/` for shared model code.
-
-### Active runs
-
-All three cells are training in parallel on the synthetic tasks.
-The memfix5 runs (2026-08-11) progressed to steps 8200/7900/3500 before
-being stopped. The WRAP rename (2026-08-12) touched all model class names,
-configs, and docs but no algorithm logic. The runs below resume from the
-latest memfix5 checkpoints with the renamed code.
-
-| Run | Device | Config | Checkpoint dir | Latest checkpoint | Log |
-|-----|--------|--------|----------------|-------------------|-----|
-| Cell A (backbone control) | 3 | `cell_a_tt.yaml` | `checkpoints/stability_fix_a/` | step 8200 | `logs/cell_a_wrap_20260812.log` |
-| Cell B (workspace) | 1 | `cell_b_tt.yaml` | `checkpoints/stability_fix_b/` | step 7900 | `logs/cell_b_wrap_20260812.log` |
-| Cell C (AR + recurrent) | 2 | `cell_c_attn_residual.yaml` | `checkpoints/stability_fix_c/` | step 3500 | `logs/cell_c_wrap_20260812.log` |
-
-Previous runs (memfix4) grew ~12-14 GB/hr and were killed at steps
-7100/7400/3200 respectively. The memfix5 runs resumed from those
-checkpoints with all leak fixes applied and progressed to 8200/7900/3500
-before being stopped.
-
-Training health at last checkpoint:
-- Cell A: loss ~0.81, grad_norm ~6.5 — stable, no skips/restores
-- Cell B: loss ~1.10, grad_norm ~448 — one grad spike restore at step 7745
-  (restored from 7700), continued to 7900. Gates opening (gz_gr=0.23,
-  gz_gw=0.125). Watch for recurring grad spikes on restart.
-- Cell C: loss ~1.12, grad_norm ~4.7 — stable, gates negative (-0.30,
-  -0.26) which is expected with causal masking
-
-### Launch commands (from workspace-poc/):
-
-All 4 devices are p300c. `train_ttnn.py` auto-detects P300 and finds the
-mesh graph descriptor automatically — no manual `TT_MESH_GRAPH_DESC_PATH`
-is needed.
-
-```bash
-# Cell B — device 1
-cd /home/rfenwick/Documents/jasper/workspace-poc
-TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
-    --config configs/cell_b_tt.yaml --device 0 \
-    --checkpoint_dir checkpoints/stability_fix_b \
-    --resume checkpoints/stability_fix_b/cell_B_step7900.pt \
-    >> logs/cell_b_wrap_20260812.log 2>&1 &
-
-# Cell C — device 2
-TT_VISIBLE_DEVICES=2 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
-    --config configs/cell_c_attn_residual.yaml --device 0 \
-    --checkpoint_dir checkpoints/stability_fix_c \
-    --resume checkpoints/stability_fix_c/cell_C_step3500.pt \
-    >> logs/cell_c_wrap_20260812.log 2>&1 &
-
-# Cell A — device 3
-TT_VISIBLE_DEVICES=3 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_ttnn.py \
-    --config configs/cell_a_tt.yaml --device 0 \
-    --checkpoint_dir checkpoints/stability_fix_a \
-    --resume checkpoints/stability_fix_a/cell_A_step8200.pt \
-    >> logs/cell_a_wrap_20260812.log 2>&1 &
-```
 
 ### Critical divergence thresholds
 
@@ -832,20 +889,30 @@ Further optimization requires either:
 
 The `workspace-mvp/` directory contains the text training pipeline — a
 drop-in replacement for the synthetic data pipeline that trains the same
-model architecture on TinyStories with GPT-2 BPE tokenization.
+model architecture on text with GPT-2 BPE tokenization. The current
+active dataset is the **tiny challenges** corpus (mixed reasoning
+puzzles), replacing the earlier TinyStories-only approach.
 
 ### Directory structure
 
 ```
 workspace-mvp/
-├── text_data.py          # BPE tokenizer + TinyStories dataset + batch sampling
+├── text_data.py          # BPE tokenizer + dataset loading + batch sampling
 ├── train_text.py         # Training loop (imports from workspace-poc/train_ttnn.py)
 ├── eval_text.py          # Perplexity evaluation + text generation
 ├── configs/
-│   └── text_cell_c.yaml  # Cell C AR config adapted for text (50K vocab, seq_len=512)
+│   ├── text_cell_c.yaml              # Cell C AR on TinyStories (legacy)
+│   └── text_cell_c_tiny_challenges.yaml  # Cell C AR on tiny challenges (active)
+├── tools/
+│   ├── prepare_tinystories.py
+│   ├── prepare_logic_puzzles.py
+│   ├── prepare_brainbashers_style.py
+│   ├── prepare_babi.py
+│   └── prepare_tiny_challenges.py    # 2M mixed corpus generator
 ├── data/
-│   ├── tinystories_train.txt         # 1.9GB, ~480M tokens
-│   └── tinystories_valid.txt         # 19MB, ~4.8M tokens
+│   ├── tiny_challenges_train.txt         # ~292 MB, 78.7M tokens
+│   ├── tiny_challenges_valid.txt         # ~3 MB, 787K tokens
+│   └── *.tokens.pt                       # Pre-tokenized caches
 ├── model_ttnn.py -> ../workspace-poc/model_ttnn.py  (symlink)
 ├── kernels/ -> ../workspace-poc/kernels/
 └── venv -> ../.tt-venv/
@@ -855,13 +922,36 @@ workspace-mvp/
 
 | Aspect | Synthetic (workspace-poc) | Text (workspace-mvp) |
 |--------|--------------------------|----------------------|
-| Data | Generated arithmetic tasks | TinyStories (real text) |
+| Data | Generated arithmetic tasks | Tiny challenges (mixed reasoning puzzles) |
 | Vocab | 128 (char-level) | 50,257 (GPT-2 BPE) |
 | Seq len | 128 | 512 |
 | Labels | Answer tokens only (-100 elsewhere) | Every position (standard LM) |
 | Loss | On-device (V×V identity matrix) | Host-side (for V > 2048) |
 | Eval | Task accuracy with verifiers | Perplexity + text generation |
 | Params | 10.5M | 29.8M (19.3M from embedding) |
+
+### Tiny challenges corpus
+
+The tiny challenges corpus is a 2M-example mixed reasoning dataset
+inspired by Enigmata-style synthetic reasoning training. The mixture:
+
+| Component | Fraction | Description |
+|-----------|----------|-------------|
+| Narrative logic puzzles | 40% | Multi-hop location, arithmetic, swap, attribute puzzles |
+| BrainBashers-style puzzles | 55% | Attribute-chain, elimination, ordering puzzles |
+| bAbI QA | 5% | HuggingFace `Muennighoff/babi` passages |
+
+- Train: 2,000,000 examples (~292 MB, 78.7M tokens)
+- Validation: 20,000 examples (~3 MB, 787K tokens)
+- Generated by `tools/prepare_tiny_challenges.py` (requires bAbI source
+  files from `tools/prepare_babi.py` first)
+
+The shift from TinyStories to tiny challenges reflects the finding that
+the synthetic POC tasks (Task 1 chained arithmetic) were not learnable
+by a 10M retention model. The tiny challenges corpus tests whether
+framing multi-hop reasoning as text continuation — with the workspace
+and recurrent core — can learn reasoning that the synthetic POC could
+not.
 
 ### Host-side loss for large vocab
 
@@ -880,47 +970,52 @@ matrix for one-hot encoding — fine for V=128 (32KB), impossible for V=50257
 
 Select via CLI: `--loss_method host` (default) or `--loss_method scatter`.
 
-### Dataset choice rationale
+### Gate freeze in text training
 
-TinyStories was chosen over reasoning datasets (OpenThoughts, NuminaMath,
-etc.) because:
-- It's the only dataset designed for <10M param models
-- ~480M tokens fits the training budget exactly
-- It validates that the architecture can learn coherent language at all
-- Reasoning datasets (DeepSeek-R1 distilled CoT) are too complex for a 10M
-  model — it would memorize surface patterns without understanding reasoning
+`train_text.py` has its own training loop (it does not call the
+`train_ttnn.py` loop), so gate freeze logic was added separately:
+- Reads `gate_freeze_steps` from the config
+- Calls `model.freeze_workspace_gates()` after each optimizer step while
+  `step < gate_freeze_steps`
+- Clamps gates to `[-gate_clamp_bound, gate_clamp_bound]` after unfreeze
+- Syncs optimizer fp32 master copies after gate modifications
 
-A two-stage approach is planned: TinyStories for foundation training, then
-a small reasoning dataset (OpenThoughts-114k metadata config) for
-fine-tuning to test the workspace's multi-hop capability.
+Config: `configs/text_cell_c_tiny_challenges.yaml` uses
+`gate_freeze_steps: 600` and 1x gate/AR LR (reduced from 10x).
 
-### Smoke test results (200 steps)
+### Current text training run
 
-- Loss: 10.92 → 9.24 (log(50257) ≈ 10.82 at init, confirming correct random init)
-- Perplexity: ~50K → 10,595
-- Grad norm: 1.2-2.9 (stable, no divergence)
-- Speed: ~1.4s/step, 1,400 tok/s (micro_batch=4, seq_len=512, no accum)
+- Config: `configs/text_cell_c_tiny_challenges.yaml`
+- Device: 3
+- micro_batch=8, accum_steps=48, effective_batch=384
+- seq_len=512, effective_tokens/step=196,608
+- lr=1e-4, max_steps=2000
+- gate_freeze_steps=600
+- Initial loss: 10.92 (≈log(50257), correct random init)
+- Initial grad_norm: 1.5, gates 0.0 (frozen)
+- Speed: ~112s/step (K=6 recurrent core on 30M model)
+- Estimated total: ~62 hours for 2000 steps
 
 ### Launch (from workspace-mvp/):
 
 ```bash
 # Smoke test
 TT_VISIBLE_DEVICES=1 python train_text.py \
-    --config configs/text_cell_c.yaml --steps 3 \
+    --config configs/text_cell_c_tiny_challenges.yaml --steps 3 \
     --micro_batch 4 --accum_steps 1 \
     --checkpoint_dir /tmp/text_test --device 0
 
-# Full training
+# Full training (tiny challenges corpus)
 cd /home/rfenwick/Documents/jasper/workspace-mvp
-TT_VISIBLE_DEVICES=1 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
-    --config configs/text_cell_c.yaml --device 0 \
-    --checkpoint_dir checkpoints \
-    > logs/text_cell_c.log 2>&1 &
+TT_VISIBLE_DEVICES=3 nohup /home/rfenwick/Documents/jasper/.tt-venv/bin/python train_text.py \
+    --config configs/text_cell_c_tiny_challenges.yaml --device 0 \
+    --checkpoint_dir checkpoints/tiny_challenges \
+    > logs/text_tiny_challenges_20260813.log 2>&1 &
 
 # Evaluation
 TT_VISIBLE_DEVICES=1 python eval_text.py \
-    --checkpoint checkpoints/cell_text_step500.pt \
-    --config configs/text_cell_c.yaml --device 0 \
+    --checkpoint checkpoints/tiny_challenges/cell_text_step500.pt \
+    --config configs/text_cell_c_tiny_challenges.yaml --device 0 \
     --generate --prompt "Once upon a time"
 ```
 
@@ -1385,29 +1480,41 @@ addresses by rebuilding the descriptor with current tensor buffers on
 every cache hit. Combined with Component 1 (flat-array patch), the
 full model leak is reduced to allocator fragmentation levels.
 
-### Current status (2026-08-12)
+### Current status (2026-08-14)
 
-- The patched `.so` files (Component 1 flat-array + clean adapter) are
-  installed in the pip package. Original `.so` files are backed up as `.bak`.
+- The patched `.so` files (Component 1 flat-array + binary_ng hash fix +
+  Tracy disabled) are installed in the pip package. Original `.so` files
+  are backed up as `.bak`.
 - The tt-metal source tree with the patches is at
   `/home/rfenwick/Documents/tt-metal-src/`.
-- **The full model leak is fixed.** Component 1 eliminates the
-  isolated-operation leak (0 KB growth after 10k ops). The adapter's
-  `resolve_bindings`/`apply_resolved_bindings` mechanism handles CB
-  buffer patching on cache hits. binary_ng uses the slow path (descriptor
-  rebuild) which correctly handles stale buffers.
-- **Validation results (2026-08-12):**
-  - 3 forwards of 14-layer model: PASS (no hang)
-  - Forward + backward + loss x3: PASS
-  - Gradient correctness: 12/12 tests PASS
-  - Isolated leak test (retention_forward, 100 iters): 0.12 MB/iter (MINOR)
-  - Isolated leak test (retention_backward, 100 iters): 0.25 MB/iter (MINOR)
-  - Cell A smoke test (3 steps): PASS
-  - Cell B smoke test (3 steps): PASS
-  - Cell C smoke test (3 steps): PASS
+- **The full model leak is fixed.** Three components were addressed:
+  1. Component 1 (DataCollector flat-array) eliminates the common-path
+     heap fragmentation from hash map node inserts.
+  2. Component 2 (binary_ng padded_shape hash + buffer_bindings) enables
+     the fast path for binary_ng cache hits, avoiding descriptor rebuilds.
+  3. Component 3 (Tracy profiler disabled) eliminates the dominant leak
+     source — see below.
+- **Component 3: Tracy profiler leak (2026-08-14, the dominant leak)**
+  - The build had `ENABLE_TRACY=ON` and `TRACY_ON_DEMAND=OFF`.
+  - Without `TRACY_ON_DEMAND`, every `ZoneScoped` macro unconditionally
+    enqueues to an unbounded `moodycamel::ConcurrentQueue` that grows via
+    `rpmalloc` → `mmap(MAP_ANONYMOUS)`.
+  - No Tracy client was connected to drain the queue, so it grew linearly.
+  - This was the source of the ~350 KB/step anonymous mmap growth that
+    caused OOM after ~2000 optimizer steps (16.8 MB/step × 2000 = 33.6 GB).
+  - The previous "0.25 MB/iter residual" was actually this Tracy leak,
+    not allocator fragmentation as previously concluded.
+  - Fix: Rebuilt with `ENABLE_TRACY=OFF` (via `--disable-profiler`).
+  - Verification: 200-step test shows RSS plateaus at 338 MB (1 MB total
+    growth, 0 KB/step after step 20). Anonymous mappings: 0 new mappings.
+    All three .so files have zero rpmalloc symbol references.
+- **Validation results (2026-08-14, with Tracy disabled):**
+  - 200-step leak test: 336 -> 338 MB (1 MB, plateaus by step 20)
+  - Anonymous mappings: 161 -> 161 (0 new), virtual size stable
+  - Program cache: stable at 212
+  - Previous validation (2026-08-12): 12/12 gradient tests, all smoke tests
 - Training requires `TT_METAL_HOME=/home/rfenwick/Documents/tt-metal-src`
   to be set so JIT compilation can find kernel sources.
-- Production training has NOT been restarted yet.
 - If the patched library causes issues, restore the originals:
   ```bash
   PKG_DIR=.tt-venv/lib/python3.12/site-packages/pjrt_plugin_tt/lib64
