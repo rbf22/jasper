@@ -10,6 +10,7 @@ All tasks are character-level, generated on-the-fly, and verifiable.
 """
 
 import random
+import re
 import string
 import torch
 from typing import List, Tuple, Dict, Optional
@@ -345,6 +346,137 @@ def sample_batch(
             labels[b, t] = ids[t + 1]
 
     return input_ids, labels, task_ids
+
+
+def task1_memory_trace(prompt: str) -> Tuple[List[List[int]], int]:
+    unknown = MOD
+    assignments = {}
+    query_var = None
+    for part in prompt.rstrip(";").split(";"):
+        if part.startswith("?"):
+            query_var = part[1:]
+        elif "=" in part:
+            var, expr = part.split("=", 1)
+            assignments[var] = expr
+
+    state = [unknown] * len(VAR_NAMES)
+    for var, expr in assignments.items():
+        if expr.isdigit():
+            state[VAR_NAMES.index(var)] = int(expr) % MOD
+
+    states = [state.copy()]
+    while query_var is not None and state[VAR_NAMES.index(query_var)] == unknown:
+        previous = state.copy()
+        updates = {}
+        for var, expr in assignments.items():
+            index = VAR_NAMES.index(var)
+            if previous[index] != unknown:
+                continue
+            match = re.fullmatch(r"([a-p])([+\-*])(\d+)", expr)
+            if match is None:
+                continue
+            source, op, operand_text = match.groups()
+            source_value = previous[VAR_NAMES.index(source)]
+            if source_value == unknown:
+                continue
+            operand = int(operand_text)
+            if op == "+":
+                value = source_value + operand
+            elif op == "-":
+                value = source_value - operand
+            else:
+                value = source_value * operand
+            updates[index] = value % MOD
+        if not updates:
+            break
+        for index, value in updates.items():
+            state[index] = value
+        states.append(state.copy())
+
+    if query_var is None:
+        raise ValueError("Task 1 prompt has no query variable")
+    return states, VAR_NAMES.index(query_var)
+
+
+def sample_task1_latent_batch(
+    batch_size: int,
+    seq_len: int,
+    vocab: Vocab,
+    depth_range: Tuple[int, int] = (2, 8),
+    max_reasoning_steps: int = 7,
+    rng: Optional[random.Random] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    if rng is None:
+        rng = random.Random()
+
+    input_ids = torch.full((batch_size, seq_len), vocab.PAD, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
+    memory_targets = torch.full(
+        (batch_size, max_reasoning_steps + 1, len(VAR_NAMES)), MOD, dtype=torch.long
+    )
+    memory_target_mask = torch.zeros((batch_size, len(VAR_NAMES)), dtype=torch.bool)
+    answer_targets = torch.empty(batch_size, dtype=torch.long)
+    query_targets = torch.empty(batch_size, dtype=torch.long)
+    reasoning_steps = torch.empty(batch_size, dtype=torch.long)
+    source_targets = torch.full((batch_size, len(VAR_NAMES)), len(VAR_NAMES), dtype=torch.long)
+    operator_targets = torch.zeros((batch_size, len(VAR_NAMES)), dtype=torch.long)
+    operand_targets = torch.zeros((batch_size, len(VAR_NAMES)), dtype=torch.long)
+
+    for batch_index in range(batch_size):
+        depth = rng.randint(*depth_range)
+        prompt, _, answer = gen_task1(depth, rng)
+        ids = vocab.encode(prompt)[:seq_len]
+        input_ids[batch_index, :len(ids)] = torch.tensor(ids)
+        attention_mask[batch_index, :len(ids)] = True
+        states, query_index = task1_memory_trace(prompt)
+        reasoning_steps[batch_index] = min(len(states) - 1, max_reasoning_steps)
+        query_targets[batch_index] = query_index
+        assigned_indices = []
+        for part in prompt.split(";"):
+            if "=" not in part:
+                continue
+            variable, expression = part.split("=", 1)
+            variable_index = VAR_NAMES.index(variable)
+            assigned_indices.append(variable_index)
+            if expression.isdigit():
+                operand_targets[batch_index, variable_index] = int(expression) % MOD
+                continue
+            match = re.fullmatch(r"([a-p])([+\-*])(\d+)", expression)
+            if match is None:
+                continue
+            source, operator, operand = match.groups()
+            source_targets[batch_index, variable_index] = VAR_NAMES.index(source)
+            operator_targets[batch_index, variable_index] = {"+": 1, "-": 2, "*": 3}[operator]
+            operand_targets[batch_index, variable_index] = int(operand) % MOD
+        memory_target_mask[batch_index, assigned_indices] = True
+        for step in range(max_reasoning_steps + 1):
+            state = states[min(step, len(states) - 1)]
+            memory_targets[batch_index, step] = torch.tensor(state)
+        answer_targets[batch_index] = answer
+
+    return (
+        input_ids,
+        attention_mask,
+        memory_targets,
+        memory_target_mask,
+        answer_targets,
+        query_targets,
+        reasoning_steps,
+        source_targets,
+        operator_targets,
+        operand_targets,
+    )
 
 
 def generate_eval_set(
