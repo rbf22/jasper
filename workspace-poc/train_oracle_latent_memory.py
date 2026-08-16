@@ -111,13 +111,22 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--checkpoint-dir", default="checkpoints/oracle-latent-memory")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--explicit-arithmetic", action="store_true",
+                        help="Use exact circulant/permutation matrices instead of learning arithmetic")
+    parser.add_argument("--no-detach", action="store_true",
+                        help="Don't detach memory between recurrent steps")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     device = torch.device(args.device)
     vocab = Vocab()
-    config = OracleLatentMemoryConfig(d_model=args.d_model, expand=args.expand)
+    config = OracleLatentMemoryConfig(
+        d_model=args.d_model,
+        expand=args.expand,
+        use_explicit_arithmetic=args.explicit_arithmetic,
+        detach_memory_steps=not args.no_detach,
+    )
     model = OracleLatentMemoryReasoner(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     checkpoint_dir = Path(args.checkpoint_dir)

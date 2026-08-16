@@ -210,7 +210,27 @@ class OracleLatentMemoryConfig:
     detach_memory_steps: bool = True
     memory_update_scale: float = 1.0
     use_value_channel: bool = True
+    use_explicit_arithmetic: bool = False
     value_hidden: int = 256
+
+
+def _build_circulant_shift(operand: int, n: int = MOD, subtract: bool = False) -> torch.Tensor:
+    """Build an n×n circulant matrix that shifts a one-hot vector by operand (mod n)."""
+    mat = torch.zeros(n, n)
+    for i in range(n):
+        if subtract:
+            mat[i, (i - operand) % n] = 1.0
+        else:
+            mat[i, (i + operand) % n] = 1.0
+    return mat
+
+
+def _build_mul_permutation(operand: int, n: int = MOD) -> torch.Tensor:
+    """Build an n×n permutation matrix for multiplication by operand (mod n)."""
+    mat = torch.zeros(n, n)
+    for i in range(n):
+        mat[i, (i * operand) % n] = 1.0
+    return mat
 
 
 class OracleMemoryTransition(nn.Module):
@@ -221,6 +241,10 @@ class OracleMemoryTransition(nn.Module):
     head, and writes them back alongside the latent state update.  This
     separates *value propagation* (which must be exact) from *latent
     context* (which can be approximate).
+
+    When use_explicit_arithmetic is True, the arithmetic is computed exactly
+    using circulant/permutation matrices instead of being learned.  This tests
+    whether the routing/propagation works when arithmetic is given for free.
     """
 
     def __init__(self, config: OracleLatentMemoryConfig):
@@ -238,19 +262,62 @@ class OracleMemoryTransition(nn.Module):
         self.update_scale = config.memory_update_scale
         self.n_slots = config.n_slots
         self.use_value_channel = config.use_value_channel
+        self.use_explicit_arithmetic = config.use_explicit_arithmetic
 
-        if self.use_value_channel:
+        if self.use_value_channel or self.use_explicit_arithmetic:
             value_dim = MOD + 1
             # Read value logits from a slot's latent state.
             self.value_read = nn.Linear(config.d_model, value_dim, bias=False)
+            # Write computed value logits back into latent state.
+            self.value_write = nn.Linear(value_dim, config.d_model, bias=False)
+
+        if self.use_value_channel and not self.use_explicit_arithmetic:
             # Compute new value logits from (source_value_logits, operator_emb, operand_emb).
             self.value_compute = nn.Sequential(
                 nn.Linear(value_dim + config.d_model * 2, config.value_hidden, bias=False),
                 nn.SiLU(),
                 nn.Linear(config.value_hidden, value_dim, bias=False),
             )
-            # Write computed value logits back into latent state.
-            self.value_write = nn.Linear(value_dim, config.d_model, bias=False)
+
+        if self.use_explicit_arithmetic:
+            # Pre-compute circulant/permutation matrices for all operands.
+            # Shape: (MOD, MOD, MOD) — indexed by operand value.
+            self.register_buffer("add_matrices", torch.stack([_build_circulant_shift(k) for k in range(MOD)]))
+            self.register_buffer("sub_matrices", torch.stack([_build_circulant_shift(k, subtract=True) for k in range(MOD)]))
+            self.register_buffer("mul_matrices", torch.stack([_build_mul_permutation(k) for k in range(MOD)]))
+
+    def explicit_arithmetic(
+        self,
+        source_value_logits: torch.Tensor,
+        operator_targets: torch.Tensor,
+        operand_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply exact modular arithmetic using pre-computed matrices."""
+        # source_value_logits: (B, S, MOD+1) — use only first MOD logits.
+        src = source_value_logits[..., :MOD]  # (B, S, MOD)
+        # Softmax to get a distribution, then apply the matrix.
+        src_dist = F.softmax(src, dim=-1)  # (B, S, MOD)
+
+        # Gather the right matrix for each slot based on operator and operand.
+        # operator_targets: (B, S) — 0=none, 1=add, 2=sub, 3=mul
+        # operand_targets: (B, S) — 0..MOD-1
+        B, S = operator_targets.shape
+        result = torch.zeros_like(src_dist)
+
+        for op_id, matrices in [(1, self.add_matrices), (2, self.sub_matrices), (3, self.mul_matrices)]:
+            mask = operator_targets == op_id  # (B, S)
+            if not mask.any():
+                continue
+            # For each (b, s) where mask is true, apply matrices[operand_targets[b,s]] to src_dist[b,s]
+            indices = mask.nonzero()  # (N, 2)
+            for idx in indices:
+                b, s = idx
+                operand = operand_targets[b, s].item()
+                result[b, s] = matrices[operand] @ src_dist[b, s]
+
+        # Append the "unknown" logit (index MOD) — set to large negative for known values.
+        unknown_logit = source_value_logits[..., MOD:MOD+1]  # (B, S, 1)
+        return torch.cat([result, unknown_logit], dim=-1)
 
     def forward(
         self,
@@ -259,6 +326,8 @@ class OracleMemoryTransition(nn.Module):
         source_targets: torch.Tensor,
         operator_metadata: torch.Tensor,
         operand_metadata: torch.Tensor,
+        operator_targets: Optional[torch.Tensor] = None,
+        operand_targets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         source_indices = source_targets.clamp_max(self.n_slots - 1)
         batch_indices = torch.arange(memory.shape[0], device=memory.device)[:, None]
@@ -271,7 +340,14 @@ class OracleMemoryTransition(nn.Module):
         updated = self.output_norm(memory + self.update_scale * gate * proposal)
         dependent = source_targets.lt(self.n_slots).unsqueeze(-1)
 
-        if self.use_value_channel:
+        if self.use_explicit_arithmetic and operator_targets is not None and operand_targets is not None:
+            source_value_logits = self.value_read(source_memory)
+            new_value_logits = self.explicit_arithmetic(
+                source_value_logits, operator_targets, operand_targets
+            )
+            value_update = self.value_write(new_value_logits)
+            updated = updated + self.update_scale * value_update
+        elif self.use_value_channel:
             source_value_logits = self.value_read(source_memory)
             compute_input = torch.cat(
                 (source_value_logits, operator_metadata, operand_metadata), dim=-1
@@ -350,7 +426,13 @@ class OracleLatentMemoryReasoner(nn.Module):
                 step_op = op_meta
                 step_operand = operand_meta
             memory = self.transition(
-                transition_input, step_metadata, source_targets, step_op, step_operand
+                transition_input,
+                step_metadata,
+                source_targets,
+                step_op,
+                step_operand,
+                operator_targets=operator_targets if self.config.use_explicit_arithmetic else None,
+                operand_targets=operand_targets if self.config.use_explicit_arithmetic else None,
             )
             states.append(memory)
         memory_states = torch.stack(states, dim=1)
