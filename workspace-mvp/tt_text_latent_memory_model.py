@@ -1345,12 +1345,13 @@ class TTTextLatentMemoryModel:
         _safe_deallocate(kpm)
 
         # --- Initialize memory ---
+        # NOTE: Use encoder_norm output (x_enc), not pre-norm — matches CPU model
         queries = ttnn.reshape(self.slot_queries, [1, self.n_slots, d])
         queries_b = ttnn.expand(queries, [B, self.n_slots, d])
 
         kpm_mem = self._get_key_padding_mask(prompt_mask)
         mem_attn_out = self.memory_init_attn.forward(
-            queries_b, enc_pre_norm, enc_pre_norm,
+            queries_b, x_enc, x_enc,
             key_padding_mask=kpm_mem, training=True
         )
         memory = ttnn.add(queries_b, mem_attn_out)
