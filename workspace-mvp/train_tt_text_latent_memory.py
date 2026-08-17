@@ -144,13 +144,13 @@ def _map_tt_to_pt_name(tt_name: str) -> str:
     if tt_name in mapping:
         return mapping[tt_name]
 
-    # Encoder layers
+    # Encoder layers: enc_{i}_{suffix}
     if tt_name.startswith("enc_"):
         parts = tt_name.split("_", 2)
         idx = int(parts[1])
         suffix = parts[2]
         prefix = f"encoder.layers.{idx}"
-        return _map_attn_or_ffn(suffix, prefix)
+        return _map_enc_dec_param(suffix, prefix)
 
     # Memory init attention
     if tt_name.startswith("mem_init_"):
@@ -162,45 +162,59 @@ def _map_tt_to_pt_name(tt_name: str) -> str:
         suffix = tt_name[len("trans_"):]
         if suffix == "gate_w": return "transition.gate.weight"
         if suffix == "gate_b": return "transition.gate.bias"
-        return _map_attn_or_ffn(suffix, "transition")
+        if suffix == "attn_norm_w": return "transition.attn_norm.weight"
+        if suffix == "output_norm_w": return "transition.output_norm.weight"
+        if suffix == "ffn_w": return "transition.mlp.0.weight"
+        if suffix == "ffn_out_w": return "transition.mlp.2.weight"
+        # Attention params
+        return _map_attn_param(suffix, "transition.self_attn")
 
-    # Decoder layers
+    # Decoder layers: dec_{i}_{suffix}
     if tt_name.startswith("dec_"):
         parts = tt_name.split("_", 2)
         idx = int(parts[1])
         suffix = parts[2]
-        if suffix.startswith("sa_"):
-            return _map_attn_param(suffix[3:], f"decoder.layers.{idx}.self_attn")
-        if suffix.startswith("ca_"):
-            return _map_attn_param(suffix[3:], f"decoder.layers.{idx}.cross_attn")
-        if suffix == "sa_norm_w": return f"decoder.layers.{idx}.self_attn_norm.weight"
-        if suffix == "ca_norm_w": return f"decoder.layers.{idx}.cross_attn_norm.weight"
-        return _map_attn_or_ffn(suffix, f"decoder.layers.{idx}")
+        prefix = f"decoder.layers.{idx}"
+        return _map_enc_dec_param(suffix, prefix)
 
     return None
 
 
 def _map_attn_param(suffix, prefix):
+    """Map attention parameter suffix to PyTorch name."""
     mapping = {
-        "q_w": f"{prefix}.q_proj.weight", "q_b": f"{prefix}.q_proj.bias",
-        "k_w": f"{prefix}.k_proj.weight", "k_b": f"{prefix}.k_proj.bias",
-        "v_w": f"{prefix}.v_proj.weight", "v_b": f"{prefix}.v_proj.bias",
-        "o_w": f"{prefix}.out_proj.weight", "o_b": f"{prefix}.out_proj.bias",
+        "in_proj_w": f"{prefix}.in_proj_weight",
+        "in_proj_b": f"{prefix}.in_proj_bias",
+        "out_proj_w": f"{prefix}.out_proj.weight",
+        "out_proj_b": f"{prefix}.out_proj.bias",
     }
     return mapping.get(suffix)
 
 
-def _map_attn_or_ffn(suffix, prefix):
-    attn = _map_attn_param(suffix, prefix + ".self_attn") if prefix != "transition" else _map_attn_param(suffix, prefix + ".self_attn")
-    if attn: return attn
-    mapping = {
-        "attn_norm_w": f"{prefix}.attn_norm.weight",
-        "ffn_w": f"{prefix}.mlp.0.weight",
-        "ffn_out_w": f"{prefix}.mlp.2.weight",
-        "ffn_norm_w": f"{prefix}.mlp_norm.weight",
-        "output_norm_w": f"{prefix}.output_norm.weight",
+def _map_enc_dec_param(suffix, prefix):
+    """Map encoder/decoder layer parameter suffix to PyTorch name."""
+    # Self-attention
+    if suffix.startswith("sa_"):
+        return _map_attn_param(suffix[3:], f"{prefix}.self_attn")
+    # Cross-attention
+    if suffix.startswith("ca_"):
+        return _map_attn_param(suffix[3:], f"{prefix}.multihead_attn")
+    # Norms
+    norm_map = {
+        "norm1_w": f"{prefix}.norm1.weight", "norm1_b": f"{prefix}.norm1.bias",
+        "norm2_w": f"{prefix}.norm2.weight", "norm2_b": f"{prefix}.norm2.bias",
+        "norm3_w": f"{prefix}.norm3.weight", "norm3_b": f"{prefix}.norm3.bias",
     }
-    return mapping.get(suffix)
+    if suffix in norm_map:
+        return norm_map[suffix]
+    # FFN
+    ffn_map = {
+        "linear1_w": f"{prefix}.linear1.weight", "linear1_b": f"{prefix}.linear1.bias",
+        "linear2_w": f"{prefix}.linear2.weight", "linear2_b": f"{prefix}.linear2.bias",
+    }
+    if suffix in ffn_map:
+        return ffn_map[suffix]
+    return None
 
 
 def evaluate_tt(tt_model, dataset, batch_size, n_batches, device, seed):

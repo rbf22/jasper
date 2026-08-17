@@ -75,6 +75,26 @@ class TTRMSNorm:
         return ttnn.rms_norm(x, weight=self.weight, epsilon=self.eps)
 
 
+class TTLayerNorm:
+    """LayerNorm using ttnn.layer_norm — matches PyTorch nn.LayerNorm."""
+
+    def __init__(self, d: int, device, eps=1e-5):
+        self.d = d
+        self.eps = eps
+        self.device = device
+        self.weight = ttnn.from_torch(
+            torch.ones(d, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.bias = ttnn.from_torch(
+            torch.zeros(d, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+
+    def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
+        return ttnn.layer_norm(x, weight=self.weight, bias=self.bias, epsilon=self.eps)
+
+
 class TTLinear:
     """Linear layer: y = x @ W + b.
 
@@ -100,9 +120,13 @@ class TTLinear:
 
 
 class TTMultiHeadAttention:
-    """Multi-head attention on device. Supports self-attention and cross-attention.
+    """Multi-head attention on device with combined QKV projection.
 
-    Forward only — backward is handled by PyTorch autograd at the layer boundary.
+    Matches PyTorch nn.MultiheadAttention:
+    - in_proj_weight: (3*d_model, d_model) — combined QKV
+    - in_proj_bias: (3*d_model,)
+    - out_proj.weight: (d_model, d_model)
+    - out_proj.bias: (d_model,)
     """
 
     def __init__(self, d_model: int, n_heads: int, device, dropout=0.0):
@@ -112,10 +136,20 @@ class TTMultiHeadAttention:
         self.scale = 1.0 / (self.d_head ** 0.5)
         self.device = device
 
-        self.q_proj = TTLinear(d_model, d_model, device)
-        self.k_proj = TTLinear(d_model, d_model, device)
-        self.v_proj = TTLinear(d_model, d_model, device)
-        self.out_proj = TTLinear(d_model, d_model, device)
+        # Combined QKV projection: (d_model, 3*d_model) for ttnn.linear
+        self.in_proj_weight = to_device(
+            torch.randn(d_model, 3 * d_model, dtype=torch.bfloat16) * 0.02, device
+        )
+        self.in_proj_bias = to_device(
+            torch.zeros(3 * d_model, dtype=torch.bfloat16), device
+        )
+        # Output projection
+        self.out_proj_weight = to_device(
+            torch.randn(d_model, d_model, dtype=torch.bfloat16) * 0.02, device
+        )
+        self.out_proj_bias = to_device(
+            torch.zeros(d_model, dtype=torch.bfloat16), device
+        )
 
         # Cache scale as device tensor
         self._scale_tt = ttnn.from_torch(
@@ -139,14 +173,17 @@ class TTMultiHeadAttention:
         key_padding_mask: Optional["ttnn.Tensor"] = None,
         attn_mask: Optional["ttnn.Tensor"] = None,
     ) -> "ttnn.Tensor":
-        """Forward pass for multi-head attention.
+        """Forward pass for multi-head attention with combined QKV.
+
+        For self-attention (query==key==value), uses a single combined projection.
+        For cross-attention, projects query separately and combines key+value.
 
         Args:
             query: (B, L_q, d_model)
             key: (B, L_k, d_model)
             value: (B, L_k, d_model)
-            key_padding_mask: (B, L_k) — 1.0 for valid, 0.0 for padding (added to scores as -inf)
-            attn_mask: (L_q, L_k) — additive mask (0 for keep, -inf for mask)
+            key_padding_mask: (B, L_k) — additive mask (0=valid, -inf=padding)
+            attn_mask: (L_q, L_k) — additive mask (0=keep, -inf=mask)
 
         Returns: (B, L_q, d_model)
         """
@@ -154,10 +191,37 @@ class TTMultiHeadAttention:
         B = query.shape[0]
         L_q = query.shape[1]
         L_k = key.shape[1]
+        d = self.d_model
 
-        q = self.q_proj.forward(query)
-        k = self.k_proj.forward(key)
-        v = self.v_proj.forward(value)
+        if query is key and key is value:
+            # Self-attention: single combined QKV projection
+            qkv = ttnn.linear(query, self.in_proj_weight, bias=self.in_proj_bias)
+            # Split into q, k, v along last dim
+            qkv_parts = ttnn.split(qkv, d, dim=-1)
+            q, k, v = qkv_parts[0], qkv_parts[1], qkv_parts[2]
+            _safe_deallocate(qkv)
+        else:
+            # Cross-attention: project query, then combined KV
+            # PyTorch nn.MultiheadAttention uses the same in_proj_weight for all
+            # but with different inputs. The in_proj_weight is (3*d, d).
+            # For cross-attention, PyTorch splits it: first d rows for Q, next 2d for KV.
+            # We project query with first d columns, key with next d, value with last d.
+            # Actually, PyTorch's in_proj_weight for cross-attn is structured as:
+            #   q_proj = in_proj_weight[:d, :]
+            #   k_proj = in_proj_weight[d:2d, :]
+            #   v_proj = in_proj_weight[2d:3d, :]
+            # But ttnn.linear uses (in, out) format, so we need to split columns.
+            # Simpler: just do three separate linears using slices of the weight.
+            # For now, use the full projection on each input (works for self-attn parity)
+            qkv_q = ttnn.linear(query, self.in_proj_weight, bias=self.in_proj_bias)
+            qkv_parts = ttnn.split(qkv_q, d, dim=-1)
+            q = qkv_parts[0]
+            _safe_deallocate(qkv_q)
+
+            qkv_kv = ttnn.linear(key, self.in_proj_weight, bias=self.in_proj_bias)
+            kv_parts = ttnn.split(qkv_kv, d, dim=-1)
+            k, v = kv_parts[1], kv_parts[2]
+            _safe_deallocate(qkv_kv)
 
         q = self._reshape_to_heads(q, B, L_q)  # (B, H, L_q, d_h)
         k = self._reshape_to_heads(k, B, L_k)  # (B, H, L_k, d_h)
@@ -171,18 +235,16 @@ class TTMultiHeadAttention:
 
         # Apply key padding mask if provided
         if key_padding_mask is not None:
-            # key_padding_mask: (B, L_k) — reshape to (B, 1, 1, L_k) for broadcasting
             kpm = ttnn.reshape(key_padding_mask, [B, 1, 1, L_k])
-            # Convert 0->-inf, 1->0
             neg_inf = ttnn.from_torch(
                 torch.full((1,), float('-inf'), dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
             )
-            mask_val = ttnn.mul(kpm, neg_inf)  # 0*−inf=0 (valid), 1*−inf=−inf (masked)
+            mask_val = ttnn.mul(kpm, neg_inf)
             _safe_deallocate(kpm)
             scores = ttnn.add(scores, mask_val)
             _safe_deallocate(mask_val)
-        _safe_deallocate(neg_inf) if key_padding_mask is not None else None
+            _safe_deallocate(neg_inf)
 
         # Apply attention mask if provided (causal mask)
         if attn_mask is not None:
@@ -201,34 +263,40 @@ class TTMultiHeadAttention:
 
         # Reshape back: (B, L_q, d_model)
         out = self._reshape_from_heads(out, B, L_q)
-        out = self.out_proj.forward(out)
+        out = ttnn.linear(out, self.out_proj_weight, bias=self.out_proj_bias)
         return out
 
 
 class TTEncoderLayer:
-    """Transformer encoder layer on device (pre-norm)."""
+    """Transformer encoder layer matching PyTorch nn.TransformerEncoderLayer (pre-norm, GELU).
+
+    PyTorch structure (norm_first=True):
+      x = x + self_attn(norm1(x))
+      x = x + ffn(norm2(x))
+    where norm1/norm2 are LayerNorm (with bias), ffn uses GELU.
+    """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0):
         self.device = device
         self.d_model = d_model
         self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.attn_norm = TTRMSNorm(d_model, device)
-        self.ffn = TTLinear(d_model, d_ff, device, bias=False)
-        self.ffn_out = TTLinear(d_ff, d_model, device, bias=False)
-        self.ffn_norm = TTRMSNorm(d_model, device)
+        self.norm1 = TTLayerNorm(d_model, device)  # LayerNorm, not RMSNorm
+        self.norm2 = TTLayerNorm(d_model, device)
+        self.linear1 = TTLinear(d_model, d_ff, device, bias=True)
+        self.linear2 = TTLinear(d_ff, d_model, device, bias=True)
 
     def forward(self, x: "ttnn.Tensor", key_padding_mask: Optional["ttnn.Tensor"] = None) -> "ttnn.Tensor":
         # Pre-norm self-attention
-        normed = self.attn_norm.forward(x)
+        normed = self.norm1.forward(x)
         attn_out = self.self_attn.forward(normed, normed, normed, key_padding_mask=key_padding_mask)
         x = ttnn.add(x, attn_out)
         _safe_deallocate(attn_out)
         _safe_deallocate(normed)
 
-        # Pre-norm FFN
-        normed = self.ffn_norm.forward(x)
-        hidden = ttnn.silu(self.ffn.forward(normed))
-        ffn_out = self.ffn_out.forward(hidden)
+        # Pre-norm FFN (GELU activation — matches PyTorch TransformerEncoderLayer)
+        normed = self.norm2.forward(x)
+        hidden = ttnn.gelu(self.linear1.forward(normed))
+        ffn_out = self.linear2.forward(hidden)
         _safe_deallocate(hidden)
         _safe_deallocate(normed)
         x = ttnn.add(x, ffn_out)
@@ -237,18 +305,24 @@ class TTEncoderLayer:
 
 
 class TTDecoderLayer:
-    """Transformer decoder layer on device (pre-norm) with cross-attention to memory."""
+    """Transformer decoder layer matching PyTorch nn.TransformerDecoderLayer (pre-norm, GELU).
+
+    PyTorch structure (norm_first=True):
+      x = x + self_attn(norm1(x))
+      x = x + cross_attn(norm2(x), memory)
+      x = x + ffn(norm3(x))
+    """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0):
         self.device = device
         self.d_model = d_model
         self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.self_attn_norm = TTRMSNorm(d_model, device)
+        self.norm1 = TTLayerNorm(d_model, device)
         self.cross_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.cross_attn_norm = TTRMSNorm(d_model, device)
-        self.ffn = TTLinear(d_model, d_ff, device, bias=False)
-        self.ffn_out = TTLinear(d_ff, d_model, device, bias=False)
-        self.ffn_norm = TTRMSNorm(d_model, device)
+        self.norm2 = TTLayerNorm(d_model, device)
+        self.linear1 = TTLinear(d_model, d_ff, device, bias=True)
+        self.linear2 = TTLinear(d_ff, d_model, device, bias=True)
+        self.norm3 = TTLayerNorm(d_model, device)
 
     def forward(
         self,
@@ -259,7 +333,7 @@ class TTDecoderLayer:
         memory_key_padding_mask: Optional["ttnn.Tensor"] = None,
     ) -> "ttnn.Tensor":
         # Pre-norm self-attention (causal)
-        normed = self.self_attn_norm.forward(x)
+        normed = self.norm1.forward(x)
         self_out = self.self_attn.forward(normed, normed, normed,
                                            key_padding_mask=tgt_key_padding_mask,
                                            attn_mask=causal_mask)
@@ -268,17 +342,17 @@ class TTDecoderLayer:
         _safe_deallocate(normed)
 
         # Pre-norm cross-attention to memory
-        normed = self.cross_attn_norm.forward(x)
+        normed = self.norm2.forward(x)
         cross_out = self.cross_attn.forward(normed, memory, memory,
                                              key_padding_mask=memory_key_padding_mask)
         x = ttnn.add(x, cross_out)
         _safe_deallocate(cross_out)
         _safe_deallocate(normed)
 
-        # Pre-norm FFN
-        normed = self.ffn_norm.forward(x)
-        hidden = ttnn.silu(self.ffn.forward(normed))
-        ffn_out = self.ffn_out.forward(hidden)
+        # Pre-norm FFN (GELU — matches PyTorch TransformerDecoderLayer)
+        normed = self.norm3.forward(x)
+        hidden = ttnn.gelu(self.linear1.forward(normed))
+        ffn_out = self.linear2.forward(hidden)
         _safe_deallocate(hidden)
         _safe_deallocate(normed)
         x = ttnn.add(x, ffn_out)
@@ -287,7 +361,16 @@ class TTDecoderLayer:
 
 
 class TTTransition:
-    """Recurrent memory transition step on device."""
+    """Recurrent memory transition step on device.
+
+    Matches PyTorch TextLatentMemoryTransition:
+      normed = attn_norm(memory)
+      attended = self_attn(normed, normed, normed)
+      hidden = attn_norm(memory + attended)  # reuses attn_norm!
+      proposal = mlp(hidden)  # SiLU activation
+      gate = sigmoid(gate(hidden))
+      updated = output_norm(memory + gate * proposal)
+    """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0):
         self.device = device
@@ -296,7 +379,6 @@ class TTTransition:
         self.attn_norm = TTRMSNorm(d_model, device)
         self.ffn = TTLinear(d_model, d_ff, device, bias=False)
         self.ffn_out = TTLinear(d_ff, d_model, device, bias=False)
-        self.ffn_norm = TTRMSNorm(d_model, device)
         self.gate = TTLinear(d_model, d_model, device, bias=True)
         self.output_norm = TTRMSNorm(d_model, device)
 
@@ -304,15 +386,16 @@ class TTTransition:
         """Returns (updated_memory, gate) where gate is (B, S, d_model) in [0, 1]."""
         normed = self.attn_norm.forward(memory)
         attn_out = self.self_attn.forward(normed, normed, normed)
-        hidden = ttnn.add(memory, attn_out)
-        _safe_deallocate(attn_out)
         _safe_deallocate(normed)
+        hidden_pre = ttnn.add(memory, attn_out)
+        _safe_deallocate(attn_out)
+        # Reuse attn_norm for FFN input (matches PyTorch)
+        hidden = self.attn_norm.forward(hidden_pre)
+        _safe_deallocate(hidden_pre)
 
-        normed = self.ffn_norm.forward(hidden)
-        hidden_act = ttnn.silu(self.ffn.forward(normed))
+        hidden_act = ttnn.silu(self.ffn.forward(hidden))
         proposal = self.ffn_out.forward(hidden_act)
         _safe_deallocate(hidden_act)
-        _safe_deallocate(normed)
 
         gate = ttnn.sigmoid(self.gate.forward(hidden))
         gated_proposal = ttnn.mul(gate, proposal)
@@ -617,66 +700,54 @@ class TTTextLatentMemoryModel:
         params["decoder_norm_weight"] = self.decoder_norm.weight
 
         for i, layer in enumerate(self.encoder_layers):
-            params[f"enc_{i}_q_w"] = layer.self_attn.q_proj.weight
-            params[f"enc_{i}_q_b"] = layer.self_attn.q_proj.bias
-            params[f"enc_{i}_k_w"] = layer.self_attn.k_proj.weight
-            params[f"enc_{i}_k_b"] = layer.self_attn.k_proj.bias
-            params[f"enc_{i}_v_w"] = layer.self_attn.v_proj.weight
-            params[f"enc_{i}_v_b"] = layer.self_attn.v_proj.bias
-            params[f"enc_{i}_o_w"] = layer.self_attn.out_proj.weight
-            params[f"enc_{i}_o_b"] = layer.self_attn.out_proj.bias
-            params[f"enc_{i}_attn_norm_w"] = layer.attn_norm.weight
-            params[f"enc_{i}_ffn_w"] = layer.ffn.weight
-            params[f"enc_{i}_ffn_out_w"] = layer.ffn_out.weight
-            params[f"enc_{i}_ffn_norm_w"] = layer.ffn_norm.weight
+            params[f"enc_{i}_in_proj_w"] = layer.self_attn.in_proj_weight
+            params[f"enc_{i}_in_proj_b"] = layer.self_attn.in_proj_bias
+            params[f"enc_{i}_out_proj_w"] = layer.self_attn.out_proj_weight
+            params[f"enc_{i}_out_proj_b"] = layer.self_attn.out_proj_bias
+            params[f"enc_{i}_norm1_w"] = layer.norm1.weight
+            params[f"enc_{i}_norm1_b"] = layer.norm1.bias
+            params[f"enc_{i}_norm2_w"] = layer.norm2.weight
+            params[f"enc_{i}_norm2_b"] = layer.norm2.bias
+            params[f"enc_{i}_linear1_w"] = layer.linear1.weight
+            params[f"enc_{i}_linear1_b"] = layer.linear1.bias
+            params[f"enc_{i}_linear2_w"] = layer.linear2.weight
+            params[f"enc_{i}_linear2_b"] = layer.linear2.bias
 
-        params["mem_init_q_w"] = self.memory_init_attn.q_proj.weight
-        params["mem_init_q_b"] = self.memory_init_attn.q_proj.bias
-        params["mem_init_k_w"] = self.memory_init_attn.k_proj.weight
-        params["mem_init_k_b"] = self.memory_init_attn.k_proj.bias
-        params["mem_init_v_w"] = self.memory_init_attn.v_proj.weight
-        params["mem_init_v_b"] = self.memory_init_attn.v_proj.bias
-        params["mem_init_o_w"] = self.memory_init_attn.out_proj.weight
-        params["mem_init_o_b"] = self.memory_init_attn.out_proj.bias
+        params["mem_init_in_proj_w"] = self.memory_init_attn.in_proj_weight
+        params["mem_init_in_proj_b"] = self.memory_init_attn.in_proj_bias
+        params["mem_init_out_proj_w"] = self.memory_init_attn.out_proj_weight
+        params["mem_init_out_proj_b"] = self.memory_init_attn.out_proj_bias
 
-        params["trans_q_w"] = self.transition.self_attn.q_proj.weight
-        params["trans_q_b"] = self.transition.self_attn.q_proj.bias
-        params["trans_k_w"] = self.transition.self_attn.k_proj.weight
-        params["trans_k_b"] = self.transition.self_attn.k_proj.bias
-        params["trans_v_w"] = self.transition.self_attn.v_proj.weight
-        params["trans_v_b"] = self.transition.self_attn.v_proj.bias
-        params["trans_o_w"] = self.transition.self_attn.out_proj.weight
-        params["trans_o_b"] = self.transition.self_attn.out_proj.bias
+        params["trans_in_proj_w"] = self.transition.self_attn.in_proj_weight
+        params["trans_in_proj_b"] = self.transition.self_attn.in_proj_bias
+        params["trans_out_proj_w"] = self.transition.self_attn.out_proj_weight
+        params["trans_out_proj_b"] = self.transition.self_attn.out_proj_bias
         params["trans_attn_norm_w"] = self.transition.attn_norm.weight
         params["trans_ffn_w"] = self.transition.ffn.weight
         params["trans_ffn_out_w"] = self.transition.ffn_out.weight
-        params["trans_ffn_norm_w"] = self.transition.ffn_norm.weight
         params["trans_gate_w"] = self.transition.gate.weight
         params["trans_gate_b"] = self.transition.gate.bias
         params["trans_output_norm_w"] = self.transition.output_norm.weight
 
         for i, layer in enumerate(self.decoder_layers):
-            params[f"dec_{i}_sa_q_w"] = layer.self_attn.q_proj.weight
-            params[f"dec_{i}_sa_q_b"] = layer.self_attn.q_proj.bias
-            params[f"dec_{i}_sa_k_w"] = layer.self_attn.k_proj.weight
-            params[f"dec_{i}_sa_k_b"] = layer.self_attn.k_proj.bias
-            params[f"dec_{i}_sa_v_w"] = layer.self_attn.v_proj.weight
-            params[f"dec_{i}_sa_v_b"] = layer.self_attn.v_proj.bias
-            params[f"dec_{i}_sa_o_w"] = layer.self_attn.out_proj.weight
-            params[f"dec_{i}_sa_o_b"] = layer.self_attn.out_proj.bias
-            params[f"dec_{i}_sa_norm_w"] = layer.self_attn_norm.weight
-            params[f"dec_{i}_ca_q_w"] = layer.cross_attn.q_proj.weight
-            params[f"dec_{i}_ca_q_b"] = layer.cross_attn.q_proj.bias
-            params[f"dec_{i}_ca_k_w"] = layer.cross_attn.k_proj.weight
-            params[f"dec_{i}_ca_k_b"] = layer.cross_attn.k_proj.bias
-            params[f"dec_{i}_ca_v_w"] = layer.cross_attn.v_proj.weight
-            params[f"dec_{i}_ca_v_b"] = layer.cross_attn.v_proj.bias
-            params[f"dec_{i}_ca_o_w"] = layer.cross_attn.out_proj.weight
-            params[f"dec_{i}_ca_o_b"] = layer.cross_attn.out_proj.bias
-            params[f"dec_{i}_ca_norm_w"] = layer.cross_attn_norm.weight
-            params[f"dec_{i}_ffn_w"] = layer.ffn.weight
-            params[f"dec_{i}_ffn_out_w"] = layer.ffn_out.weight
-            params[f"dec_{i}_ffn_norm_w"] = layer.ffn_norm.weight
+            params[f"dec_{i}_sa_in_proj_w"] = layer.self_attn.in_proj_weight
+            params[f"dec_{i}_sa_in_proj_b"] = layer.self_attn.in_proj_bias
+            params[f"dec_{i}_sa_out_proj_w"] = layer.self_attn.out_proj_weight
+            params[f"dec_{i}_sa_out_proj_b"] = layer.self_attn.out_proj_bias
+            params[f"dec_{i}_norm1_w"] = layer.norm1.weight
+            params[f"dec_{i}_norm1_b"] = layer.norm1.bias
+            params[f"dec_{i}_ca_in_proj_w"] = layer.cross_attn.in_proj_weight
+            params[f"dec_{i}_ca_in_proj_b"] = layer.cross_attn.in_proj_bias
+            params[f"dec_{i}_ca_out_proj_w"] = layer.cross_attn.out_proj_weight
+            params[f"dec_{i}_ca_out_proj_b"] = layer.cross_attn.out_proj_bias
+            params[f"dec_{i}_norm2_w"] = layer.norm2.weight
+            params[f"dec_{i}_norm2_b"] = layer.norm2.bias
+            params[f"dec_{i}_linear1_w"] = layer.linear1.weight
+            params[f"dec_{i}_linear1_b"] = layer.linear1.bias
+            params[f"dec_{i}_linear2_w"] = layer.linear2.weight
+            params[f"dec_{i}_linear2_b"] = layer.linear2.bias
+            params[f"dec_{i}_norm3_w"] = layer.norm3.weight
+            params[f"dec_{i}_norm3_b"] = layer.norm3.bias
 
         return params
 
@@ -769,77 +840,65 @@ class TTTextLatentMemoryModel:
             self._set_decoder_param(name, tt_tensor)
 
     def _set_encoder_param(self, name: str, tt_tensor: "ttnn.Tensor"):
-        parts = name.split("_")
+        parts = name.split("_", 2)
         idx = int(parts[1])
-        suffix = "_".join(parts[2:])
+        suffix = parts[2]
         layer = self.encoder_layers[idx]
-        if suffix == "q_w": _safe_deallocate(layer.self_attn.q_proj.weight); layer.self_attn.q_proj.weight = tt_tensor
-        elif suffix == "q_b": _safe_deallocate(layer.self_attn.q_proj.bias); layer.self_attn.q_proj.bias = tt_tensor
-        elif suffix == "k_w": _safe_deallocate(layer.self_attn.k_proj.weight); layer.self_attn.k_proj.weight = tt_tensor
-        elif suffix == "k_b": _safe_deallocate(layer.self_attn.k_proj.bias); layer.self_attn.k_proj.bias = tt_tensor
-        elif suffix == "v_w": _safe_deallocate(layer.self_attn.v_proj.weight); layer.self_attn.v_proj.weight = tt_tensor
-        elif suffix == "v_b": _safe_deallocate(layer.self_attn.v_proj.bias); layer.self_attn.v_proj.bias = tt_tensor
-        elif suffix == "o_w": _safe_deallocate(layer.self_attn.out_proj.weight); layer.self_attn.out_proj.weight = tt_tensor
-        elif suffix == "o_b": _safe_deallocate(layer.self_attn.out_proj.bias); layer.self_attn.out_proj.bias = tt_tensor
-        elif suffix == "attn_norm_w": _safe_deallocate(layer.attn_norm.weight); layer.attn_norm.weight = tt_tensor
-        elif suffix == "ffn_w": _safe_deallocate(layer.ffn.weight); layer.ffn.weight = tt_tensor
-        elif suffix == "ffn_out_w": _safe_deallocate(layer.ffn_out.weight); layer.ffn_out.weight = tt_tensor
-        elif suffix == "ffn_norm_w": _safe_deallocate(layer.ffn_norm.weight); layer.ffn_norm.weight = tt_tensor
+        if suffix == "in_proj_w": _safe_deallocate(layer.self_attn.in_proj_weight); layer.self_attn.in_proj_weight = tt_tensor
+        elif suffix == "in_proj_b": _safe_deallocate(layer.self_attn.in_proj_bias); layer.self_attn.in_proj_bias = tt_tensor
+        elif suffix == "out_proj_w": _safe_deallocate(layer.self_attn.out_proj_weight); layer.self_attn.out_proj_weight = tt_tensor
+        elif suffix == "out_proj_b": _safe_deallocate(layer.self_attn.out_proj_bias); layer.self_attn.out_proj_bias = tt_tensor
+        elif suffix == "norm1_w": _safe_deallocate(layer.norm1.weight); layer.norm1.weight = tt_tensor
+        elif suffix == "norm1_b": _safe_deallocate(layer.norm1.bias); layer.norm1.bias = tt_tensor
+        elif suffix == "norm2_w": _safe_deallocate(layer.norm2.weight); layer.norm2.weight = tt_tensor
+        elif suffix == "norm2_b": _safe_deallocate(layer.norm2.bias); layer.norm2.bias = tt_tensor
+        elif suffix == "linear1_w": _safe_deallocate(layer.linear1.weight); layer.linear1.weight = tt_tensor
+        elif suffix == "linear1_b": _safe_deallocate(layer.linear1.bias); layer.linear1.bias = tt_tensor
+        elif suffix == "linear2_w": _safe_deallocate(layer.linear2.weight); layer.linear2.weight = tt_tensor
+        elif suffix == "linear2_b": _safe_deallocate(layer.linear2.bias); layer.linear2.bias = tt_tensor
 
     def _set_mem_init_param(self, name: str, tt_tensor: "ttnn.Tensor"):
         suffix = name[len("mem_init_"):]
         attn = self.memory_init_attn
-        if suffix == "q_w": _safe_deallocate(attn.q_proj.weight); attn.q_proj.weight = tt_tensor
-        elif suffix == "q_b": _safe_deallocate(attn.q_proj.bias); attn.q_proj.bias = tt_tensor
-        elif suffix == "k_w": _safe_deallocate(attn.k_proj.weight); attn.k_proj.weight = tt_tensor
-        elif suffix == "k_b": _safe_deallocate(attn.k_proj.bias); attn.k_proj.bias = tt_tensor
-        elif suffix == "v_w": _safe_deallocate(attn.v_proj.weight); attn.v_proj.weight = tt_tensor
-        elif suffix == "v_b": _safe_deallocate(attn.v_proj.bias); attn.v_proj.bias = tt_tensor
-        elif suffix == "o_w": _safe_deallocate(attn.out_proj.weight); attn.out_proj.weight = tt_tensor
-        elif suffix == "o_b": _safe_deallocate(attn.out_proj.bias); attn.out_proj.bias = tt_tensor
+        if suffix == "in_proj_w": _safe_deallocate(attn.in_proj_weight); attn.in_proj_weight = tt_tensor
+        elif suffix == "in_proj_b": _safe_deallocate(attn.in_proj_bias); attn.in_proj_bias = tt_tensor
+        elif suffix == "out_proj_w": _safe_deallocate(attn.out_proj_weight); attn.out_proj_weight = tt_tensor
+        elif suffix == "out_proj_b": _safe_deallocate(attn.out_proj_bias); attn.out_proj_bias = tt_tensor
 
     def _set_transition_param(self, name: str, tt_tensor: "ttnn.Tensor"):
         suffix = name[len("trans_"):]
         t = self.transition
-        if suffix == "q_w": _safe_deallocate(t.self_attn.q_proj.weight); t.self_attn.q_proj.weight = tt_tensor
-        elif suffix == "q_b": _safe_deallocate(t.self_attn.q_proj.bias); t.self_attn.q_proj.bias = tt_tensor
-        elif suffix == "k_w": _safe_deallocate(t.self_attn.k_proj.weight); t.self_attn.k_proj.weight = tt_tensor
-        elif suffix == "k_b": _safe_deallocate(t.self_attn.k_proj.bias); t.self_attn.k_proj.bias = tt_tensor
-        elif suffix == "v_w": _safe_deallocate(t.self_attn.v_proj.weight); t.self_attn.v_proj.weight = tt_tensor
-        elif suffix == "v_b": _safe_deallocate(t.self_attn.v_proj.bias); t.self_attn.v_proj.bias = tt_tensor
-        elif suffix == "o_w": _safe_deallocate(t.self_attn.out_proj.weight); t.self_attn.out_proj.weight = tt_tensor
-        elif suffix == "o_b": _safe_deallocate(t.self_attn.out_proj.bias); t.self_attn.out_proj.bias = tt_tensor
+        if suffix == "in_proj_w": _safe_deallocate(t.self_attn.in_proj_weight); t.self_attn.in_proj_weight = tt_tensor
+        elif suffix == "in_proj_b": _safe_deallocate(t.self_attn.in_proj_bias); t.self_attn.in_proj_bias = tt_tensor
+        elif suffix == "out_proj_w": _safe_deallocate(t.self_attn.out_proj_weight); t.self_attn.out_proj_weight = tt_tensor
+        elif suffix == "out_proj_b": _safe_deallocate(t.self_attn.out_proj_bias); t.self_attn.out_proj_bias = tt_tensor
         elif suffix == "attn_norm_w": _safe_deallocate(t.attn_norm.weight); t.attn_norm.weight = tt_tensor
         elif suffix == "ffn_w": _safe_deallocate(t.ffn.weight); t.ffn.weight = tt_tensor
         elif suffix == "ffn_out_w": _safe_deallocate(t.ffn_out.weight); t.ffn_out.weight = tt_tensor
-        elif suffix == "ffn_norm_w": _safe_deallocate(t.ffn_norm.weight); t.ffn_norm.weight = tt_tensor
         elif suffix == "gate_w": _safe_deallocate(t.gate.weight); t.gate.weight = tt_tensor
         elif suffix == "gate_b": _safe_deallocate(t.gate.bias); t.gate.bias = tt_tensor
         elif suffix == "output_norm_w": _safe_deallocate(t.output_norm.weight); t.output_norm.weight = tt_tensor
 
     def _set_decoder_param(self, name: str, tt_tensor: "ttnn.Tensor"):
-        parts = name.split("_")
+        parts = name.split("_", 2)
         idx = int(parts[1])
-        suffix = "_".join(parts[2:])
+        suffix = parts[2]
         layer = self.decoder_layers[idx]
-        if suffix == "sa_q_w": _safe_deallocate(layer.self_attn.q_proj.weight); layer.self_attn.q_proj.weight = tt_tensor
-        elif suffix == "sa_q_b": _safe_deallocate(layer.self_attn.q_proj.bias); layer.self_attn.q_proj.bias = tt_tensor
-        elif suffix == "sa_k_w": _safe_deallocate(layer.self_attn.k_proj.weight); layer.self_attn.k_proj.weight = tt_tensor
-        elif suffix == "sa_k_b": _safe_deallocate(layer.self_attn.k_proj.bias); layer.self_attn.k_proj.bias = tt_tensor
-        elif suffix == "sa_v_w": _safe_deallocate(layer.self_attn.v_proj.weight); layer.self_attn.v_proj.weight = tt_tensor
-        elif suffix == "sa_v_b": _safe_deallocate(layer.self_attn.v_proj.bias); layer.self_attn.v_proj.bias = tt_tensor
-        elif suffix == "sa_o_w": _safe_deallocate(layer.self_attn.out_proj.weight); layer.self_attn.out_proj.weight = tt_tensor
-        elif suffix == "sa_o_b": _safe_deallocate(layer.self_attn.out_proj.bias); layer.self_attn.out_proj.bias = tt_tensor
-        elif suffix == "sa_norm_w": _safe_deallocate(layer.self_attn_norm.weight); layer.self_attn_norm.weight = tt_tensor
-        elif suffix == "ca_q_w": _safe_deallocate(layer.cross_attn.q_proj.weight); layer.cross_attn.q_proj.weight = tt_tensor
-        elif suffix == "ca_q_b": _safe_deallocate(layer.cross_attn.q_proj.bias); layer.cross_attn.q_proj.bias = tt_tensor
-        elif suffix == "ca_k_w": _safe_deallocate(layer.cross_attn.k_proj.weight); layer.cross_attn.k_proj.weight = tt_tensor
-        elif suffix == "ca_k_b": _safe_deallocate(layer.cross_attn.k_proj.bias); layer.cross_attn.k_proj.bias = tt_tensor
-        elif suffix == "ca_v_w": _safe_deallocate(layer.cross_attn.v_proj.weight); layer.cross_attn.v_proj.weight = tt_tensor
-        elif suffix == "ca_v_b": _safe_deallocate(layer.cross_attn.v_proj.bias); layer.cross_attn.v_proj.bias = tt_tensor
-        elif suffix == "ca_o_w": _safe_deallocate(layer.cross_attn.out_proj.weight); layer.cross_attn.out_proj.weight = tt_tensor
-        elif suffix == "ca_o_b": _safe_deallocate(layer.cross_attn.out_proj.bias); layer.cross_attn.out_proj.bias = tt_tensor
-        elif suffix == "ca_norm_w": _safe_deallocate(layer.cross_attn_norm.weight); layer.cross_attn_norm.weight = tt_tensor
-        elif suffix == "ffn_w": _safe_deallocate(layer.ffn.weight); layer.ffn.weight = tt_tensor
-        elif suffix == "ffn_out_w": _safe_deallocate(layer.ffn_out.weight); layer.ffn_out.weight = tt_tensor
-        elif suffix == "ffn_norm_w": _safe_deallocate(layer.ffn_norm.weight); layer.ffn_norm.weight = tt_tensor
+        if suffix == "sa_in_proj_w": _safe_deallocate(layer.self_attn.in_proj_weight); layer.self_attn.in_proj_weight = tt_tensor
+        elif suffix == "sa_in_proj_b": _safe_deallocate(layer.self_attn.in_proj_bias); layer.self_attn.in_proj_bias = tt_tensor
+        elif suffix == "sa_out_proj_w": _safe_deallocate(layer.self_attn.out_proj_weight); layer.self_attn.out_proj_weight = tt_tensor
+        elif suffix == "sa_out_proj_b": _safe_deallocate(layer.self_attn.out_proj_bias); layer.self_attn.out_proj_bias = tt_tensor
+        elif suffix == "norm1_w": _safe_deallocate(layer.norm1.weight); layer.norm1.weight = tt_tensor
+        elif suffix == "norm1_b": _safe_deallocate(layer.norm1.bias); layer.norm1.bias = tt_tensor
+        elif suffix == "ca_in_proj_w": _safe_deallocate(layer.cross_attn.in_proj_weight); layer.cross_attn.in_proj_weight = tt_tensor
+        elif suffix == "ca_in_proj_b": _safe_deallocate(layer.cross_attn.in_proj_bias); layer.cross_attn.in_proj_bias = tt_tensor
+        elif suffix == "ca_out_proj_w": _safe_deallocate(layer.cross_attn.out_proj_weight); layer.cross_attn.out_proj_weight = tt_tensor
+        elif suffix == "ca_out_proj_b": _safe_deallocate(layer.cross_attn.out_proj_bias); layer.cross_attn.out_proj_bias = tt_tensor
+        elif suffix == "norm2_w": _safe_deallocate(layer.norm2.weight); layer.norm2.weight = tt_tensor
+        elif suffix == "norm2_b": _safe_deallocate(layer.norm2.bias); layer.norm2.bias = tt_tensor
+        elif suffix == "linear1_w": _safe_deallocate(layer.linear1.weight); layer.linear1.weight = tt_tensor
+        elif suffix == "linear1_b": _safe_deallocate(layer.linear1.bias); layer.linear1.bias = tt_tensor
+        elif suffix == "linear2_w": _safe_deallocate(layer.linear2.weight); layer.linear2.weight = tt_tensor
+        elif suffix == "linear2_b": _safe_deallocate(layer.linear2.bias); layer.linear2.bias = tt_tensor
+        elif suffix == "norm3_w": _safe_deallocate(layer.norm3.weight); layer.norm3.weight = tt_tensor
+        elif suffix == "norm3_b": _safe_deallocate(layer.norm3.bias); layer.norm3.bias = tt_tensor
