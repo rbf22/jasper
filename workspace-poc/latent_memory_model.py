@@ -525,15 +525,27 @@ class RegisterFileTransition(nn.Module):
         metadata: torch.Tensor,
         source_targets: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (updated_latent, gate) where gate is (B, S, 1) in [0, 1]."""
-        source_indices = source_targets.clamp_max(self.n_slots - 1)
-        batch_indices = torch.arange(latent.shape[0], device=latent.device)[:, None]
-        source_latent = latent[batch_indices, source_indices]
+        """Returns (updated_latent, gate) where gate is (B, S, 1) in [0, 1].
+
+        source_targets can be either:
+        - Long tensor (B, S) of slot indices (oracle mode)
+        - Float tensor (B, S, n_slots+1) of soft source probabilities (prompt mode)
+        """
+        if source_targets.dtype in (torch.long, torch.int):
+            # Hard indices (oracle mode)
+            source_indices = source_targets.clamp_max(self.n_slots - 1)
+            batch_indices = torch.arange(latent.shape[0], device=latent.device)[:, None]
+            source_latent = latent[batch_indices, source_indices]
+        else:
+            # Soft attention (prompt mode): source_targets is (B, S, n_slots+1)
+            slot_attn = source_targets[..., :self.n_slots]  # (B, S, n_slots)
+            source_latent = torch.einsum("bsk,bkv->bsv", slot_attn, latent)
+
         ctrl_input = torch.cat(
             (self.input_norm(latent), self.input_norm(source_latent), metadata), dim=-1
         )
         proposal = self.controller(ctrl_input)
-        gate = torch.sigmoid(self.gate_head(ctrl_input))  # (B, S, 1)
+        gate = torch.sigmoid(self.gate_head(ctrl_input))
         updated_latent = self.output_norm(latent + proposal)
         return updated_latent, gate
 
@@ -710,3 +722,218 @@ class RegisterFileReasoner(nn.Module):
         memory_loss = F.cross_entropy(logits[expanded_mask], targets[expanded_mask])
         total = answer_loss + memory_weight * memory_loss
         return {"loss": total, "answer_loss": answer_loss, "memory_loss": memory_loss}
+
+
+# ---------------------------------------------------------------------------
+# Prompt-conditioned register-file model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PromptRegisterFileConfig:
+    vocab_size: int = Vocab.VOCAB_SIZE
+    d_model: int = 128
+    n_encoder_layers: int = 3
+    n_heads: int = 4
+    n_slots: int = 16
+    max_reasoning_steps: int = 15
+    expand: int = 4
+    dropout: float = 0.0
+    detach_latent_steps: bool = True
+    value_init_scale: float = 10.0
+    d_state: int = 32
+
+
+class PromptRegisterFileReasoner(nn.Module):
+    """Prompt-conditioned register-file model with learned parsing."""
+
+    def __init__(self, config: PromptRegisterFileConfig):
+        super().__init__()
+        self.config = config
+        self.n_slots = config.n_slots
+
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        encoder_cfg = ModelConfig(
+            d_model=config.d_model,
+            n_layers=config.n_encoder_layers,
+            vocab_size=config.vocab_size,
+            d_state=config.d_state,
+            expand=config.expand,
+            n_heads=config.n_heads,
+            dropout=config.dropout,
+            use_gradient_checkpointing=False,
+        )
+        self.encoder_layers = nn.ModuleList(
+            GatedBlock(SSMLayer(encoder_cfg), config.d_model, use_checkpoint=False)
+            for _ in range(config.n_encoder_layers)
+        )
+        self.encoder_norm = RMSNorm(config.d_model)
+
+        self.slot_identity = nn.Parameter(torch.randn(config.n_slots, config.d_model) * 0.02)
+        self.slot_reader = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout, batch_first=True
+        )
+        self.slot_norm = RMSNorm(config.d_model)
+
+        self.source_head = nn.Linear(config.d_model, config.n_slots + 1, bias=False)
+        self.operator_head = nn.Linear(config.d_model, 4, bias=False)
+        self.operand_head = nn.Linear(config.d_model, MOD, bias=False)
+        self.direct_value_head = nn.Linear(config.d_model, MOD, bias=False)
+        self.is_direct_head = nn.Linear(config.d_model, 1, bias=True)
+
+        self.query_reader = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout, batch_first=True
+        )
+        self.query_token = nn.Parameter(torch.randn(1, 1, config.d_model) * 0.02)
+        self.query_head = nn.Linear(config.d_model, config.n_slots, bias=False)
+
+        self.value_to_latent = nn.Linear(MOD + 1, config.d_model, bias=False)
+        self.latent_norm = RMSNorm(config.d_model)
+        self.transition = RegisterFileTransition(
+            RegisterFileConfig(
+                d_model=config.d_model,
+                n_slots=config.n_slots,
+                max_reasoning_steps=config.max_reasoning_steps,
+                expand=config.expand,
+                detach_latent_steps=config.detach_latent_steps,
+                value_init_scale=config.value_init_scale,
+            )
+        )
+
+        self.register_buffer("add_matrices", torch.stack([_build_circulant_shift(k) for k in range(MOD)]))
+        self.register_buffer("sub_matrices", torch.stack([_build_circulant_shift(k, subtract=True) for k in range(MOD)]))
+        self.register_buffer("mul_matrices", torch.stack([_build_mul_permutation(k) for k in range(MOD)]))
+
+        self.apply(LatentMemoryReasoner._init_weights)
+        nn.init.zeros_(self.transition.gate_head.weight)
+        nn.init.constant_(self.transition.gate_head.bias, 4.0)
+
+    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+        hidden = self.token_embedding(input_ids)
+        for layer in self.encoder_layers:
+            hidden = layer(hidden)
+        return self.encoder_norm(hidden)
+
+    def parse_slots(self, encoded: torch.Tensor, attention_mask: torch.Tensor):
+        B = encoded.shape[0]
+        queries = self.slot_identity.unsqueeze(0).expand(B, -1, -1)
+        slot_feat, _ = self.slot_reader(
+            queries, encoded, encoded,
+            key_padding_mask=~attention_mask,
+            need_weights=False,
+        )
+        slot_feat = self.slot_norm(queries + slot_feat)
+        return (
+            self.source_head(slot_feat),
+            self.operator_head(slot_feat),
+            self.operand_head(slot_feat),
+            self.direct_value_head(slot_feat),
+            self.is_direct_head(slot_feat),
+            slot_feat,
+        )
+
+    def parse_query(self, encoded: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        B = encoded.shape[0]
+        query_token = self.query_token.expand(B, -1, -1)
+        query_feat, _ = self.query_reader(
+            query_token, encoded, encoded,
+            key_padding_mask=~attention_mask,
+            need_weights=False,
+        )
+        return self.query_head(query_feat.squeeze(1))
+
+    def _soft_arithmetic(self, source_value_logits, operator_probs, operand_probs):
+        src = source_value_logits[..., :MOD]
+        result = operator_probs[..., 0:1] * src
+        for op_id, matrices in [(1, self.add_matrices), (2, self.sub_matrices), (3, self.mul_matrices)]:
+            weighted = torch.einsum("bsk,kij->bsij", operand_probs, matrices)
+            result_op = torch.einsum("bsij,bsj->bsi", weighted, src)
+            result = result + operator_probs[..., op_id:op_id + 1] * result_op
+        unknown = source_value_logits[..., MOD:MOD + 1]
+        return torch.cat([result, unknown], dim=-1)
+
+    def _soft_source_gather(self, value_logits, source_probs):
+        slot_attn = source_probs[..., :self.n_slots]
+        return torch.einsum("bsk,bkv->bsv", slot_attn, value_logits)
+
+    def forward(self, input_ids, attention_mask, reasoning_steps=None):
+        B = input_ids.shape[0]
+        device = input_ids.device
+        S = self.n_slots
+
+        encoded = self.encode(input_ids)
+        source_logits, operator_logits, operand_logits, \
+            direct_value_logits, is_direct_logits, slot_feat = self.parse_slots(encoded, attention_mask)
+
+        source_probs = F.softmax(source_logits, dim=-1)
+        operator_probs = F.softmax(operator_logits, dim=-1)
+        operand_probs = F.softmax(operand_logits, dim=-1)
+        direct_value_probs = F.softmax(direct_value_logits, dim=-1)
+        is_direct_probs = torch.sigmoid(is_direct_logits)
+
+        query_logits = self.parse_query(encoded, attention_mask)
+        query_probs = F.softmax(query_logits, dim=-1)
+
+        direct_logits_scaled = direct_value_probs * self.config.value_init_scale
+        unknown_logits = torch.full((B, S, 1), -self.config.value_init_scale, device=device)
+        direct_full = torch.cat([direct_logits_scaled, unknown_logits], dim=-1)
+        unknown_full = torch.full((B, S, MOD + 1), -self.config.value_init_scale, device=device)
+        unknown_full[..., MOD] = self.config.value_init_scale
+        value_logits = is_direct_probs * direct_full + (1 - is_direct_probs) * unknown_full
+
+        latent = self.latent_norm(slot_feat + self.value_to_latent(value_logits))
+
+        value_states = [value_logits]
+        latent_states = [latent]
+
+        steps = self.config.max_reasoning_steps if reasoning_steps is None else reasoning_steps
+        for _ in range(steps):
+            step_latent = latent.detach() if self.config.detach_latent_steps else latent
+            step_meta = slot_feat.detach() if self.config.detach_latent_steps else slot_feat
+            latent, gate = self.transition(step_latent, step_meta, source_probs)
+            src_values = self._soft_source_gather(value_logits, source_probs)
+            new_values = self._soft_arithmetic(src_values, operator_probs, operand_probs)
+            src_value_probs = F.softmax(src_values[..., :MOD], dim=-1)
+            src_max_prob = src_value_probs.max(dim=-1).values
+            not_direct = 1 - is_direct_probs.squeeze(-1)
+            write_mask = (not_direct * src_max_prob).unsqueeze(-1) * gate
+            value_logits = value_logits + write_mask * (new_values - value_logits)
+            value_states.append(value_logits)
+            latent_states.append(latent)
+
+        value_states_stack = torch.stack(value_states, dim=1)
+        latent_states_stack = torch.stack(latent_states, dim=1)
+        answer_logits = torch.einsum("bs,bsv->bv", query_probs, value_states_stack[:, -1, :, :MOD])
+
+        return {
+            "answer_logits": answer_logits,
+            "value_logits": value_states_stack,
+            "latent_states": latent_states_stack,
+            "source_logits": source_logits,
+            "operator_logits": operator_logits,
+            "operand_logits": operand_logits,
+            "direct_value_logits": direct_value_logits,
+            "is_direct_logits": is_direct_logits,
+            "query_logits": query_logits,
+        }
+
+    def loss(self, outputs, memory_targets, memory_target_mask, answer_targets,
+             query_targets, source_targets, operator_targets, operand_targets,
+             memory_weight=1.0, parse_weight=0.5, query_weight=0.5):
+        answer_loss = F.cross_entropy(outputs["answer_logits"], answer_targets)
+        available_steps = min(outputs["value_logits"].shape[1], memory_targets.shape[1])
+        targets = memory_targets[:, :available_steps]
+        logits = outputs["value_logits"][:, :available_steps]
+        expanded_mask = memory_target_mask[:, None, :].expand_as(targets)
+        memory_loss = F.cross_entropy(logits[expanded_mask], targets[expanded_mask])
+        source_loss = F.cross_entropy(outputs["source_logits"][memory_target_mask], source_targets[memory_target_mask])
+        operator_loss = F.cross_entropy(outputs["operator_logits"][memory_target_mask], operator_targets[memory_target_mask])
+        operand_loss = F.cross_entropy(outputs["operand_logits"][memory_target_mask], operand_targets[memory_target_mask])
+        parse_loss = source_loss + operator_loss + operand_loss
+        query_loss = F.cross_entropy(outputs["query_logits"], query_targets)
+        total = answer_loss + memory_weight * memory_loss + parse_weight * parse_loss + query_weight * query_loss
+        return {
+            "loss": total, "answer_loss": answer_loss, "memory_loss": memory_loss,
+            "source_loss": source_loss, "operator_loss": operator_loss,
+            "operand_loss": operand_loss, "query_loss": query_loss,
+        }

@@ -10,6 +10,8 @@ from latent_memory_model import (
     OracleLatentMemoryReasoner,
     RegisterFileConfig,
     RegisterFileReasoner,
+    PromptRegisterFileConfig,
+    PromptRegisterFileReasoner,
 )
 
 
@@ -546,3 +548,100 @@ def test_register_file_multi_step_depth_4():
         )
     accuracy = outputs["answer_logits"].argmax(-1).eq(batch["answers"]).float().mean()
     assert accuracy.item() > 0.7, f"depth-4 accuracy too low: {accuracy.item():.3f}"
+
+
+# ---------------------------------------------------------------------------
+# Prompt-conditioned register-file model tests
+# ---------------------------------------------------------------------------
+
+
+def prompt_config(**kwargs):
+    defaults = dict(
+        d_model=32, n_encoder_layers=1, n_heads=4, n_slots=16,
+        max_reasoning_steps=3, expand=2, d_state=16, detach_latent_steps=True,
+    )
+    defaults.update(kwargs)
+    return PromptRegisterFileConfig(**defaults)
+
+
+def prompt_batch(batch_size=4, depth_range=(2, 2), seed=303, max_reasoning_steps=3):
+    vocab = Vocab()
+    (
+        inputs, mask, mem_targets, mem_mask, answers, query_targets,
+        _, source_t, op_t, operand_t,
+    ) = sample_task1_latent_batch(
+        batch_size, 64, vocab,
+        depth_range=depth_range,
+        max_reasoning_steps=max_reasoning_steps,
+        rng=random.Random(seed),
+    )
+    return {
+        "inputs": inputs, "mask": mask,
+        "memory_targets": mem_targets, "memory_mask": mem_mask,
+        "answers": answers, "query_targets": query_targets,
+        "source_targets": source_t, "operator_targets": op_t,
+        "operand_targets": operand_t,
+    }
+
+
+def test_prompt_rf_forward_shapes():
+    batch = prompt_batch()
+    model = PromptRegisterFileReasoner(prompt_config())
+    outputs = model(batch["inputs"], batch["mask"])
+    assert outputs["answer_logits"].shape == (4, MOD)
+    assert outputs["value_logits"].shape == (4, 4, 16, MOD + 1)
+    assert outputs["source_logits"].shape == (4, 16, 17)
+    assert outputs["operator_logits"].shape == (4, 16, 4)
+    assert outputs["operand_logits"].shape == (4, 16, MOD)
+    assert outputs["query_logits"].shape == (4, 16)
+
+
+def test_prompt_rf_loss_finite_and_backprops():
+    batch = prompt_batch()
+    model = PromptRegisterFileReasoner(prompt_config())
+    outputs = model(batch["inputs"], batch["mask"])
+    losses = model.loss(
+        outputs, batch["memory_targets"], batch["memory_mask"],
+        batch["answers"], batch["query_targets"],
+        batch["source_targets"], batch["operator_targets"], batch["operand_targets"],
+    )
+    assert torch.isfinite(losses["loss"])
+    losses["loss"].backward()
+    enc_grad = model.token_embedding.weight.grad
+    assert enc_grad is not None and enc_grad.abs().sum().item() > 0
+
+
+def test_prompt_rf_learns_parsing():
+    """The model should learn to parse source/operator/operand from prompts."""
+    torch.manual_seed(0)
+    config = prompt_config(d_model=64, n_encoder_layers=2, expand=4, max_reasoning_steps=3)
+    model = PromptRegisterFileReasoner(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(500):
+        batch = prompt_batch(
+            batch_size=64, depth_range=(1, 3), seed=random.randint(0, 10**9),
+            max_reasoning_steps=3,
+        )
+        outputs = model(batch["inputs"], batch["mask"])
+        losses = model.loss(
+            outputs, batch["memory_targets"], batch["memory_mask"],
+            batch["answers"], batch["query_targets"],
+            batch["source_targets"], batch["operator_targets"], batch["operand_targets"],
+            memory_weight=0.0, parse_weight=1.0, query_weight=1.0,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        losses["loss"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+    # Evaluate parsing accuracy
+    batch = prompt_batch(batch_size=128, depth_range=(2, 3), seed=444, max_reasoning_steps=3)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(batch["inputs"], batch["mask"])
+    mask = batch["memory_mask"]
+    src_acc = outputs["source_logits"][mask].argmax(-1).eq(batch["source_targets"][mask]).float().mean()
+    op_acc = outputs["operator_logits"][mask].argmax(-1).eq(batch["operator_targets"][mask]).float().mean()
+    q_acc = outputs["query_logits"].argmax(-1).eq(batch["query_targets"]).float().mean()
+    assert src_acc.item() > 0.5, f"source parsing too low: {src_acc.item():.3f}"
+    assert op_acc.item() > 0.5, f"operator parsing too low: {op_acc.item():.3f}"
+    assert q_acc.item() > 0.5, f"query parsing too low: {q_acc.item():.3f}"
