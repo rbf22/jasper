@@ -450,6 +450,124 @@ In parallel with the synthetic POC, a text training run is testing the architect
 
 The text model (29.8M parameters including 19.3M embedding) trains with gate freeze for 600 steps, $K_{\max}=6$, seq\_len=512, effective batch 384, at $\sim$112\,s/step ($\sim$62 hours for 2{,}000 steps). Initial loss is 10.92 ($\approx \log 50257$, confirming correct random init), gradient norm 1.5, gates at 0.0.
 
+% ══════════════════════════════════════════════════════════════════════════
+\subsection{Text MVP: Simplified Latent-Memory Architecture}
+\label{sec:text-mvp}
+% ══════════════════════════════════════════════════════════════════════════
+
+After the synthetic POC showed that the full WRAP architecture (retention backbone + workspace + attention residuals) was too complex to train at 10M parameters on character-level tasks, we developed a simplified \textbf{text latent-memory} architecture that preserves the core idea --- fixed-size latent memory with recurrent reasoning --- while removing the components that caused the most engineering friction (retention layers, QK normalization, ReZero gates, attention residuals, spectral normalization, slot parameter normalization). The goal is to validate the central hypothesis --- that fixed-size latent memory with recurrent refinement can learn multi-hop reasoning from text --- at minimal architectural complexity, then re-introduce WRAP-specific components only if the simplified version succeeds.
+
+\paragraph{Architecture.}
+
+The text MVP is a standard transformer encoder-decoder with a fixed-size latent memory and recurrent transition:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Encoder}: $L_{\text{enc}}$ transformer encoder layers (pre-norm, GELU FFN) encode the prompt into hidden states $\mathbf{X} \in \R^{B \times T \times d}$.
+    \item \textbf{Memory initialization}: $m$ learnable slot queries $\mathbf{Q} \in \R^{m \times d}$ cross-attend to the encoded prompt, producing initial memory $\mathbf{M}_0 \in \R^{B \times m \times d}$. This is a single Perceiver-IO-style read, without QK normalization or ReZero gates.
+    \item \textbf{Recurrent transition}: $K$ steps of a shared transition block update the memory in-place. Each step applies slot-wise self-attention, a SiLU-gated FFN, and a sigmoid write gate:
+    \begin{align}
+        \mathbf{H} &= \text{RMSNorm}(\mathbf{M}_k) + \text{SelfAttn}(\text{RMSNorm}(\mathbf{M}_k)) \\
+        \mathbf{P} &= \text{FFN}(\mathbf{H}) \quad \text{(SiLU activation)} \\
+        \mathbf{G} &= \sigma(\text{Linear}(\mathbf{H})) \quad \text{(per-slot write gate)} \\
+        \mathbf{M}_{k+1} &= \text{RMSNorm}(\mathbf{M}_k + \mathbf{G} \odot \mathbf{P})
+    \end{align}
+    The write gate is initialized open (bias $= 4.0$, giving $\sigma(4) \approx 0.98$), allowing the transition to modify memory from the start. This is the opposite of WRAP's ReZero approach (gates start closed) --- the simplified architecture trusts the transition to learn useful updates without a freeze period.
+    \item \textbf{Decoder}: $L_{\text{dec}}$ transformer decoder layers autoregressively generate the answer, cross-attending to the final memory $\mathbf{M}_K$ (not the prompt). The decoder uses a standard causal mask and teacher forcing during training.
+    \item \textbf{Output}: weight-tied LM head ($\text{logits} = \mathbf{X}_{\text{dec}} \cdot \mathbf{E}^\top$ where $\mathbf{E}$ is the shared token embedding).
+\end{enumerate}
+
+\paragraph{Key differences from WRAP.}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{p{0.22\textwidth} p{0.36\textwidth} p{0.36\textwidth}}
+\toprule
+\textbf{Component} & \textbf{WRAP (synthetic POC)} & \textbf{Text MVP} \\
+\midrule
+Backbone & Hybrid retention + attention (13--14 layers) & Standard transformer encoder-decoder \\
+Workspace & Perceiver-style with QK-norm, ReZero gates, slot decay & Single cross-attention read, no QK-norm, no ReZero \\
+Recurrent core & Attention residuals over $K+1$ outputs & Shared transition block, sigmoid write gate \\
+Normalization & Slot RMSNorm + backbone spectral norm & RMSNorm only \\
+Gate init & ReZero (closed, $\text{gate}=0$) & Sigmoid (open, $\text{bias}=4$) \\
+Gradient stabilization & 6 techniques (QK-norm, ReZero, $1/K$ scaling, AR core, slot norm, spectral norm) & None (relies on simple architecture) \\
+Memory & 16 slots, $d=384$ & 8--16 slots, $d=128$ (test) or $d=384$ (full) \\
+\bottomrule
+\end{tabularx}
+\caption{Architectural differences between WRAP and the text MVP. The text MVP removes all six gradient stabilization techniques to test whether they are necessary at the simplified architecture's scale.}
+\label{tab:wrap-vs-mvp}
+\end{table}
+
+\paragraph{Why simplify.}
+
+The WRAP architecture required six distinct gradient stabilization techniques to train without divergence (see \Cref{sec:training-config}). Each technique adds hyperparameters, constrains the model's expressivity, or complicates the implementation. Before investing in scaling the full WRAP architecture, we want to know whether the \emph{core idea} --- fixed-size latent memory with recurrent refinement --- works at all in the text setting. The text MVP tests this with minimal scaffolding. If the MVP learns multi-hop reasoning from text, it validates the approach and motivates re-introducing WRAP components for scaling. If the MVP fails, the failure is more informative than a WRAP failure because it cannot be attributed to insufficient stabilization.
+
+\paragraph{Native Tenstorrent implementation.}
+
+The text MVP is implemented natively on Tenstorrent hardware using \texttt{ttnn} operations, without PyTorch autograd. The forward and backward passes are hand-written:
+
+\begin{itemize}[nosep]
+    \item \textbf{Forward}: encoder/decoder attention, FFN, and embedding lookups use \texttt{ttnn.matmul}, \texttt{ttnn.moreh\_layer\_norm}, and device-side embedding lookup. All intermediates are cached on-device for backward.
+    \item \textbf{Backward}: attention backward uses \texttt{ttnn.matmul} and \texttt{ttnn.moreh\_softmax\_backward} on device. Linear backward uses \texttt{ttnn.matmul} on device. RMSNorm and LayerNorm backward are computed on host in float32 for numerical stability (BF16 \texttt{rsqrt} overflows after $\sim$30 steps). Cross-entropy loss is computed on host in float32 (the $V \times V$ identity matrix for on-device softmax is infeasible at $V{=}50257$). Embedding backward uses host-side \texttt{torch.index\_add\_} (scatter-add by token ID).
+    \item \textbf{Optimizer}: custom AdamW implementation for TT tensors, with float32 master weights and BF16 device weights.
+\end{itemize}
+
+The implementation avoids three critical issues that caused earlier training failures:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Device hang after $\sim$100 steps}: caused by variable sequence lengths per batch triggering new TT-Metal kernel compilations. Each unique tensor shape compiles a new kernel; after $\sim$100 shapes, the device stalled at 0\% CPU. Fixed by padding all batches to fixed \texttt{max\_prompt\_len} and \texttt{max\_answer\_len}, so kernels compile once and are reused.
+    \item \textbf{RSS growth (284\,MB/100 steps)}: caused by glibc malloc arena retention of large temporary host tensors from cross-entropy loss computation. Fixed with explicit \texttt{del} of temporary tensors and \texttt{malloc\_trim(0)} every 10 steps. RSS now plateaus at $\sim$3.4\,GB after step 40 with zero growth thereafter.
+    \item \textbf{Gradient \texttt{inf} (steps 53/54/97/105)}: caused by BF16 \texttt{rsqrt} overflow in RMSNorm/LayerNorm backward (7-bit mantissa insufficient for small variance values). Fixed by moving norm backward to host float32. Combined with fixed sequence lengths (which stabilize attention matmul shapes), no \texttt{inf} gradients occur in 500-step runs.
+\end{enumerate}
+
+\paragraph{CPU-vs-TT parity.}
+
+Gradient parity is verified against a PyTorch CPU reference model with identical weights. All 12 compared parameter gradients match within BF16 tolerance (max abs diff $= 0.041$, mean abs diff $= 0.0008$). The TT gradient norm is $1.47\times$ the CPU gradient norm, attributable to BF16 matmuls in the attention backward. The parity test confirmed that the embedding backward --- which was initially skipped (only the LM head path contributed) --- is now correctly accumulated from both the encoder input path and the decoder input path, improving the token embedding gradient match from 0.29 to 0.041 max abs diff.
+
+\paragraph{Training results.}
+
+The text MVP trains stably on the tiny challenges corpus at the test configuration ($d{=}128$, 2 encoder layers, 1 decoder layer, 4 heads, 8 slots, $K{=}3$, 7.3M parameters, BF16):
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{c c c c c c}
+\toprule
+\textbf{Step} & \textbf{Loss} & \textbf{Token Acc.} & \textbf{Grad Norm} & \textbf{RSS (MB)} & \textbf{Inf?} \\
+\midrule
+0   & 10.886 & 0.0\%  & 9.85  & 3362 & No \\
+100 & 3.842  & 15.2\% & 4.42  & 3407 & No \\
+200 & 4.671  & 27.8\% & 8.51  & 3407 & No \\
+300 & 3.119  & 44.8\% & 6.98  & 3407 & No \\
+400 & 2.670  & 48.3\% & 5.36  & 3407 & No \\
+500 & 3.040  & 48.3\% & 5.44  & 3407 & No \\
+\bottomrule
+\end{tabularx}
+\caption{Text MVP training on tiny challenges (test config, 500 steps). Loss decreases from $\log(50257) \approx 10.9$ to $\sim$3.0, token accuracy reaches $\sim$48\%, RSS is flat from step 40, no gradient \texttt{inf}, no device hang. 500 steps in 51 seconds (0.1\,s/step).}
+\label{tab:text-mvp-results}
+\end{table}
+
+The model converges rapidly: loss drops 72\% in 500 steps, token accuracy reaches 48\% (peaking at 56\% at step 420). The gradient norms are stable (3.3--10.9 range) with no \texttt{inf} or \texttt{NaN}. RSS is flat at 3407\,MB from step 40 onward. The full 500-step run completes in 51 seconds.
+
+\paragraph{What this tells us.}
+
+The text MVP demonstrates that:
+\begin{enumerate}[nosep]
+    \item The core architectural idea --- fixed-size latent memory with recurrent refinement --- trains stably on text without any of WRAP's six gradient stabilization techniques.
+    \item Native Tenstorrent training (forward + backward + optimizer) is feasible and fast (0.1\,s/step at 7.3M parameters, BF16).
+    \item The model learns from the tiny challenges corpus, suggesting that text-framed multi-hop reasoning is more learnable than the character-level synthetic tasks.
+\end{enumerate}
+
+What it does \emph{not} yet tell us:
+\begin{enumerate}[nosep]
+    \item Whether the model can solve \emph{specific} multi-hop reasoning tasks (we measure token accuracy, not task accuracy).
+    \item Whether the recurrent transition is actually doing multi-step reasoning or just smoothing the memory representation.
+    \item Whether the architecture scales to the full $d{=}384$, 13-layer configuration.
+    \item Whether the workspace components (QK-norm, ReZero gates, attention residuals) are needed at scale or are artifacts of the retention backbone's instability.
+\end{enumerate}
+
+The next step is to scale to the full production configuration ($d{=}384$, 13 layers, 16 slots, $K{=}6$) and evaluate on held-out reasoning tasks with verifiable answers.
+
 \paragraph{History of gradient instability in Cell C.}
 Cell C required five rounds of fixes before achieving stable training, each addressing a distinct gradient amplification mechanism:
 
@@ -497,7 +615,13 @@ The more substantive question is whether the workspace provides enough \emph{com
 
 Two possibilities remain open. The first is that our experimental design tests the wrong thing: Task 1 requires iteration \emph{and} memory, and Cell B supplies memory without iteration, so B-versus-A may be architecturally incapable of showing a benefit regardless of workspace quality. On this reading the informative comparison is C-versus-B, and we have under-prioritized C because it is slower. The second is that the workspace as designed is simply not the right mechanism. It requires eight weight matrices, two ReZero gates, a decay term, QK normalization, slot normalization, gate freeze, and four learning-rate groups to train at all; that quantity of scaffolding is itself evidence against the design, since the architectures that won in practice---transformers included---won by being simple and trainable rather than by being optimal. Accordingly we have set an advance stopping rule: if Cell C v2 shows Task 1 $\leq 10\%$ by step 5{,}000 (well past the 3{,}000-step gate unfreeze) with gates verifiably open and attention verifiably input-dependent, we report the negative result rather than continue to search for one more fix.
 
-Finally, the retention coincidence may be more metaphorical than functional. The retention state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the retention state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question.
+\paragraph{The text MVP pivot.}
+
+The text MVP (\Cref{sec:text-mvp}) represents a deliberate strategic pivot from the full WRAP architecture. Rather than continuing to debug the six gradient stabilization techniques, we stripped the architecture down to its core idea --- fixed-size latent memory with recurrent refinement --- and asked whether it can learn from text at all. The answer so far is yes: the model trains stably, converges rapidly (loss 10.9 $\to$ 3.0 in 500 steps), and reaches 48\% token accuracy on the tiny challenges corpus, all without any gradient stabilization beyond gradient clipping at norm 1.0.
+
+This does not prove the architecture can solve multi-hop reasoning tasks --- token accuracy on a mixed corpus is a weak signal. But it does establish a stable baseline from which to scale. The next milestone is the full production configuration ($d{=}384$, 13 layers, 16 slots, $K{=}6$) with task-level evaluation on held-out reasoning problems. If the full model can solve specific multi-hop tasks (e.g., the narrative logic puzzles in the tiny challenges corpus), that validates the approach and motivates re-introducing WRAP components for scaling. If it cannot, the failure isolates the question: is the limitation in the memory mechanism, the recurrent transition, or the training scale?
+
+The retention coincidence may be more metaphorical than functional. The retention state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the retention state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question. The text MVP sidesteps this question by using standard attention (not retention) for the backbone, and testing whether the workspace concept alone --- independent of the retention substrate --- is sufficient for reasoning.
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Decision Framework}
