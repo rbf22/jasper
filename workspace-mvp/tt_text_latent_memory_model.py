@@ -1369,6 +1369,277 @@ class TTTextLatentMemoryModel:
 
         return logits
 
+    def forward_train(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        answer_ids: torch.Tensor,
+        answer_mask: torch.Tensor,
+    ) -> "ttnn.Tensor":
+        """Training forward pass — caches all intermediates for backward.
+
+        Returns logits as a ttnn tensor (on device). Call backward() with
+        grad_logits to compute gradients.
+        """
+        device = self.device
+        B, T = prompt_ids.shape
+        _, T_ans = answer_ids.shape
+        d = self.d_model
+
+        # --- Encode prompt ---
+        indices = ttnn.from_torch(prompt_ids.to(torch.int32),
+                                  dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+        x_enc = self._embedding_lookup(indices, self.token_emb_weight_bf16)
+        _safe_deallocate(indices)
+
+        pos = ttnn.from_torch(torch.arange(T, dtype=torch.int32).unsqueeze(0),
+                              dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+        pos_emb = self._embedding_lookup(pos, self.prompt_pos_emb_bf16)
+        _safe_deallocate(pos)
+        x_enc = ttnn.add(x_enc, pos_emb)
+        _safe_deallocate(pos_emb)
+
+        kpm = self._get_key_padding_mask(prompt_mask)
+
+        enc_inputs = []  # cache input to each encoder layer
+        for layer in self.encoder_layers:
+            enc_inputs.append(x_enc)
+            x_enc = layer.forward(x_enc, key_padding_mask=kpm, training=True)
+        enc_pre_norm = x_enc
+        x_enc = self.encoder_norm.forward(x_enc)
+
+        _safe_deallocate(kpm)
+
+        # --- Initialize memory ---
+        queries = ttnn.reshape(self.slot_queries, [1, self.n_slots, d])
+        queries_b = ttnn.expand(queries, [B, self.n_slots, d])
+
+        kpm_mem = self._get_key_padding_mask(prompt_mask)
+        mem_attn_out = self.memory_init_attn.forward(
+            queries_b, enc_pre_norm, enc_pre_norm,
+            key_padding_mask=kpm_mem, training=True
+        )
+        memory = ttnn.add(queries_b, mem_attn_out)
+        mem_pre_norm = memory
+        memory = self.memory_norm.forward(memory)
+
+        _safe_deallocate(kpm_mem)
+        _safe_deallocate(queries_b)
+
+        # --- Reason (K recurrent steps) ---
+        memory_states = [memory]  # cache for backward
+        for k in range(self.config.max_reasoning_steps):
+            memory, gate = self.transition.forward(memory, training=True)
+            _safe_deallocate(gate)
+            memory_states.append(memory)
+
+        # --- Decode answer ---
+        ans_indices = ttnn.from_torch(answer_ids.to(torch.int32),
+                                      dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+        x_dec = self._embedding_lookup(ans_indices, self.token_emb_weight_bf16)
+        _safe_deallocate(ans_indices)
+
+        ans_pos = ttnn.from_torch(torch.arange(T_ans, dtype=torch.int32).unsqueeze(0),
+                                  dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+        ans_pos_emb = self._embedding_lookup(ans_pos, self.answer_pos_emb_bf16)
+        _safe_deallocate(ans_pos)
+        x_dec = ttnn.add(x_dec, ans_pos_emb)
+        _safe_deallocate(ans_pos_emb)
+
+        causal_mask = self._get_causal_mask(T_ans)
+        ans_kpm = self._get_key_padding_mask(answer_mask)
+
+        dec_inputs = []
+        dec_memories = []
+        for layer in self.decoder_layers:
+            dec_inputs.append(x_dec)
+            x_dec = layer.forward(x_dec, memory, causal_mask=causal_mask,
+                                  tgt_key_padding_mask=ans_kpm, training=True)
+
+        dec_pre_norm = x_dec
+        x_dec = self.decoder_norm.forward(x_dec)
+
+        # LM head: logits = x_dec @ emb^T
+        emb_t = ttnn.transpose(self.lm_head_weight, 0, 1)
+        logits = ttnn.matmul(x_dec, emb_t)
+        _safe_deallocate(emb_t)
+
+        # Cache everything needed for backward
+        self._train_cache = {
+            "prompt_mask": prompt_mask, "answer_mask": answer_mask,
+            "enc_inputs": enc_inputs, "enc_pre_norm": enc_pre_norm,
+            "mem_attn_out": mem_attn_out, "mem_pre_norm": mem_pre_norm,
+            "memory_states": memory_states,
+            "dec_inputs": dec_inputs, "dec_pre_norm": dec_pre_norm,
+            "x_dec_pre_lm": x_dec,
+            "ans_kpm": ans_kpm,
+        }
+
+        return logits
+
+    def backward(self, grad_logits: "ttnn.Tensor") -> Dict[str, "ttnn.Tensor"]:
+        """Full backward pass on device.
+
+        Args:
+            grad_logits: (B, T_ans, vocab_size) gradient w.r.t. logits
+
+        Returns: dict of parameter name -> gradient tensor
+        """
+        c = self._train_cache
+        device = self.device
+        d = self.d_model
+        all_grads = {}
+
+        def _accum_grads(grads: Dict, prefix: str):
+            for k, v in grads.items():
+                name = f"{prefix}_{k}"
+                if name in all_grads:
+                    all_grads[name] = ttnn.add(all_grads[name], v)
+                    _safe_deallocate(v)
+                else:
+                    all_grads[name] = v
+
+        # --- Backward through LM head: logits = x_dec @ emb^T ---
+        # grad_x_dec = grad_logits @ emb  (B, T, V) @ (V, d) = (B, T, d)
+        # grad_emb = grad_logits^T @ x_dec  (V, T) @ (T, d) = (V, d) — but we need (V, d) summed over batch
+        emb = self.lm_head_weight  # (V, d)
+        grad_x_dec = ttnn.matmul(grad_logits, emb)  # (B, T_ans, d)
+
+        # grad_token_emb = sum over batch and seq of x_dec^T @ grad_logits
+        # x_dec is (B, T_ans, d), grad_logits is (B, T_ans, V)
+        # grad_emb = x_dec^T @ grad_logits = (d, V) — but need to sum over batch
+        x_dec = c["x_dec_pre_lm"]
+        x_dec_2d = ttnn.reshape(x_dec, [-1, d])  # (N, d)
+        gl_2d = ttnn.reshape(grad_logits, [-1, self.config.vocab_size])  # (N, V)
+        grad_token_emb = ttnn.matmul(ttnn.transpose(x_dec_2d, -2, -1), gl_2d)  # (d, V)
+        _safe_deallocate(x_dec_2d)
+        _safe_deallocate(gl_2d)
+        # Transpose to (V, d) to match embedding shape
+        grad_token_emb = ttnn.transpose(grad_token_emb, -2, -1)
+        all_grads["token_emb_weight"] = grad_token_emb
+
+        # --- Backward through decoder_norm ---
+        grad_dec_pre, grad_dn_w = self.decoder_norm.backward(grad_x_dec, c["dec_pre_norm"])
+        _safe_deallocate(grad_x_dec)
+        all_grads["decoder_norm_weight"] = grad_dn_w
+
+        # --- Backward through decoder layers (reverse order) ---
+        grad_memory = None
+        for i in reversed(range(len(self.decoder_layers))):
+            layer = self.decoder_layers[i]
+            grad_dec_pre, grad_mem_i, dec_grads = layer.backward(grad_dec_pre)
+            _accum_grads(dec_grads, f"dec_{i}")
+            if grad_memory is None:
+                grad_memory = grad_mem_i
+            else:
+                grad_memory = ttnn.add(grad_memory, grad_mem_i)
+                _safe_deallocate(grad_mem_i)
+
+        _safe_deallocate(grad_dec_pre)
+
+        # --- Backward through reasoning steps (reverse order) ---
+        # memory_states[0] = initial memory, [1..K] = after each step
+        grad_memory_state = grad_memory
+        _safe_deallocate(grad_memory)
+
+        for k in reversed(range(self.config.max_reasoning_steps)):
+            grad_memory_prev, trans_grads = self.transition.backward(grad_memory_state)
+            _accum_grads(trans_grads, "trans")
+            _safe_deallocate(grad_memory_state)
+            grad_memory_state = grad_memory_prev
+
+        # --- Backward through memory initialization ---
+        # memory = memory_norm(queries + mem_attn_out)
+        grad_mem_pre, grad_mn_w = self.memory_norm.backward(grad_memory_state, c["mem_pre_norm"])
+        all_grads["memory_norm_weight"] = grad_mn_w
+
+        # grad flows to both queries and mem_attn_out through addition
+        grad_queries = grad_mem_pre  # residual
+        grad_mem_attn_out = grad_mem_pre
+
+        # Backward through memory_init_attn (cross-attention)
+        grad_queries_proj, grad_encoded_mem, mem_grads = self.memory_init_attn.backward(grad_mem_attn_out)
+        _accum_grads(mem_grads, "mem_init")
+        _safe_deallocate(grad_mem_attn_out)
+
+        # grad_queries from residual + grad_queries from attention input
+        grad_queries_total = ttnn.add(grad_queries, grad_queries_proj)
+        _safe_deallocate(grad_queries)
+        _safe_deallocate(grad_queries_proj)
+
+        # Sum grad_queries over batch to get grad_slot_queries
+        gsq = grad_queries_total
+        while len(gsq.shape) > 1:
+            _gsq = ttnn.sum(gsq, dim=0)
+            _safe_deallocate(gsq)
+            gsq = _gsq
+        all_grads["slot_queries"] = gsq
+        _safe_deallocate(grad_queries_total)
+
+        # --- Backward through encoder ---
+        # grad_encoded = grad from encoder_norm + grad from memory_init cross-attention
+        grad_enc = grad_encoded_mem  # gradient flowing back to encoder output
+
+        # Backward through encoder_norm
+        grad_enc_pre, grad_en_w = self.encoder_norm.backward(grad_enc, c["enc_pre_norm"])
+        all_grads["encoder_norm_weight"] = grad_en_w
+        _safe_deallocate(grad_enc)
+
+        # Backward through encoder layers (reverse order)
+        grad_x = grad_enc_pre
+        for i in reversed(range(len(self.encoder_layers))):
+            layer = self.encoder_layers[i]
+            grad_x, enc_grads = layer.backward(grad_x)
+            _accum_grads(enc_grads, f"enc_{i}")
+
+        # --- Backward through prompt embeddings ---
+        # grad flows to token_emb and prompt_pos_emb
+        # x_enc = token_emb(prompt_ids) + prompt_pos_emb(pos)
+        # grad_token_emb from encoder path (add to existing from LM head)
+        # We need to use embedding_bw for this
+        # For now, sum grad_x over batch for pos_emb grad, and scatter for token_emb
+        # This is simplified — proper embedding backward needs ttnn.embedding_bw
+
+        # grad_pos_emb = sum over batch of grad_x
+        gpe = grad_x
+        while len(gpe.shape) > 1:
+            _gpe = ttnn.sum(gpe, dim=0)
+            _safe_deallocate(gpe)
+            gpe = _gpe
+        # Only first T positions are used
+        # gpe is (T, d) — but prompt_pos_emb is (max_prompt_len, d)
+        # The grad should be zero-padded to max_prompt_len
+        # For simplicity, just use the first T rows
+        if "prompt_pos_emb" in all_grads:
+            # This shouldn't happen in a single forward, but just in case
+            _safe_deallocate(all_grads["prompt_pos_emb"])
+        all_grads["prompt_pos_emb"] = gpe  # TODO: zero-pad to max_prompt_len
+
+        # grad_token_emb from encoder — use embedding_bw
+        # For now, accumulate into all_grads["token_emb_weight"]
+        # embedding_bw needs indices and grad_x
+        # This is a TODO — embedding backward on device
+        # For now, we skip the embedding backward through the encoder/decoder
+        # and only have the LM head gradient for token_emb_weight
+        _safe_deallocate(grad_x)
+
+        # --- Backward through answer embeddings ---
+        # Similar TODO for answer pos_emb and token_emb through decoder
+        # The LM head gradient already accounts for token_emb_weight
+
+        # Clean up train cache
+        _safe_deallocate(c["x_dec_pre_lm"])
+        _safe_deallocate(c["dec_pre_norm"])
+        _safe_deallocate(c["enc_pre_norm"])
+        _safe_deallocate(c["mem_pre_norm"])
+        _safe_deallocate(c["mem_attn_out"])
+        _safe_deallocate(c["ans_kpm"])
+        # memory states are deallocated by transition.backward
+        # enc_inputs and dec_inputs are deallocated by layer.backward
+        self._train_cache = {}
+
+        return all_grads
+
     def get_params(self) -> Dict[str, "ttnn.Tensor"]:
         """Get all model parameters for checkpointing."""
         params = {"token_emb_weight": self.token_emb_weight}
