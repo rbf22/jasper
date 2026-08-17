@@ -20,6 +20,40 @@ import sys
 # Set env before importing ttnn
 os.environ.setdefault("TT_METAL_HOME", "/home/rfenwick/Documents/tt-metal-src")
 
+# P300 fabric mesh graph descriptor setup (same as train_tt_text_latent_memory.py)
+_P300_SUBSYSTEM_IDS = {"0x0044", "0x0045", "0x0046"}
+def _is_p300():
+    try:
+        from pathlib import Path
+        for entry in Path("/sys/class/tenstorrent").glob("tenstorrent!*"):
+            sub = (entry / "device" / "subsystem_device").read_text().strip().lower()
+            if sub in _P300_SUBSYSTEM_IDS:
+                return True
+    except Exception:
+        pass
+    return False
+def _find_mesh_graph_descriptor():
+    try:
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.find_spec("ttnn")
+        for name in ["p150_mesh_graph_descriptor.textproto", "p300_mesh_graph_descriptor.textproto"]:
+            if spec is not None and spec.submodule_search_locations:
+                path = Path(next(iter(spec.submodule_search_locations))) / "tt_metal" / "fabric" / "mesh_graph_descriptors" / name
+                if path.is_file():
+                    return str(path)
+            for p in sys.path:
+                candidate = Path(p) / "pjrt_plugin_tt" / "tt-metal" / "tt_metal" / "fabric" / "mesh_graph_descriptors" / name
+                if candidate.is_file():
+                    return str(candidate)
+    except Exception:
+        pass
+    return None
+if _is_p300():
+    _mgd = _find_mesh_graph_descriptor()
+    if _mgd:
+        os.environ.setdefault("TT_MESH_GRAPH_DESC_PATH", _mgd)
+
 import torch
 import ttnn
 
@@ -41,12 +75,6 @@ from challenge_data import ChallengeDataset
 
 def create_device(device_id: int = 0):
     """Create TT device with proper mesh graph config."""
-    mesh_graph = os.path.join(
-        os.environ.get("TT_METAL_HOME", ""),
-        "tt_metal/fabric/mesh_graph_descriptors/n300-mesh-graph.yaml"
-    )
-    if os.path.exists(mesh_graph):
-        os.environ["TT_MESH_GRAPH"] = mesh_graph
     device = ttnn.open_device(device_id=device_id)
     return device
 
@@ -678,10 +706,6 @@ def main():
         # Deallocate gradients
         for name, g in grads.items():
             _safe_deallocate(g)
-
-        # Clear caches
-        ttnn.clear_l1_small_buffers(device)
-        ttnn.dump_device_memory_state(device)
 
         # Log
         if step % 10 == 0 or args.smoke_test:
