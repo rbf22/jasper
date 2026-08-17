@@ -8,6 +8,8 @@ from latent_memory_model import (
     LatentMemoryReasoner,
     OracleLatentMemoryConfig,
     OracleLatentMemoryReasoner,
+    RegisterFileConfig,
+    RegisterFileReasoner,
 )
 
 
@@ -354,3 +356,193 @@ def test_oracle_multi_step_chain_runs_without_divergence():
             batch["query_targets"],
         )
     assert torch.isfinite(outputs["answer_logits"]).all()
+
+
+# ---------------------------------------------------------------------------
+# Register-file oracle model tests
+# ---------------------------------------------------------------------------
+
+
+def register_config(detach_latent_steps=True):
+    return RegisterFileConfig(
+        d_model=32,
+        n_slots=16,
+        max_reasoning_steps=3,
+        expand=2,
+        detach_latent_steps=detach_latent_steps,
+    )
+
+
+def register_batch(batch_size=4, depth_range=(2, 2), seed=202, max_reasoning_steps=3):
+    vocab = Vocab()
+    (
+        _,
+        _,
+        memory_targets,
+        memory_mask,
+        answers,
+        query_targets,
+        _,
+        source_targets,
+        operator_targets,
+        operand_targets,
+    ) = sample_task1_latent_batch(
+        batch_size,
+        64,
+        vocab,
+        depth_range=depth_range,
+        max_reasoning_steps=max_reasoning_steps,
+        rng=random.Random(seed),
+    )
+    return {
+        "initial_values": memory_targets[:, 0],
+        "memory_targets": memory_targets,
+        "memory_mask": memory_mask,
+        "answers": answers,
+        "query_targets": query_targets,
+        "source_targets": source_targets,
+        "operator_targets": operator_targets,
+        "operand_targets": operand_targets,
+    }
+
+
+def test_register_file_forward_shapes():
+    batch = register_batch()
+    model = RegisterFileReasoner(register_config())
+    outputs = model(
+        batch["initial_values"],
+        batch["source_targets"],
+        batch["operator_targets"],
+        batch["operand_targets"],
+        batch["query_targets"],
+    )
+    assert outputs["answer_logits"].shape == (4, MOD)
+    assert outputs["value_logits"].shape == (4, 4, 16, MOD + 1)
+    assert outputs["latent_states"].shape == (4, 4, 16, 32)
+
+
+def test_register_file_initial_values_are_exact():
+    """At step 0, the value register should contain exact one-hot initial values."""
+    batch = register_batch(batch_size=2, depth_range=(1, 1), seed=33)
+    model = RegisterFileReasoner(register_config()).eval()
+    with torch.no_grad():
+        outputs = model(
+            batch["initial_values"],
+            batch["source_targets"],
+            batch["operator_targets"],
+            batch["operand_targets"],
+            batch["query_targets"],
+            reasoning_steps=0,
+        )
+    initial_pred = outputs["value_logits"][:, 0].argmax(dim=-1)
+    known = batch["memory_mask"]
+    assert initial_pred[known].eq(batch["memory_targets"][:, 0][known]).float().mean().item() > 0.99
+
+
+def test_register_file_loss_finite_and_backprops():
+    batch = register_batch()
+    model = RegisterFileReasoner(register_config())
+    outputs = model(
+        batch["initial_values"],
+        batch["source_targets"],
+        batch["operator_targets"],
+        batch["operand_targets"],
+        batch["query_targets"],
+    )
+    losses = model.loss(outputs, batch["memory_targets"], batch["memory_mask"], batch["answers"])
+    assert torch.isfinite(losses["loss"])
+    losses["loss"].backward()
+    gate_grad = model.transition.gate_head.weight.grad
+    assert gate_grad is not None and gate_grad.abs().sum().item() > 0
+
+
+def test_register_file_detached_latent_blocks_grad_to_embeddings():
+    batch = register_batch()
+    model = RegisterFileReasoner(register_config(detach_latent_steps=True))
+    outputs = model(
+        batch["initial_values"],
+        batch["source_targets"],
+        batch["operator_targets"],
+        batch["operand_targets"],
+        batch["query_targets"],
+    )
+    # Loss only on final latent state — should not reach embeddings.
+    outputs["latent_states"][:, -1].square().mean().backward()
+    slot_grad = model.slot_embedding.weight.grad
+    assert slot_grad is None or slot_grad.abs().sum().item() < 1e-6
+
+
+def test_register_file_one_step_arithmetic():
+    """With one step, the model should learn to gate the exact arithmetic correctly."""
+    torch.manual_seed(0)
+    config = register_config()
+    config.max_reasoning_steps = 1
+    model = RegisterFileReasoner(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    for _ in range(200):
+        batch = register_batch(
+            batch_size=64, depth_range=(1, 1), seed=random.randint(0, 10**9),
+            max_reasoning_steps=1,
+        )
+        outputs = model(
+            batch["initial_values"],
+            batch["source_targets"],
+            batch["operator_targets"],
+            batch["operand_targets"],
+            batch["query_targets"],
+        )
+        losses = model.loss(outputs, batch["memory_targets"], batch["memory_mask"], batch["answers"])
+        optimizer.zero_grad(set_to_none=True)
+        losses["loss"].backward()
+        optimizer.step()
+    batch = register_batch(batch_size=128, depth_range=(1, 1), seed=999, max_reasoning_steps=1)
+    with torch.no_grad():
+        outputs = model(
+            batch["initial_values"],
+            batch["source_targets"],
+            batch["operator_targets"],
+            batch["operand_targets"],
+            batch["query_targets"],
+        )
+    accuracy = outputs["answer_logits"].argmax(-1).eq(batch["answers"]).float().mean()
+    assert accuracy.item() > 0.9, f"one-step accuracy too low: {accuracy.item():.3f}"
+
+
+def test_register_file_multi_step_depth_4():
+    """Depth-4 chains should be resolvable with the lossless value channel."""
+    torch.manual_seed(0)
+    config = register_config()
+    config.d_model = 64
+    config.expand = 4
+    config.max_reasoning_steps = 7
+    config.detach_latent_steps = False
+    model = RegisterFileReasoner(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(2000):
+        batch = register_batch(
+            batch_size=128, depth_range=(2, 4), seed=random.randint(0, 10**9),
+            max_reasoning_steps=7,
+        )
+        outputs = model(
+            batch["initial_values"],
+            batch["source_targets"],
+            batch["operator_targets"],
+            batch["operand_targets"],
+            batch["query_targets"],
+        )
+        losses = model.loss(outputs, batch["memory_targets"], batch["memory_mask"], batch["answers"])
+        optimizer.zero_grad(set_to_none=True)
+        losses["loss"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+    batch = register_batch(batch_size=128, depth_range=(4, 4), seed=777, max_reasoning_steps=7)
+    with torch.no_grad():
+        outputs = model(
+            batch["initial_values"],
+            batch["source_targets"],
+            batch["operator_targets"],
+            batch["operand_targets"],
+            batch["query_targets"],
+        )
+    accuracy = outputs["answer_logits"].argmax(-1).eq(batch["answers"]).float().mean()
+    assert accuracy.item() > 0.7, f"depth-4 accuracy too low: {accuracy.item():.3f}"

@@ -215,21 +215,28 @@ class OracleLatentMemoryConfig:
 
 
 def _build_circulant_shift(operand: int, n: int = MOD, subtract: bool = False) -> torch.Tensor:
-    """Build an n×n circulant matrix that shifts a one-hot vector by operand (mod n)."""
+    """Build an n×n circulant matrix for addition/subtraction by operand (mod n).
+
+    For addition: result[i] = src[(i - operand) % n], so one_hot(v) → one_hot((v+operand)%n).
+    For subtraction: result[i] = src[(i + operand) % n], so one_hot(v) → one_hot((v-operand)%n).
+    """
     mat = torch.zeros(n, n)
     for i in range(n):
         if subtract:
-            mat[i, (i - operand) % n] = 1.0
-        else:
             mat[i, (i + operand) % n] = 1.0
+        else:
+            mat[i, (i - operand) % n] = 1.0
     return mat
 
 
 def _build_mul_permutation(operand: int, n: int = MOD) -> torch.Tensor:
-    """Build an n×n permutation matrix for multiplication by operand (mod n)."""
+    """Build an n×n permutation matrix for multiplication by operand (mod n).
+
+    result[i] = src[j] where i = (j * operand) % n, so one_hot(v) → one_hot((v*operand)%n).
+    """
     mat = torch.zeros(n, n)
-    for i in range(n):
-        mat[i, (i * operand) % n] = 1.0
+    for j in range(n):
+        mat[(j * operand) % n, j] = 1.0
     return mat
 
 
@@ -456,6 +463,248 @@ class OracleLatentMemoryReasoner(nn.Module):
         available_steps = min(outputs["memory_logits"].shape[1], memory_targets.shape[1])
         targets = memory_targets[:, :available_steps]
         logits = outputs["memory_logits"][:, :available_steps]
+        expanded_mask = memory_target_mask[:, None, :].expand_as(targets)
+        answer_loss = F.cross_entropy(outputs["answer_logits"], answer_targets)
+        memory_loss = F.cross_entropy(logits[expanded_mask], targets[expanded_mask])
+        total = answer_loss + memory_weight * memory_loss
+        return {"loss": total, "answer_loss": answer_loss, "memory_loss": memory_loss}
+
+
+# ---------------------------------------------------------------------------
+# Register-file oracle model
+#
+# The key insight from the ablation: routing values through a latent bottleneck
+# causes compounding information loss.  Instead, keep a parallel value-logit
+# register file that never gets compressed.  The latent state only controls
+# *when* to update a slot and provides routing context.
+#
+#   value_logits: (B, S, MOD+1)  — parallel register file, lossless
+#   latent:       (B, S, d_model) — routing/context controller only
+#
+# Each step:
+#   1. Gather source value logits directly (no projection).
+#   2. Apply exact arithmetic (circulant/permutation matrices).
+#   3. Compute a gate from the latent controller.
+#   4. Write the result directly to the value register.
+#   5. Update the latent state for context.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RegisterFileConfig:
+    d_model: int = 128
+    n_slots: int = 16
+    max_reasoning_steps: int = 7
+    expand: int = 4
+    detach_latent_steps: bool = True
+    value_init_scale: float = 10.0
+
+
+class RegisterFileTransition(nn.Module):
+    """Latent controller that decides when to update each value register."""
+
+    def __init__(self, config: RegisterFileConfig):
+        super().__init__()
+        self.config = config
+        self.n_slots = config.n_slots
+        hidden = config.d_model * config.expand
+
+        # The controller sees: current latent, source slot latent, metadata.
+        self.input_norm = RMSNorm(config.d_model)
+        self.controller = nn.Sequential(
+            nn.Linear(config.d_model * 3, hidden, bias=False),
+            nn.SiLU(),
+            nn.Linear(hidden, config.d_model, bias=False),
+        )
+        self.gate_head = nn.Linear(config.d_model * 3, 1, bias=True)
+        self.output_norm = RMSNorm(config.d_model)
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        metadata: torch.Tensor,
+        source_targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (updated_latent, gate) where gate is (B, S, 1) in [0, 1]."""
+        source_indices = source_targets.clamp_max(self.n_slots - 1)
+        batch_indices = torch.arange(latent.shape[0], device=latent.device)[:, None]
+        source_latent = latent[batch_indices, source_indices]
+        ctrl_input = torch.cat(
+            (self.input_norm(latent), self.input_norm(source_latent), metadata), dim=-1
+        )
+        proposal = self.controller(ctrl_input)
+        gate = torch.sigmoid(self.gate_head(ctrl_input))  # (B, S, 1)
+        updated_latent = self.output_norm(latent + proposal)
+        return updated_latent, gate
+
+
+class RegisterFileReasoner(nn.Module):
+    """Oracle model with a lossless parallel value-logit register file."""
+
+    def __init__(self, config: RegisterFileConfig):
+        super().__init__()
+        self.config = config
+        self.n_slots = config.n_slots
+
+        # Latent controller embeddings.
+        self.slot_embedding = nn.Embedding(config.n_slots, config.d_model)
+        self.source_embedding = nn.Embedding(config.n_slots + 1, config.d_model)
+        self.operator_embedding = nn.Embedding(4, config.d_model)
+        self.operand_embedding = nn.Embedding(MOD, config.d_model)
+        self.value_init = nn.Linear(MOD + 1, config.d_model, bias=False)
+        self.metadata_norm = RMSNorm(config.d_model)
+        self.latent_norm = RMSNorm(config.d_model)
+        self.transition = RegisterFileTransition(config)
+
+        # Pre-compute exact arithmetic matrices.
+        self.register_buffer("add_matrices", torch.stack([_build_circulant_shift(k) for k in range(MOD)]))
+        self.register_buffer("sub_matrices", torch.stack([_build_circulant_shift(k, subtract=True) for k in range(MOD)]))
+        self.register_buffer("mul_matrices", torch.stack([_build_mul_permutation(k) for k in range(MOD)]))
+
+        self.apply(LatentMemoryReasoner._init_weights)
+        # Re-initialize gate to start open (~0.98). Must be after apply()
+        # which zeroes all linear biases.
+        nn.init.zeros_(self.transition.gate_head.weight)
+        nn.init.constant_(self.transition.gate_head.bias, 4.0)
+
+    def _init_value_logits(self, initial_values: torch.Tensor) -> torch.Tensor:
+        """Create one-hot value logits for each slot. Unknown = index MOD."""
+        B, S = initial_values.shape
+        value_logits = torch.full(
+            (B, S, MOD + 1), -self.config.value_init_scale, device=initial_values.device
+        )
+        # Scatter one-hot: set the correct value index to +scale, rest stay negative.
+        value_logits.scatter_(2, initial_values.unsqueeze(-1), self.config.value_init_scale)
+        return value_logits
+
+    def _exact_arithmetic(
+        self,
+        source_value_logits: torch.Tensor,
+        operator_targets: torch.Tensor,
+        operand_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply exact modular arithmetic to value logits.
+
+        Args:
+            source_value_logits: (B, S, MOD+1)
+            operator_targets: (B, S) — 0=none/direct, 1=add, 2=sub, 3=mul
+            operand_targets: (B, S) — 0..MOD-1
+
+        Returns: (B, S, MOD+1) new value logits.
+        """
+        # Work on the first MOD logits (the value space).
+        src = source_value_logits[..., :MOD]  # (B, S, MOD)
+        result = src.clone()
+
+        for op_id, matrices in [(1, self.add_matrices), (2, self.sub_matrices), (3, self.mul_matrices)]:
+            mask = operator_targets == op_id  # (B, S)
+            if not mask.any():
+                continue
+            # Vectorized: for each slot where mask is true, apply matrices[operand] @ src
+            indices = mask.nonzero()
+            for idx in indices:
+                b, s = idx
+                operand = operand_targets[b, s].item()
+                result[b, s] = matrices[operand] @ src[b, s]
+
+        # Keep the unknown logit unchanged.
+        unknown = source_value_logits[..., MOD:MOD + 1]
+        return torch.cat([result, unknown], dim=-1)
+
+    def _metadata(
+        self,
+        source_targets: torch.Tensor,
+        operator_targets: torch.Tensor,
+        operand_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        slot_ids = torch.arange(self.n_slots, device=source_targets.device)
+        slot_ids = slot_ids.unsqueeze(0).expand(source_targets.shape[0], -1)
+        meta = (
+            self.slot_embedding(slot_ids)
+            + self.source_embedding(source_targets)
+            + self.operator_embedding(operator_targets)
+            + self.operand_embedding(operand_targets)
+        )
+        return self.metadata_norm(meta)
+
+    def forward(
+        self,
+        initial_values: torch.Tensor,
+        source_targets: torch.Tensor,
+        operator_targets: torch.Tensor,
+        operand_targets: torch.Tensor,
+        query_targets: torch.Tensor,
+        reasoning_steps: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        B, S = initial_values.shape
+        device = initial_values.device
+
+        # Initialize the parallel value register (lossless, never compressed).
+        value_logits = self._init_value_logits(initial_values)  # (B, S, MOD+1)
+
+        # Initialize the latent controller from value info + metadata.
+        metadata = self._metadata(source_targets, operator_targets, operand_targets)
+        latent = self.latent_norm(metadata + self.value_init(F.one_hot(initial_values, MOD + 1).float()))
+
+        # Record states for supervision.
+        value_states = [value_logits]
+        latent_states = [latent]
+
+        steps = self.config.max_reasoning_steps if reasoning_steps is None else reasoning_steps
+        for _ in range(steps):
+            if self.config.detach_latent_steps:
+                step_latent = latent.detach()
+                step_metadata = metadata.detach()
+            else:
+                step_latent = latent
+                step_metadata = metadata
+
+            # 1. Controller decides gate and updates latent.
+            latent, gate = self.transition(step_latent, step_metadata, source_targets)
+
+            # 2. Gather source value logits directly (no projection!).
+            source_indices = source_targets.clamp_max(self.n_slots - 1)
+            batch_indices = torch.arange(B, device=device)[:, None]
+            src_values = value_logits[batch_indices, source_indices]  # (B, S, MOD+1)
+
+            # 3. Apply exact arithmetic.
+            new_values = self._exact_arithmetic(src_values, operator_targets, operand_targets)
+
+            # 4. Gated write to the value register.
+            #    Only write if the source is actually known (argmax != MOD).
+            source_known = (src_values.argmax(dim=-1) < MOD)  # (B, S)
+            dependent = source_targets.lt(self.n_slots)  # (B, S)
+            write_mask = (dependent & source_known).unsqueeze(-1) * gate  # (B, S, 1)
+            value_logits = value_logits + write_mask * (new_values - value_logits)
+
+            value_states.append(value_logits)
+            latent_states.append(latent)
+
+        value_states_stack = torch.stack(value_states, dim=1)  # (B, T, S, MOD+1)
+        latent_states_stack = torch.stack(latent_states, dim=1)  # (B, T, S, d_model)
+
+        # Answer read directly from the value register — no probe needed!
+        batch_indices = torch.arange(B, device=device)
+        answer_logits = value_states_stack[batch_indices, -1, query_targets, :MOD]
+
+        return {
+            "answer_logits": answer_logits,
+            "value_logits": value_states_stack,  # (B, T, S, MOD+1)
+            "latent_states": latent_states_stack,  # (B, T, S, d_model)
+        }
+
+    def loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        memory_targets: torch.Tensor,
+        memory_target_mask: torch.Tensor,
+        answer_targets: torch.Tensor,
+        memory_weight: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        available_steps = min(outputs["value_logits"].shape[1], memory_targets.shape[1])
+        targets = memory_targets[:, :available_steps]  # (B, T, S)
+        logits = outputs["value_logits"][:, :available_steps]  # (B, T, S, MOD+1)
+        # Supervise all slots, but mask out unassigned ones.
         expanded_mask = memory_target_mask[:, None, :].expand_as(targets)
         answer_loss = F.cross_entropy(outputs["answer_logits"], answer_targets)
         memory_loss = F.cross_entropy(logits[expanded_mask], targets[expanded_mask])
