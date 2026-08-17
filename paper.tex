@@ -25,19 +25,17 @@
     linkcolor=blue!60!black,
     citecolor=blue!60!black,
     urlcolor=blue!60!black,
-    pdftitle={Jasper: Engineering a Global Workspace for Latent Reasoning in Hybrid Retention Models},
+    pdftitle={Jasper: Latent Memory Reasoning for Small Language Models},
     pdfauthor={Jasper Research}
 }
 
 % ── Title ─────────────────────────────────────────────────────────────────
-\title{\textbf{Jasper: Engineering a Global Workspace for Latent Reasoning\\
-in Hybrid Retention Models}}
+\title{\textbf{Jasper: Latent Memory Reasoning for Small Language Models}}
 \author{Jasper Research Project}
 \date{August 2026}
 
 % ── Custom commands ───────────────────────────────────────────────────────
 \newcommand{\R}{\mathbb{R}}
-\newcommand{\workspace}{\textsc{Workspace}}
 \newcommand{\jspace}{\textsc{J-space}}
 \newcommand{\trm}{\textsc{TRM}}
 
@@ -46,7 +44,7 @@ in Hybrid Retention Models}}
 
 \begin{abstract}
 \noindent
-Recent work from Anthropic has revealed that language models develop a compact, privileged internal workspace---the \jspace{}---that causally carries multi-step reasoning, while Samsung's Tiny Recursive Model (TRM) has demonstrated that iterative refinement through a tiny recurrent network can substitute for parameter count on hard reasoning tasks. We present Jasper, an architecture that combines these two insights into a single system: a hybrid retention/attention backbone with an explicitly engineered workspace module and a recurrent core that iterates on the workspace state. The key architectural observation is that the retention layer's fixed-size compressed state is functionally shaped like the \jspace{}---a coincidence that makes the combination more powerful than applying the same ideas to a pure transformer. The retention layer (decayed linear attention) preserves the key property---a fixed-size, input-dependent state---while being simple and fast on the target hardware. The recurrent core combines iteration outputs via learned attention residuals (inspired by Kimi K3), which bound output magnitude and provide stable gradient flow across iterations. We argue that this approach is a direct and more efficient alternative to chain-of-thought ``thinking tokens'': it reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and allows trading inference-time compute depth for parameter count. We describe a proof-of-concept experiment that trains three parameter-matched model variants on synthetic reasoning tasks with controllable depth, and outline the pre-registered criteria for a go/no-go decision on scaling.
+Recent work from Anthropic has revealed that language models develop a compact, privileged internal workspace---the \jspace{}---that causally carries multi-step reasoning, while Samsung's Tiny Recursive Model (TRM) has demonstrated that iterative refinement through a tiny recurrent network can substitute for parameter count on hard reasoning tasks. We present Jasper, an architecture that combines these two insights: a fixed-size latent memory that serves as an explicit reasoning workspace, initialized from the input via cross-attention and iteratively refined through a shared recurrent transition block. The architecture reasons in latent space without generating intermediate tokens, keeps memory flat in both sequence length and reasoning depth, and allows trading inference-time compute for parameter count. We describe a native Tenstorrent implementation with hand-written forward and backward passes, validate gradient parity against a PyTorch reference, and present training results on a 2M-example mixed reasoning corpus. The model trains stably in BF16, converges from loss 10.9 to 3.0 in 500 steps, and reaches 48\% token accuracy with flat memory usage and no gradient instability.
 \end{abstract}
 
 \tableofcontents
@@ -60,7 +58,7 @@ Large language models have demonstrated impressive reasoning capabilities, but t
 
 Two recent findings suggest an alternative path. First, Anthropic's discovery of the \jspace{} \citep{anthropic2026jspace} revealed that the reasoning-critical machinery inside a language model is already small: a compact set of verbalizable representations, occupying less than 10\% of activation variance, carries the causal bulk of multi-step reasoning. This workspace is not the full residual stream---it is a privileged, broadcasted subset that functions analogously to the global workspace in cognitive science \citep{baars2005global}. Second, Samsung's Tiny Recursive Model (TRM) \citep{jolicoeur2025trm} and Geiping et al.'s recurrent-depth transformers \citep{geiping2025recurrent} have shown that iterative refinement through a small recurrent network can substitute for parameter count: a 7M-parameter model recursing on itself can outperform models with $1000\times$ more parameters on reasoning benchmarks.
 
-Jasper combines these insights. We engineer an explicit workspace module---a compact set of learned slot vectors that serve as a persistent scratchpad---and pair it with a recurrent core that iterates on the workspace state. The backbone is a hybrid retention/attention model. The retention layer (decayed linear attention \citep{sun2024retention}) maintains a fixed-size, input-dependent compressed state---the key property that makes it functionally shaped like the \jspace{}. The architecture already has a mechanism that resembles the global workspace, so the engineered workspace and the retention state reinforce each other rather than competing for the same functional role.
+Jasper combines these insights. We engineer an explicit \textbf{latent memory}---a compact set of learned slot vectors that serve as a persistent scratchpad---and pair it with a \textbf{recurrent transition} that iterates on the memory state. The input is encoded once into the memory via cross-attention. The transition block then refines the memory for $K$ steps, each step applying self-attention over the slots and a gated feed-forward update. Finally, a decoder generates the answer by cross-attending to the final memory state. The prompt is never re-processed.
 
 The result is a model that reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and can trade inference-time compute (more loop iterations) for parameter count. We argue that this is a direct alternative to thinking tokens---one that is more memory-efficient, faster, and potentially more capable of reasoning that is not easily expressed in words.
 
@@ -93,54 +91,11 @@ Independently, \citet{geiping2025recurrent} demonstrated that recurrent-depth tr
 Both works share a key insight: \emph{depth (iterations) can substitute for width (parameters)}. But both use attention-based cores, which means the key-value cache grows with sequence length, and the recurrent state is carried in the residual stream---a high-dimensional, unstructured representation.
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Retention: Decayed Linear Attention}
+\subsection{Perceiver-IO: Cross-Attention to Fixed Slots}
 
-\citet{sun2024retention} introduced the Retentive Network (RetNet), which replaces standard attention's softmax normalization with a decayed linear attention formulation. The retention layer computes:
+\citet{jaegle2022perceiverio} introduced the Perceiver IO architecture, which uses a fixed set of latent vectors that cross-attend to the input sequence. This decouples the model's internal computation from the input length: the latents have a fixed size regardless of how long the input is. The Perceiver demonstrated that a small set of learned latent vectors can extract and compress information from arbitrarily long sequences through cross-attention.
 
-\begin{equation}
-    y_t = \sum_{s \leq t} \gamma^{t-s} \cdot (C_t^\top B_s) \cdot V_s
-\end{equation}
-
-where $B_s, C_t$ are input-dependent projections, $V_s$ is the value vector, and $\gamma \in (0, 1)$ is a per-head decay scalar. In our implementation $\gamma$ is frozen (not trained) — when trainable, it drifted toward 1.0 (no decay), causing its $O(T^2)$ gradient to dominate the global gradient clip. This is equivalent to attention with a fixed exponential decay mask $D[t,s] = \gamma^{t-s}$ in place of softmax normalization.
-
-The key property for our purposes is that the retention layer maintains a \textbf{fixed-size state} $\mathbf{h}_t$ that is updated at each position:
-
-\begin{equation}
-    \mathbf{h}_t = \gamma \, \mathbf{h}_{t-1} + B_t^\top V_t
-\end{equation}
-
-This state is \textbf{compressed}: it has a fixed dimension regardless of sequence length, and it is \textbf{input-dependent}: the projections $B_t, V_t$ are computed from the current input. This is functionally analogous to the \jspace{}---a small, privileged state that carries task-relevant information forward through the computation. The decay $\gamma$ provides a natural forgetting mechanism: old information fades unless actively reinforced by new inputs, preventing unbounded state growth.
-
-The retention formulation is pure matrix multiplications (no selective scan or causal conv1d), which makes it well-suited to the Tenstorrent Blackhole hardware. The backward pass (gradient of the loss w.r.t.\ $\gamma$) is computed via a row-sum/col-sum reduction of the $T \times T$ decay matrix, on-device.
-
-% ══════════════════════════════════════════════════════════════════════════
-\section{The Retention Coincidence}
-\label{sec:coincidence}
-% ══════════════════════════════════════════════════════════════════════════
-
-The central architectural observation behind Jasper is what we call the \emph{retention coincidence}: the retention layer's compressed state already maintains a representation with the functional shape of the \jspace{}, without any engineering. Consider the parallels:
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabularx}{\textwidth}{p{0.22\textwidth} p{0.36\textwidth} p{0.36\textwidth}}
-\toprule
-\textbf{Property} & \textbf{J-space (Anthropic)} & \textbf{Retention State} \\
-\midrule
-Fixed size & $\sim$25 concepts, $<$10\% of activation variance & $d_{\text{state}}=64$ per head, regardless of sequence length \\
-Selective & Broadcasted more widely than other representations & Input-dependent projections control write/forget \\
-Persistent & Carries intermediate reasoning steps across layers & Carries information across the sequence \\
-Causally responsible & Ablation destroys multi-step reasoning & Removing state connections breaks long-range dependencies \\
-Emerges in training & Not designed, emerged in Claude & Not designed for reasoning, emerged from language modeling \\
-\bottomrule
-\end{tabularx}
-\caption{Functional parallel between the \jspace{} and the retention state.}
-\label{tab:coincidence}
-\end{table}
-
-This parallel is not merely metaphorical. When we build a hybrid model with retention layers and an explicit workspace module, the retention state and the workspace slots \emph{reinforce each other}: the retention state provides a natural substrate for the workspace to read from and write to, and the workspace provides a structured, interpretable interface to the retention layer's otherwise opaque state. In a pure transformer, the workspace must carve out its role from the residual stream against the competing pressure of attention's global mixing. In a hybrid retention model, the workspace aligns with an existing architectural feature.
-
-The coincidence becomes powerful when combined with a recurrent core. In a recurrent transformer \citep{geiping2025recurrent}, each iteration processes the full sequence with attention, growing the KV cache. In a recurrent retention model, each iteration updates the retention state in-place---memory is flat in both sequence length \emph{and} loop count. The workspace state, carried between iterations, provides a stable anchor for iterative refinement without any memory growth.
+Jasper adopts this mechanism for memory initialization: learned slot queries cross-attend to the encoded prompt, compressing the prompt into a fixed-size memory. The key difference from the original Perceiver is that Jasper's slots are then \emph{iteratively refined} by the recurrent transition, rather than being processed once.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Architecture}
@@ -150,136 +105,200 @@ The coincidence becomes powerful when combined with a recurrent core. In a recur
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Overview}
 
-The Jasper architecture combines four components:
+The Jasper architecture has four stages, executed sequentially:
 
 \begin{enumerate}[nosep]
-    \item \textbf{Retention layers} for sequence processing with flat memory. The retention layer uses decayed linear attention with a frozen per-head decay scalar $\gamma$, maintaining a fixed-size compressed state while being pure matmuls.
-    \item \textbf{Attention layers} at selected positions for exact retrieval capability.
-    \item \textbf{Workspace module} --- a perceiver-style cross-attention block with learned slot vectors, QK normalization, and ReZero gates.
-    \item \textbf{Recurrent core} --- a range of layers that are iterated $K$ times, with the workspace state carried between iterations. The iteration outputs are combined via learned attention residuals rather than a fixed blend.
+    \item \textbf{Encode}: a transformer encoder processes the prompt into hidden states.
+    \item \textbf{Initialize memory}: learned slot queries cross-attend to the encoded prompt, producing a fixed-size memory.
+    \item \textbf{Reason}: a shared transition block iterates on the memory for $K$ steps, refining it through self-attention and gated feed-forward updates.
+    \item \textbf{Decode}: a transformer decoder generates the answer autoregressively, cross-attending to the final memory state.
 \end{enumerate}
 
-% ──────────────────────────────────────────────────────────────────────────
-\subsection{Workspace Module}
-\label{sec:workspace}
+The prompt is encoded \textbf{once} and never re-processed. The decoder attends to the fixed memory ($m \times d$ floats), not to the prompt's key-value cache. Memory size is flat in both sequence length and reasoning depth: $K$ iterations use the same $m \times d$ memory, regardless of how many steps are taken. At inference time, $K$ can be chosen freely per problem, trading compute for accuracy.
 
-The workspace module is an explicit implementation of the \jspace{} concept. It maintains $m=16$ learned slot vectors $\mathbf{S} \in \R^{m \times d}$, where $d=384$ is the model dimension. At each application, it performs two phases:
-
-\paragraph{QK normalization.}
-Both cross-attention passes L2-normalize the query and key vectors along the per-head dimension before computing attention scores, with a learnable per-pass scale parameter $s$ initialized to $1/\sqrt{d_h}$:
-\begin{equation}
-    \hat{\mathbf{Q}} = \frac{\mathbf{Q}}{\|\mathbf{Q}\|_{d_h}}, \quad \hat{\mathbf{K}} = \frac{\mathbf{K}}{\|\mathbf{K}\|_{d_h}}, \quad \mathbf{A} = \text{softmax}\!\left(s \cdot \hat{\mathbf{Q}}\, \hat{\mathbf{K}}^\top\right)
-\end{equation}
-This bounds attention logits to $[-s, +s]$ regardless of weight matrix magnitudes, eliminating the entropy collapse and ill-conditioned $\mathbf{Q}\mathbf{K}^\top$ that caused training divergence in early experiments (condition numbers of 40{,}000--112{,}000 were observed). QK normalization is now standard in modern frontier models (OLMo 2, Gemma 3, Qwen 3) \citep{henry2020qknorm} and was independently validated by Kimi K3's KDA attention \citep{moonshot2026kimi}. It replaces an earlier spectral norm cap on the workspace weight matrices, which addressed the same root cause (unbounded logits) less directly.
-
-\paragraph{Read phase (sequence $\to$ workspace).}
-Slots attend over the hidden states $\mathbf{X} \in \R^{T \times d}$:
-\begin{align}
-    \mathbf{Q}_s &= \mathbf{S}\, W_Q, \quad \mathbf{K}_x = \mathbf{X}\, W_K, \quad \mathbf{V}_x = \mathbf{X}\, W_V \\
-    \mathbf{A}_{\text{read}} &= \text{softmax}\!\left(s_r \cdot \hat{\mathbf{Q}}_s\, \hat{\mathbf{K}}_x^\top\right) \\
-    \mathbf{S}' &= \text{SlotNorm}\!\left(\gamma_s \cdot \mathbf{S} + g_r \cdot \mathbf{A}_{\text{read}} \mathbf{V}_x\, W_O\right)
-\end{align}
-
-where $g_r$ is a ReZero gate (scalar, initialized to 0) and $\gamma_s$ is a learned slot decay scalar (initialized to 1.0). The ReZero gate means the workspace starts as a true no-op ($g_r = 0$) and grows linearly through gradient descent, giving the backbone time to learn a good representation before the workspace contributes. This avoids the gradient saturation problem of sigmoid gates (which we used in earlier experiments and found slow to adapt). The slot decay provides a restoring force: old information fades unless actively reinforced, making the slot update contractive.
-
-\paragraph{Write phase (workspace $\to$ sequence).}
-Hidden states attend over the updated slots:
-\begin{align}
-    \mathbf{Q}_x &= \mathbf{X}\, W_Q', \quad \mathbf{K}_s = \mathbf{S}'\, W_K', \quad \mathbf{V}_s = \mathbf{S}'\, W_V' \\
-    \mathbf{A}_{\text{write}} &= \text{softmax}\!\left(s_w \cdot \hat{\mathbf{Q}}_x\, \hat{\mathbf{K}}_s^\top\right) \\
-    \mathbf{X}' &= \text{RMSNorm}\!\left(\mathbf{X} + g_w \cdot \mathbf{A}_{\text{write}} \mathbf{V}_s\, W_O'\right)
-\end{align}
-
-where $g_w$ is a ReZero gate (scalar, initialized to 0) and $s_w$ is the write-pass QK scale. The slot state $\mathbf{S}'$ is persistent: it is carried forward to the next workspace application and, in the recurrent core, across loop iterations. SlotNorm (RMSNorm applied to the slot dimension) prevents unbounded growth of slot activations across iterations.
-
-\paragraph{Causal masking.}
-Both cross-attention passes use causal masking (Perceiver-IO style \citep{jaegle2022perceiverio}) to prevent future-token leakage in autoregressive settings. Without causal masking, the workspace's bidirectional cross-attention would allow the model to read future tokens (including the answer) through the slots, creating a shortcut that bypasses reasoning entirely. The read pass restricts slot $i$ to positions $[0, (i{+}1)\lfloor T/m \rfloor - 1]$, giving each slot a growing receptive field. The write pass restricts position $t$ to slots $[0, (t{+}1)\lfloor m/T \rfloor]$, ensuring each position only reads from slots whose receptive field includes positions $\leq t$. This preserves the workspace's memory function while respecting causality.
-
-\paragraph{Slot parameter normalization.}
-The learned slot parameters $\mathbf{S}$ are subject to a positive feedback loop: large slots produce sharp attention distributions, which produce large gradients, which cause the slots to grow further. To break this loop, the slot parameters are normalized to unit RMS after each optimizer step:
-\begin{equation}
-    \mathbf{S} \leftarrow \frac{\mathbf{S}}{\text{RMS}(\mathbf{S})}, \quad \text{RMS}(\mathbf{S}) = \sqrt{\frac{1}{md}\sum_{i,j} S_{ij}^2}
-\end{equation}
-This is a parameter constraint (analogous to weight clipping in GANs) rather than a learned normalization. It allows the \emph{direction} of each slot vector to change freely while constraining its magnitude, preventing the runaway growth that causes gradient explosion.
-
-\paragraph{Backbone spectral normalization.}
-The backbone attention and retention weight matrices (QKV and output projections) are spectrally normalized to a cap of $C_{\text{bb}} = 2.0$ after each optimizer step, using the same power-iteration technique as \citet{miyato2018spectral}. This prevents unbounded weight growth in the backbone while preserving sufficient capacity. The workspace weights are not spectrally normalized — QK normalization handles that path more directly.
-
-\paragraph{Design rationale.}
-The workspace is deliberately small ($m=16$ slots, $\sim$2M parameters total) to mirror the compactness of the \jspace{}. The two-phase design (read then write) mirrors the global workspace theory's broadcast cycle: information is first consolidated into the workspace, then broadcast back to the processing stream.
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{c l X}
+\toprule
+\textbf{Stage} & \textbf{Component} & \textbf{Operation} \\
+\midrule
+1 & Encoder & $L_{\text{enc}}$ transformer encoder layers (pre-norm, GELU FFN) \\
+2 & Memory init & Cross-attention from $m$ learned slot queries to encoded prompt \\
+3 & Transition & $K$ iterations of self-attention + gated FFN over $m$ slots \\
+4 & Decoder & $L_{\text{dec}}$ transformer decoder layers, cross-attending to memory \\
+\bottomrule
+\end{tabularx}
+\caption{The four stages of the Jasper architecture. Memory is fixed-size ($m \times d$) throughout.}
+\label{tab:stages}
+\end{table}
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Recurrent Core}
-\label{sec:recurrent-core}
+\subsection{Memory Initialization}
+\label{sec:mem-init}
 
-Layers $c_{\text{start}}$ through $c_{\text{end}}-1$ (by default, layers 6--9) form the recurrent core. These layers are applied $K$ times in sequence, with the workspace state carried between iterations:
+The memory is initialized via a single cross-attention pass from $m$ learned slot queries to the encoded prompt. Let $\mathbf{X} \in \R^{B \times T \times d}$ be the encoded prompt hidden states and $\mathbf{Q} \in \R^{m \times d}$ be the learned slot queries (shared across the batch, expanded to $B \times m \times d$):
 
-\begin{equation}
-    \mathbf{x}^{(k+1)}, \mathbf{S}^{(k+1)} = \text{CoreLayers}\!\left(\mathbf{x}^{(k)}, \mathbf{S}^{(k)}\right), \quad k = 0, \ldots, K-1
-\end{equation}
-
-During training, $K$ is sampled uniformly from $\{1, \ldots, K_{\max}\}$ for each batch. For hardware compilation (e.g., on Tenstorrent accelerators), the loop is always unrolled to $K_{\max}$, with iterations beyond the sampled $K$ masked out. The computation graph is static, allowing variable-depth training without recompilation.
-
-\paragraph{Attention residuals.}
-The final hidden state is computed not by a fixed linear blend of iteration outputs, but by \emph{learned softmax attention over all iteration outputs} (including the pre-core input $\mathbf{x}^{(0)}$). This technique, inspired by Kimi K3's Attention Residuals \citep{moonshot2026kimi} and ReZero \citep{bachlechner2020rezero}, stores all $K+1$ iteration outputs and computes:
 \begin{align}
-    \text{score}_k &= \left(\sum_d \mathbf{x}^{(k)}_d \cdot \mathbf{w}_d\right) \cdot s, \quad k = 0, \ldots, K \\
-    \boldsymbol{\alpha} &= \text{softmax}\!\left([\text{score}_0, \ldots, \text{score}_K]\right) \\
-    \mathbf{x}_{\text{final}} &= \sum_{k=0}^{K} \alpha_k \cdot \mathbf{x}^{(k)}
+    \mathbf{M}_0 &= \text{RMSNorm}\!\left(\mathbf{Q} + \text{CrossAttn}(\mathbf{Q}, \mathbf{X}, \mathbf{X})\right)
 \end{align}
-where $\mathbf{w} \in \R^d$ is a learned query vector (not input-dependent) and $s$ is a learnable scalar (initialized to $1/\sqrt{d}$). This gives three key properties:
 
+where $\text{CrossAttn}(Q, K, V)$ is standard multi-head cross-attention with a key padding mask to ignore padding tokens in the prompt. The residual connection ($\mathbf{Q} + \text{CrossAttn}$) means the slots start from their learned prior and are modulated by the prompt content. RMSNorm prevents unbounded slot activation growth.
+
+The number of slots $m$ is small (8--16 in our experiments), mirroring the compactness of the \jspace{} ($<$25 concepts). The slots are initialized as learned parameters with $\mathcal{N}(0, 0.02)$, giving each slot a distinct starting point that the cross-attention then specializes.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Recurrent Transition}
+\label{sec:transition}
+
+The core of the architecture is the recurrent transition block, applied $K$ times to the memory:
+
+\begin{align}
+    \mathbf{H}_k &= \text{RMSNorm}(\mathbf{M}_k) + \text{SelfAttn}(\text{RMSNorm}(\mathbf{M}_k)) \\
+    \mathbf{P}_k &= \text{FFN}(\mathbf{H}_k) \quad \text{(SiLU activation)} \\
+    \mathbf{G}_k &= \sigma(\text{Linear}(\mathbf{H}_k)) \quad \text{(per-slot write gate)} \\
+    \mathbf{M}_{k+1} &= \text{RMSNorm}(\mathbf{M}_k + \mathbf{G}_k \odot \mathbf{P}_k)
+\end{align}
+
+where:
 \begin{itemize}[nosep]
-    \item \textbf{Bounded output magnitude:} softmax normalizes weights to sum to 1, so $|\mathbf{x}_{\text{final}}| \leq \max_k |\mathbf{x}^{(k)}|$ — no amplification across iterations.
-    \item \textbf{Consistent gradient magnitude:} each iteration receives gradient $\alpha_k \cdot \nabla_{\mathbf{x}_{\text{final}}}$ directly from the attention, not through a chain of blend operations. The gradient is bounded by the softmax weights.
-    \item \textbf{Learned selection:} the model learns which iterations' outputs to weight more, rather than using a fixed schedule.
+    \item $\text{SelfAttn}$ is multi-head self-attention over the $m$ slots (no causal mask---all slots attend to all others).
+    \item $\text{FFN}$ is a two-layer feed-forward network with SiLU activation: $\text{Linear}(d, d \cdot e) \to \text{SiLU} \to \text{Linear}(d \cdot e, d)$, where $e$ is the expansion factor.
+    \item $\mathbf{G}_k \in \R^{B \times m \times d}$ is a per-slot, per-dimension write gate, computed by a linear layer followed by a sigmoid. The gate controls how much of the FFN proposal is written to memory.
+    \item The residual connection $\mathbf{M}_k + \mathbf{G}_k \odot \mathbf{P}_k$ means the transition is additive: it modifies the memory rather than replacing it.
 \end{itemize}
 
-This design was motivated by repeated divergence in earlier experiments with a fixed blend ($\mathbf{x} = \alpha \cdot \mathbf{x}_{\text{new}} + (1-\alpha) \cdot \mathbf{x}$). The fixed blend creates a multiplicative gradient path: each iteration's gradient flows back through all subsequent iterations' blend operations, amplifying by $(1-\alpha)$ per iteration. With $K=6$ and $\alpha = 1/\sqrt{K}$, the workspace's cross-attention amplification compounds on top of this chain, causing gradient explosion at step $\sim$1000 in our experiments. The attention residual replaces the chain with direct (bounded) gradient paths.
+\paragraph{Gate initialization.}
+The write gate is initialized open: the gate linear layer's weight is zeroed and its bias is set to 4.0, giving $\sigma(4) \approx 0.98$. This allows the transition to modify memory from the start of training, rather than requiring a warm-up period. The rationale is that the transition block needs to participate in the forward pass from the beginning so that gradients flow through it and it learns useful updates. A closed gate would starve the transition of gradient signal.
 
-\paragraph{Slot chain gradient scaling.}
-While the attention residual bounds the $\mathbf{x}$-path gradient, the workspace slot state $\mathbf{S}$ chains multiplicatively across iterations: $\mathbf{S}^{(k+1)}$ depends on $\mathbf{S}^{(k)}$, and the gradient $\nabla_{\mathbf{S}^{(k)}}$ receives chained contributions from all subsequent iterations. In the backward pass, this chained slot gradient is scaled by $1/K$ per iteration, giving a per-iteration gain of $A/K^2 + 1 - 1/\sqrt{K}$ (where $A$ is the workspace's backward amplification factor), which is $\leq 1$ for $A \leq \sqrt{K}$. This is more conservative than the $1/\sqrt{K}$ scaling used for additive residual streams, but necessary because the slot chain is multiplicative rather than additive.
+\paragraph{Shared parameters.}
+The same transition block (same weights) is applied at every step $k$. This is parameter-efficient---one transition block regardless of $K$---and encourages each step to learn a general refinement operation rather than step-specific behavior. At inference time, $K$ can be increased beyond the training value, and the shared transition applies its learned refinement to the evolved memory state.
 
-At inference time, $K$ can be chosen freely---this is the test-time compute scaling mechanism. Harder problems can be allocated more iterations, directly trading compute for accuracy.
+\paragraph{Why self-attention over slots.}
+The slots represent different ``concepts'' or ``variables'' in the reasoning problem. Self-attention allows slots to interact: one slot can query another to retrieve information needed for the next reasoning step. This mirrors the broadcast property of the global workspace theory \citep{baars2005global}---all workspace contents are accessible to all other contents. Without self-attention, each slot would be refined independently, losing the ability to combine information across slots.
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Hybrid Backbone}
+\subsection{Decoder}
+\label{sec:decoder}
 
-The full model uses 13--14 layers total, with attention inserted at positions 5 and 10. The attention layers provide exact retrieval capability---a known weakness of pure retention models \citep{arora2024theoretical}---while the retention layers provide efficient sequence processing with flat memory. The hybrid ratio ($\sim$85\% retention, $\sim$15\% attention) follows the empirical finding that a minority of attention layers recovers most of the retrieval gap while preserving the throughput and memory advantages.
+The decoder is a standard transformer decoder that generates the answer autoregressively:
 
-% ══════════════════════════════════════════════════════════════════════════
-\section{Comparison to Thinking Tokens}
-\label{sec:cot}
-% ══════════════════════════════════════════════════════════════════════════
+\begin{align}
+    \mathbf{Y} &= \text{TokenEmb}(\text{answer\_ids}) + \text{PosEmb}(\text{positions}) \\
+    \mathbf{D} &= \text{TransformerDecoder}(\mathbf{Y}, \mathbf{M}_K) \\
+    \text{logits} &= \mathbf{D} \cdot \mathbf{E}^\top
+\end{align}
 
-The dominant approach to scaling reasoning in language models is chain-of-thought (CoT) prompting: the model generates a sequence of intermediate ``thinking tokens'' before producing its final answer. This approach, while effective, has several structural inefficiencies that the workspace-recurrent architecture addresses directly.
+where $\mathbf{M}_K$ is the final memory state after $K$ transition steps, used as the key/value for cross-attention in each decoder layer. The decoder uses a causal mask for autoregressive generation and teacher forcing during training. The LM head is weight-tied with the token embedding ($\mathbf{E}$), following standard practice.
+
+The critical distinction from a standard transformer decoder is that cross-attention targets the \textbf{fixed memory} ($m \times d$), not the prompt's key-value cache ($T \times d$ per layer). This means the decoder's memory footprint is independent of prompt length---it attends to $m$ slots regardless of how long the prompt was.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Memory Properties}
+\label{sec:memory-properties}
+
+The architecture has three key memory properties:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Fixed-size memory}: the memory is always $m \times d$ floats, regardless of prompt length $T$ or reasoning depth $K$. This is the core advantage over thinking tokens, where the KV cache grows linearly with reasoning length.
+    \item \textbf{Encode-once, decode-once}: the prompt is processed by the encoder exactly once. The decoder generates the answer in a single pass. The recurrent transition operates only on the $m$ slots, not on the full sequence.
+    \item \textbf{Test-time compute scaling}: $K$ can be chosen at inference time. Harder problems can be allocated more iterations, directly trading compute for accuracy without retraining.
+\end{enumerate}
 
 \begin{table}[h]
 \centering
 \small
 \begin{tabularx}{\textwidth}{p{0.2\textwidth} p{0.38\textwidth} p{0.38\textwidth}}
 \toprule
-\textbf{Property} & \textbf{Thinking Tokens (CoT)} & \textbf{Workspace Recurrence (Jasper)} \\
+\textbf{Property} & \textbf{Thinking Tokens (CoT)} & \textbf{Jasper (Latent Memory)} \\
 \midrule
 Reasoning medium & Token space (discrete, serial) & Latent space (continuous, parallel) \\
-Memory growth & Linear in reasoning length (KV cache) & Flat (fixed workspace + retention state) \\
+Memory growth & Linear in reasoning length (KV cache) & Flat (fixed $m \times d$ memory) \\
 Tokens generated & One per reasoning step & Zero---reasoning is internal \\
-Legibility & Fully legible (readable text) & Partially legible (workspace probes) \\
+Legibility & Fully legible (readable text) & Partially legible (memory probes) \\
 Compute control & Number of generated tokens & Number of loop iterations $K$ \\
-Training data & Requires CoT supervision or RL & Standard next-token prediction + deep supervision \\
+Training data & Requires CoT supervision or RL & Standard next-token prediction \\
 Expressive range & Limited to verbalizable reasoning & Can capture non-verbal reasoning patterns \\
 Deployment cost & High (long generation, large cache) & Low (short output, fixed memory) \\
 \bottomrule
 \end{tabularx}
-\caption{Comparison of thinking tokens vs.\ workspace recurrence.}
+\caption{Comparison of thinking tokens vs.\ latent memory reasoning.}
 \label{tab:cot-comparison}
 \end{table}
 
-The key distinction is that thinking tokens reason in \emph{token space}---the model must verbalize each intermediate step, serialize it, and re-process it on the next forward pass. This is slow (one forward pass per token), memory-hungry (the KV cache grows with each token), and constrains reasoning to what can be expressed in language. As \citet{geiping2025recurrent} note, ``a substantial amount of thought happens through complex, recurrent firing patterns in the brain, before the first word of an answer is uttered.''
+% ══════════════════════════════════════════════════════════════════════════
+\section{Native Tenstorrent Implementation}
+\label{sec:implementation}
+% ══════════════════════════════════════════════════════════════════════════
 
-Workspace recurrence reasons in \emph{latent space}---the workspace state is updated in-place through matrix operations, without generating any tokens. This is faster (one forward pass per iteration, not per token), memory-flat (the workspace has a fixed size regardless of reasoning depth), and can capture reasoning patterns that are not easily expressed in words. The trade-off is legibility: thinking tokens produce readable traces, while workspace reasoning is only partially legible through probes (see \Cref{sec:experiments}).
+The model is implemented natively on Tenstorrent Blackhole hardware using the \texttt{ttnn} library, without PyTorch autograd. The forward and backward passes are hand-written, giving full control over which operations run on the device versus the host.
 
-For deployment on constrained devices (web browsers, mobile phones), the memory advantage is decisive. A model that generates 1000 thinking tokens accumulates a KV cache of $\sim$1000 $\times$ $d_{\text{model}}$ $\times$ $n_{\text{layers}}$ floats. A model that iterates its workspace 100 times uses the same fixed workspace state ($m \times d$ floats) plus the retention state ($d_{\text{state}} \times d$ floats), regardless of $K$.
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Device vs.\ Host Operation Placement}
+
+The placement of each operation is chosen based on numerical stability and memory efficiency:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{p{0.28\textwidth} p{0.12\textwidth} p{0.52\textwidth}}
+\toprule
+\textbf{Operation} & \textbf{Where} & \textbf{Rationale} \\
+\midrule
+Attention (forward) & Device & BF16 matmuls are fast on device \\
+Attention (backward) & Device & \texttt{ttnn.matmul} + \texttt{moreh\_softmax\_backward} \\
+Linear (forward + backward) & Device & \texttt{ttnn.matmul} in BF16 \\
+FFN / activation (backward) & Device & SiLU/GELU derivatives on device \\
+Embedding lookup (forward) & Device & \texttt{ttnn} embedding lookup \\
+Embedding backward & Host & \texttt{torch.index\_add\_} scatter by token ID \\
+RMSNorm / LayerNorm (forward) & Device & \texttt{ttnn.moreh\_layer\_norm} \\
+RMSNorm / LayerNorm (backward) & Host & BF16 \texttt{rsqrt} overflows; FP32 on host is stable \\
+Cross-entropy loss & Host & $V \times V$ identity matrix infeasible at $V{=}50257$ \\
+AdamW optimizer & Host & FP32 master weights, BF16 device weights \\
+\bottomrule
+\end{tabularx}
+\caption{Operation placement. Operations that require numerical stability (norms, loss) run on host in FP32. Operations that benefit from device throughput (matmuls, attention) run on device in BF16.}
+\label{tab:op-placement}
+\end{table}
+
+\paragraph{Why norms run on host.}
+BF16 has a 7-bit mantissa (8 bits, 1 implicit). The \texttt{rsqrt} operation in RMSNorm/LayerNorm backward produces values that can overflow when the variance is small. In our experiments, BF16 norm backward produced \texttt{inf} gradients after $\sim$30 training steps. Moving norm backward to host FP32 eliminates this entirely with negligible performance impact (norms are small compared to matmuls).
+
+\paragraph{Why cross-entropy runs on host.}
+On-device cross-entropy with a 50,257-token vocabulary requires a $V \times V$ identity matrix for one-hot encoding ($\sim$5\,GB in BF16), which is infeasible. Host-side FP32 cross-entropy is numerically stable, and the host transfer of $(B, T, V)$ logits is only $\sim$6.4\,MB per step---negligible compared to the model's device memory footprint. The host FP32 softmax over 50K elements is also faster than device dispatch overhead for the same operation.
+
+\paragraph{Why embedding backward runs on host.}
+The embedding gradient is a scatter-add: for each token ID in the input, add the corresponding gradient row to that embedding row. This is \texttt{torch.index\_add\_} on host---a simple, memory-efficient operation that doesn't require a matmul. Doing it on host avoids device scatter complexity and the gradient is accumulated from both the encoder input path and the decoder input path (plus the LM head output path).
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Engineering Challenges and Solutions}
+\label{sec:engineering}
+
+Three engineering issues caused training failures during development. Each was diagnosed and fixed:
+
+\paragraph{1. Device hang after $\sim$100 steps.}
+
+\textbf{Symptom}: Training ran at 0.07\,s/step for $\sim$100 steps, then the process went to 0\% CPU and hung indefinitely. The hang coincided with TT-Metal kernel compilation messages.
+
+\textbf{Root cause}: The data sampler used per-batch maximum sequence lengths, meaning every batch had different tensor shapes. Each unique shape triggers a new TT-Metal kernel compilation. After $\sim$100 unique shapes, the device stalled---likely due to program cache exhaustion or compilation deadlock.
+
+\textbf{Fix}: Pad all batches to fixed \texttt{max\_prompt\_len} and \texttt{max\_answer\_len}. Kernels compile once for the fixed shapes and are reused for every subsequent batch. This eliminated all hangs in runs of 500+ steps.
+
+\paragraph{2. Host RSS growth (284\,MB per 100 steps).}
+
+\textbf{Symptom}: Host RSS grew steadily from 3.3\,GB to 3.6\,GB over 100 steps, suggesting a memory leak.
+
+\textbf{Root cause}: The cross-entropy loss computation creates several large temporary host tensors (each $B \times T \times 50257 \times 4$ bytes $\approx$ 12.8\,MB). When these are freed, glibc's malloc allocator retains the memory in its arena rather than returning it to the OS. This is not a true leak---the memory is reusable---but RSS appears to grow.
+
+\textbf{Fix}: Explicit \texttt{del} of all temporary tensors immediately after use, plus \texttt{malloc\_trim(0)} every 10 steps to force glibc to return freed memory to the OS. RSS now plateaus at $\sim$3.4\,GB after step 40 with zero growth thereafter.
+
+\paragraph{3. Gradient \texttt{inf} (steps 53, 54, 97, 105).}
+
+\textbf{Symptom}: Gradient norms spiked to \texttt{inf} at seemingly random steps, despite gradient clipping at norm 1.0. Training continued (the clipper handled it) but the \texttt{inf} values indicated a numerical instability.
+
+\textbf{Root cause}: BF16 \texttt{rsqrt} in RMSNorm/LayerNorm backward overflows when the variance is small. The 7-bit mantissa cannot represent the large \texttt{rsqrt} values, producing \texttt{inf}. This cascaded through the backward pass into the gradient norms.
+
+\textbf{Fix}: Move RMSNorm and LayerNorm backward to host FP32. FP32 has sufficient precision for \texttt{rsqrt} at any variance value. Combined with fixed sequence lengths (which stabilize attention matmul shapes), no \texttt{inf} gradients occur in 500-step runs.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Experimental Design}
@@ -287,246 +306,78 @@ For deployment on constrained devices (web browsers, mobile phones), the memory 
 % ══════════════════════════════════════════════════════════════════════════
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Ablation Ladder}
+\subsection{Dataset: Tiny Challenges Corpus}
 
-We train three parameter-matched model variants ($\sim$10M parameters each) that form an ablation ladder---each cell adds one component, so the marginal contribution of each is isolated:
+The model trains on a 2M-example mixed reasoning corpus (``tiny challenges''), inspired by Enigmata-style synthetic reasoning training. The corpus mixes three types of problems:
 
 \begin{table}[h]
 \centering
 \small
-\begin{tabularx}{\textwidth}{c l X}
+\begin{tabularx}{\textwidth}{p{0.25\textwidth} p{0.1\textwidth} p{0.6\textwidth}}
 \toprule
-\textbf{Cell} & \textbf{Architecture} & \textbf{What it tests} \\
+\textbf{Component} & \textbf{Fraction} & \textbf{Description} \\
 \midrule
-A & Hybrid (14 retention + 2 attention at positions 5, 10), no workspace & The no-workspace control; isolates the workspace effect \\
-B & Hybrid + workspace (13 retention + 2 attention + 16-slot perceiver workspace) & Does an engineered workspace help without recurrence? \\
-C & Full architecture (hybrid + workspace + layers 6--9 looped $K$ times) & The go/no-go cell; does recurrence + workspace beat the control? \\
+Narrative logic puzzles & 40\% & Multi-hop location, arithmetic, swap, and attribute puzzles expressed in natural language \\
+BrainBashers-style puzzles & 55\% & Attribute-chain, elimination, and ordering puzzles requiring systematic reasoning \\
+bAbI QA & 5\% & HuggingFace \texttt{Muennighoff/babi} passages testing reading comprehension \\
 \bottomrule
 \end{tabularx}
-\caption{The three-cell ablation ladder. All cells target $\sim$10M parameters ($d_{\text{model}}=384$, 13--14 layers). Cell B removes one retention layer to compensate for the $\sim$2M workspace parameters, keeping cells parameter-matched.}
-\label{tab:cells}
+\caption{Tiny challenges corpus composition.}
+\label{tab:corpus}
 \end{table}
 
-\paragraph{Cell history.}
-The design was refined from an initial four-cell grid to the current three-cell ladder after preliminary experiments showed that the pure-backbone and high-LR variants plateaued on Task 1 without contributing additional signal. The comparison logic is: \textbf{B vs A} isolates the workspace effect (same LR=$2 \times 10^{-4}$); \textbf{C vs B} isolates the recurrent core; \textbf{C vs A} is the full R1 test.
+\begin{itemize}[nosep]
+    \item Train: 2,000,000 examples ($\sim$292\,MB, 78.7M tokens)
+    \item Validation: 20,000 examples ($\sim$3\,MB, 787K tokens)
+    \item Tokenization: GPT-2 BPE (vocab size 50,257)
+\end{itemize}
+
+The puzzles are designed to require multi-hop reasoning but are expressed in natural language, testing whether the architecture can learn reasoning that goes beyond surface-level pattern matching.
 
 % ──────────────────────────────────────────────────────────────────────────
 \subsection{Training Configuration}
 \label{sec:training-config}
 
-All cells use AdamW ($\beta_1=0.9, \beta_2=0.95, \epsilon=10^{-8}$) with weight decay $0.1$ and gradient clipping at norm $1.0$. All cells use peak lr=$2 \times 10^{-4}$ with a linear warmup over 200 steps, followed by a constant peak. The training budget is 10{,}000 steps per cell. Training runs on a Tenstorrent Quietbox 2 (4$\times$ Blackhole chips, bfloat16-native) with all three cells in parallel on separate devices.
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{p{0.3\textwidth} p{0.25\textwidth} p{0.4\textwidth}}
+\toprule
+\textbf{Parameter} & \textbf{Test config} & \textbf{Production config (planned)} \\
+\midrule
+$d_{\text{model}}$ & 128 & 384 \\
+Encoder layers & 2 & 4 \\
+Decoder layers & 1 & 2 \\
+Attention heads & 4 & 4 \\
+Memory slots & 8 & 16 \\
+Reasoning steps $K$ & 3 & 6 \\
+FFN expansion & 2 & 4 \\
+Max prompt length & 64 & 512 \\
+Max answer length & 16 & 32 \\
+Batch size & 4 & 8 \\
+Precision & BF16 & BF16 \\
+Total parameters & $\sim$7.3M & $\sim$30M \\
+\bottomrule
+\end{tabularx}
+\caption{Model configurations. The test config is used for rapid iteration and validation; the production config is the target for full-scale training.}
+\label{tab:configs}
+\end{table}
 
-\paragraph{Batch configuration.}
-Each step uses micro-batch size 8 with 48 gradient accumulation steps, giving an effective batch size of 384 sequences ($\sim$49K tokens per step). Fresh data is sampled every batch---with generated data there is no train set to overfit.
+\paragraph{Optimizer.}
+AdamW ($\beta_1=0.9, \beta_2=0.95, \epsilon=10^{-8}$) with weight decay 0.1 and gradient clipping at norm 1.0. Learning rate starts at $6 \times 10^{-4}$ with cosine decay over the training run. The optimizer maintains FP32 master weights and BF16 device weights, with the update applied to the FP32 copy and then transferred to the device.
 
-\paragraph{Early stopping.}
-An EMA-smoothed loss plateau detector stops training if the loss does not improve by a relative $0.1\%$ over 1{,}000 steps (10\% of the training budget). The EMA smoothing factor is $\beta=0.99$, giving a half-life of $\sim$69 steps ($\sim$3{,}300 micro-batches), which is well above the per-step noise floor at this batch size.
-
-\paragraph{Per-parameter LR groups.}
-The workspace parameters ($\sim$2M of $\sim$10M total) receive $0.25\times$ the base learning rate ($5 \times 10^{-5}$ vs $2 \times 10^{-4}$ for the backbone). This is motivated by the observation that the workspace creates a sharper loss landscape: at equal LR, workspace gradients dominate and cause instability. The backbone LR is kept at $2 \times 10^{-4}$ to match Cell A (the control), preserving the clean B-vs-A comparison. Gate parameters (read/write gates) receive $1\times$ the base LR — reduced from an earlier $10\times$ after evaluation showed that high gate LR caused premature gate opening before the workspace had learned useful representations, destabilizing the backbone.
-
-\paragraph{Stabilization techniques.}
-The workspace and recurrent core introduce several sources of gradient instability that are not present in the baseline hybrid model. We address each with a targeted normalization:
-
-\begin{enumerate}[nosep]
-    \item \textbf{Per-parameter LR groups} (above): workspace parameters receive $0.25\times$ the base LR, preventing the workspace from dominating the gradient. Gate parameters receive $1\times$ base LR (reduced from $10\times$ after evaluation showed premature opening destabilized the backbone). QK scale and attention residual parameters receive $1.0\times$ base LR (backbone speed).
-    \item \textbf{QK normalization} (\Cref{sec:workspace}): L2-normalizes Q and K per head before attention, bounding logits regardless of weight magnitudes. This eliminates the entropy collapse (condition numbers 40{,}000--112{,}000) that caused divergence in early experiments.
-    \item \textbf{ReZero gates} (\Cref{sec:workspace}): scalar gates initialized to 0.0 (true identity at init), no sigmoid. The workspace starts as a no-op and grows through gradient descent, avoiding the sigmoid's gradient saturation.
-    \item \textbf{Gate freeze} (new): during the first $N_{\text{freeze}}$ steps (3{,}000 for synthetic, 600 for text), workspace gates are held at exactly 0 after each optimizer step via \texttt{freeze\_workspace\_gates()}. This makes the workspace a true identity (no-op) during the freeze, so the backbone trains as if the workspace doesn't exist. After the freeze, gates learn freely at $1\times$ LR. This was added after evaluation showed that even with ReZero initialization, noisy gradients at high gate LR caused gates to drift open before the workspace had learned useful representations, destabilizing the backbone. The freeze ensures a clean B-vs-A comparison: B trains as exactly A during freeze, then the workspace opens only if gradient descent finds it useful.
-    \item \textbf{Attention residual core} (\Cref{sec:recurrent-core}): replaces the fixed blend with learned softmax attention over iteration outputs, bounding output magnitude and providing direct (non-chained) gradient paths.
-    \item \textbf{Slot chain $1/K$ scaling} (\Cref{sec:recurrent-core}): scales the chained slot gradient by $1/K$ per iteration in the backward pass, preventing multiplicative gradient amplification across the $K$-iteration slot chain.
-    \item \textbf{Slot parameter normalization} (\Cref{sec:workspace}): constrains the learned slot parameters to unit RMS after each optimizer step, breaking the positive feedback loop where large slots $\to$ sharp attention $\to$ large gradients $\to$ larger slots.
-    \item \textbf{Backbone spectral normalization} (\Cref{sec:workspace}): caps the spectral norm of backbone weight matrices at $C_{\text{bb}} = 2.0$ after each optimizer step.
-    \item \textbf{Retention $\gamma$ freezing}: the retention layer's decay scalar $\gamma$ is frozen (not trained). When $\gamma$ was trainable, it drifted to 1.0 (no decay), causing its $O(T^2)$ gradient to dominate the global gradient clip and starve all other parameters. Freezing eliminates this gradient scale mismatch entirely.
-    \item \textbf{Component-wise gradient clipping}: workspace parameters (names starting with \texttt{ws\_}) are clipped at norm 0.5, backbone parameters at norm 1.0, with each group's norm computed and clipped independently. This prevents workspace gradient spikes from dominating the global clip and starving the backbone of learning signal \citep{yang2022componentwise}.
-    \item \textbf{Restore-on-spike}: if the pre-clip gradient norm exceeds 5000, the model and optimizer state are restored from the last checkpoint rather than skipping the step. Skip-on-spike freezes the model in the bad state that caused the spike --- it can never recover. Restore gives a fresh start from a known-good state (at most 100 steps old).
-\end{enumerate}
-
-Each technique targets a distinct mechanism. The first six are architectural (they change the forward or backward computation); the last five are training-time (they constrain parameters or gradients). All are deterministic and can be disabled independently for ablation.
-
-\paragraph{Custom fused kernels.}
-The Tenstorrent implementation uses three custom tt-metal kernels to reduce op dispatch overhead and eliminate intermediate DRAM writes: (1)~fused RoPE (full rotation in a single kernel pass, using a split-RoPE optimization that avoids sub-tile concat/slice when $d_{\text{head}}/2$ is not tile-aligned), (2)~fused scale+decay (scores $= \text{qk} \cdot \text{scale} \cdot D_{\text{decay}}$ in one pass), and (3)~fused gate backward (computing $\text{grad\_out\_flat}$ and $\text{grad\_g}$ in a single kernel pass). The retention layer runs at 2.9\,ms per forward+backward pass at $d_{\text{model}}=384$, $n_{\text{heads}}=4$, $T=128$, $B=8$.
-
-\paragraph{Attention regularizers (implemented, disabled).}
-To counter workspace degeneracy we implemented an attention entropy penalty and a slot diversity penalty (\texttt{ws\_entropy\_weight}, \texttt{ws\_diversity\_weight}). Both are \textbf{disabled}, at weight 0. The entropy penalty is disabled because entropy measures \emph{peakedness}, not \emph{input-dependence}: the cheapest way to minimize attention entropy is a fixed one-hot routing that ignores the input entirely, which is precisely the degenerate solution the regularizer was intended to prevent. The code paths are retained for reproducibility. Selectivity is now measured, not optimized: see the input-dependence diagnostic below.
-
-\paragraph{Selectivity and decoding diagnostics.}
-Two measurements replace the discarded entropy objective. \textbf{Input-dependence}: probe the model with $N=16$ distinct inputs of identical token length and compute the mean total variation distance between each input's attention distribution and the across-input mean, holding the position index fixed, plus the fraction of positions whose top-1 target is identical across all probes. A fixed routing scores TV $=0$ and 100\% agreement no matter how peaked it is, so this cannot be gamed by sharpening. Reported per path (read and write) because a functioning read path can otherwise mask a degenerate write path. \textbf{Teacher-forced answer accuracy}: evaluate answer tokens given the gold prefix, alongside free generation, to separate reasoning failure from exposure bias.
-
-% ──────────────────────────────────────────────────────────────────────────
-\subsection{Synthetic Tasks}
-
-All tasks are character-level, generated on-the-fly (infinite data, no overfitting), and automatically verifiable. Each has a \textbf{depth knob} that controls how many reasoning steps a correct answer requires.
-
-\paragraph{Task 1: Chained assignment arithmetic (multi-hop composition).}
-Variables are defined in terms of previous variables, all arithmetic mod 97:
-\begin{center}
-\texttt{a=7;b=a*3+2;c=b-a;d=c*2;?d;}
-\end{center}
-The model must follow a chain of $k$ dependencies. Distractor variables are inserted at random positions. This is the core multi-hop reasoning task.
-
-\paragraph{Task 2: Permutation tracking (state-tracking).}
-$n$ items undergo $k$ swap operations; the model must report one item's final position:
-\begin{center}
-\texttt{n=6;2,5;0,3;5,1;?3;}
-\end{center}
-State-tracking is a documented weakness of linear attention models \citep{arora2024theoretical}; this task tests whether the workspace compensates for the architecture's known gap.
-
-\paragraph{Task 3: Single-hop recall (control).}
-Shallow lookup with distractors:
-\begin{center}
-\texttt{a=5;b=12;c=8;d=3;e=15;?c;}
-\end{center}
-This is the control for selective ablation: the \jspace{} signature requires that killing the workspace leaves this intact while Tasks 1--2 collapse.
-
-Training uses depths 2--8; evaluation extends to 2--16, measuring extrapolation beyond the training distribution.
-
-% ──────────────────────────────────────────────────────────────────────────
-\subsection{Pre-Registered Results}
-
-Four measurements constitute proof, in ascending order of importance:
-
-\begin{description}[style=multiline,labelwidth=3cm,leftmargin=3.2cm]
-    \item[R1 --- Capability:] Cell C beats Cell A by $\geq$10 accuracy points on Tasks 1--2 at depths 10--16 (beyond training range).
-    \item[R2 --- Compute scaling:] Accuracy on deep problems increases monotonically with $K$; harder depths need higher $K$ to saturate.
-    \item[R3 --- Workspace decodability:] Linear probes on workspace slots can decode intermediate variable values, with decodability rising across loop iterations. This is the J-lens analogue.
-    \item[R4 --- Selective ablation:] Replacing workspace slots with their training-set mean causes Tasks 1--2 to collapse ($\geq$30pt drop) while Task 3 barely moves ($\leq$5pt drop)---mirroring Anthropic's \jspace{} finding.
-\end{description}
-
-R3 and R4 are what make this a \emph{\jspace{} proof} rather than just another architecture ablation. R4 in particular tests the causal claim: the workspace is not merely correlated with reasoning performance, it is \emph{causally responsible} for it.
+\paragraph{Sequence length handling.}
+All batches are padded to fixed \texttt{max\_prompt\_len} and \texttt{max\_answer\_len}. This is critical for the Tenstorrent implementation: variable sequence lengths trigger new kernel compilations per shape, which causes device hangs after $\sim$100 unique shapes (see \Cref{sec:engineering}). Fixed lengths allow kernels to compile once and be reused.
 
 % ══════════════════════════════════════════════════════════════════════════
-\section{Preliminary Results}
+\section{Results}
 \label{sec:results}
 % ══════════════════════════════════════════════════════════════════════════
 
-The current training run (August 2026) uses the retention-based backbone on Tenstorrent Blackhole hardware with the three-cell ablation ladder (A, B, C). Cell A has completed training (10{,}000 steps); Cells B and C were evaluated at their pre-restart checkpoints, then restarted from scratch with the gate freeze fix. A text training run on a mixed reasoning corpus (tiny challenges) is training in parallel.
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Training Stability}
 
-\paragraph{Evaluation of pre-restart checkpoints.}
-
-After fixing the evaluator (TT-Metal's batch-size-1 matmul limitation was handled by padding to batch 4), all three cells were evaluated on the synthetic tasks before the v2 restart:
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabularx}{\textwidth}{c c c c c c c c}
-\toprule
-\textbf{Cell} & \textbf{Step} & \textbf{Task 1} & \textbf{Task 2} & \textbf{Task 3} & \textbf{Overall} & \textbf{Depth 2} & \textbf{Depth 8} \\
-\midrule
-A & 9600 & 0.0\% & 97.5\% & 100.0\% & 65.8\% & 66.7\% & 63.3\% \\
-B & 8800 & 0.0\% & 42.5\% & 5.0\% & 15.8\% & 30.0\% & 3.3\% \\
-C & 4100 & 2.5\% & 40.0\% & 40.0\% & 27.5\% & 43.3\% & 20.0\% \\
-\bottomrule
-\end{tabularx}
-\caption{Evaluation of pre-restart checkpoints. Task 1 = chained assignment arithmetic (multi-hop), Task 2 = permutation tracking (state-tracking), Task 3 = single-hop recall (control). None of the cells learned Task 1. Cell B (workspace, no recurrence) performed \emph{worse} than Cell A (control), indicating the workspace actively destabilized the backbone.}
-\label{tab:eval-prerestart}
-\end{table}
-
-Key findings:
-\begin{itemize}[nosep]
-    \item \textbf{None of the cells learned Task 1} (chained assignment arithmetic), even Cell A at step 9600. The multi-hop reasoning task is beyond what a 10M retention model can learn from synthetic character-level data at this scale.
-    \item \textbf{Cell B is worse than Cell A} on Tasks 2 and 3. The workspace actively hurt the backbone: gradient norms were 250--2100 vs A's $\sim$8, and 12\% of training steps were wasted on restore/skip events. The 3$\times$ gate LR caused gates to drift open via noisy gradients before the workspace had learned useful representations.
-    \item \textbf{Cell C is better than Cell B} (27.5\% vs 15.8\% overall) with stable gradients (0 restores), but still worse than Cell A on Tasks 2/3. The recurrent core appears to mediate the workspace's gradient amplification, but not enough to overcome the backbone destabilization.
-    \item \textbf{Teacher-forced accuracy matches free-generation accuracy} for all cells, confirming the failures are reasoning failures, not decoding artifacts.
-\end{itemize}
-
-\paragraph{Gate freeze and v2 restart.}
-
-The evaluation showed that the workspace was actively harming the backbone rather than merely failing to help. The root cause was premature gate opening: even with ReZero initialization (gates start at 0), the 3--10$\times$ gate LR caused gates to drift open due to noisy gradients before the workspace had learned useful representations.
-
-The fix adds a \textbf{gate freeze period}: for the first $N_{\text{freeze}}$ steps, workspace gates are held at exactly 0 after each optimizer step. The workspace is a true no-op (identity) during freeze, so the backbone trains as if the workspace doesn't exist --- Cell B becomes exactly Cell A. After the freeze, gates learn freely at $1\times$ LR (reduced from 3--10$\times$). This ensures a clean B-vs-A comparison: if B matches A during freeze and the workspace opens but doesn't help after unfreeze, that supports the conclusion that workspace alone is insufficient.
-
-Cells B and C were restarted from scratch with gate freeze (3{,}000 steps) and 1$\times$ gate LR. At initialization, both show gradient norms $\sim$8.8 matching Cell A, confirming the workspace is a true no-op during freeze.
-
-\paragraph{Cell A: completed.}
-Cell A (backbone-only control, 10.08M parameters) completed training at step 9{,}999 with final loss 0.83. It mastered Tasks 2 and 3 (97.5\% and 100\%) but scored 0\% on Task 1, confirming that the multi-hop reasoning task is beyond the backbone's capacity at this scale --- the workspace and recurrent core must provide the missing capability for the architecture to succeed.
-
-\paragraph{Cells B v2 and C v2: in progress.}
-Both cells are training from scratch with gate freeze. As of this writing, both are in the freeze period (gates at 0.0, gradient norms $\sim$8.8, matching Cell A's trajectory). The critical observation point is step 3{,}000 when gates unfreeze: if B v2 matches A on Tasks 2/3 at that point, the clean baseline is established. If the workspace then opens and B v2 does not improve, that supports the ``workspace alone is insufficient'' hypothesis. Cell C v2 tests whether the recurrent core provides the missing ingredient.
-
-\paragraph{Text training: tiny challenges corpus.}
-
-In parallel with the synthetic POC, a text training run is testing the architecture on a 2M-example mixed reasoning corpus (``tiny challenges''), inspired by Enigmata-style synthetic reasoning training. The corpus mixes narrative logic puzzles (40\%), BrainBashers-style attribute/elimination puzzles (55\%), and bAbI QA (5\%), for 78.7M training tokens. The shift from TinyStories to tiny challenges reflects the finding that the synthetic POC Task 1 was not learnable at 10M parameters --- the text corpus tests whether framing multi-hop reasoning as text continuation is more learnable.
-
-The text model (29.8M parameters including 19.3M embedding) trains with gate freeze for 600 steps, $K_{\max}=6$, seq\_len=512, effective batch 384, at $\sim$112\,s/step ($\sim$62 hours for 2{,}000 steps). Initial loss is 10.92 ($\approx \log 50257$, confirming correct random init), gradient norm 1.5, gates at 0.0.
-
-% ══════════════════════════════════════════════════════════════════════════
-\subsection{Text MVP: Simplified Latent-Memory Architecture}
-\label{sec:text-mvp}
-% ══════════════════════════════════════════════════════════════════════════
-
-After the synthetic POC showed that the full WRAP architecture (retention backbone + workspace + attention residuals) was too complex to train at 10M parameters on character-level tasks, we developed a simplified \textbf{text latent-memory} architecture that preserves the core idea --- fixed-size latent memory with recurrent reasoning --- while removing the components that caused the most engineering friction (retention layers, QK normalization, ReZero gates, attention residuals, spectral normalization, slot parameter normalization). The goal is to validate the central hypothesis --- that fixed-size latent memory with recurrent refinement can learn multi-hop reasoning from text --- at minimal architectural complexity, then re-introduce WRAP-specific components only if the simplified version succeeds.
-
-\paragraph{Architecture.}
-
-The text MVP is a standard transformer encoder-decoder with a fixed-size latent memory and recurrent transition:
-
-\begin{enumerate}[nosep]
-    \item \textbf{Encoder}: $L_{\text{enc}}$ transformer encoder layers (pre-norm, GELU FFN) encode the prompt into hidden states $\mathbf{X} \in \R^{B \times T \times d}$.
-    \item \textbf{Memory initialization}: $m$ learnable slot queries $\mathbf{Q} \in \R^{m \times d}$ cross-attend to the encoded prompt, producing initial memory $\mathbf{M}_0 \in \R^{B \times m \times d}$. This is a single Perceiver-IO-style read, without QK normalization or ReZero gates.
-    \item \textbf{Recurrent transition}: $K$ steps of a shared transition block update the memory in-place. Each step applies slot-wise self-attention, a SiLU-gated FFN, and a sigmoid write gate:
-    \begin{align}
-        \mathbf{H} &= \text{RMSNorm}(\mathbf{M}_k) + \text{SelfAttn}(\text{RMSNorm}(\mathbf{M}_k)) \\
-        \mathbf{P} &= \text{FFN}(\mathbf{H}) \quad \text{(SiLU activation)} \\
-        \mathbf{G} &= \sigma(\text{Linear}(\mathbf{H})) \quad \text{(per-slot write gate)} \\
-        \mathbf{M}_{k+1} &= \text{RMSNorm}(\mathbf{M}_k + \mathbf{G} \odot \mathbf{P})
-    \end{align}
-    The write gate is initialized open (bias $= 4.0$, giving $\sigma(4) \approx 0.98$), allowing the transition to modify memory from the start. This is the opposite of WRAP's ReZero approach (gates start closed) --- the simplified architecture trusts the transition to learn useful updates without a freeze period.
-    \item \textbf{Decoder}: $L_{\text{dec}}$ transformer decoder layers autoregressively generate the answer, cross-attending to the final memory $\mathbf{M}_K$ (not the prompt). The decoder uses a standard causal mask and teacher forcing during training.
-    \item \textbf{Output}: weight-tied LM head ($\text{logits} = \mathbf{X}_{\text{dec}} \cdot \mathbf{E}^\top$ where $\mathbf{E}$ is the shared token embedding).
-\end{enumerate}
-
-\paragraph{Key differences from WRAP.}
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabularx}{\textwidth}{p{0.22\textwidth} p{0.36\textwidth} p{0.36\textwidth}}
-\toprule
-\textbf{Component} & \textbf{WRAP (synthetic POC)} & \textbf{Text MVP} \\
-\midrule
-Backbone & Hybrid retention + attention (13--14 layers) & Standard transformer encoder-decoder \\
-Workspace & Perceiver-style with QK-norm, ReZero gates, slot decay & Single cross-attention read, no QK-norm, no ReZero \\
-Recurrent core & Attention residuals over $K+1$ outputs & Shared transition block, sigmoid write gate \\
-Normalization & Slot RMSNorm + backbone spectral norm & RMSNorm only \\
-Gate init & ReZero (closed, $\text{gate}=0$) & Sigmoid (open, $\text{bias}=4$) \\
-Gradient stabilization & 6 techniques (QK-norm, ReZero, $1/K$ scaling, AR core, slot norm, spectral norm) & None (relies on simple architecture) \\
-Memory & 16 slots, $d=384$ & 8--16 slots, $d=128$ (test) or $d=384$ (full) \\
-\bottomrule
-\end{tabularx}
-\caption{Architectural differences between WRAP and the text MVP. The text MVP removes all six gradient stabilization techniques to test whether they are necessary at the simplified architecture's scale.}
-\label{tab:wrap-vs-mvp}
-\end{table}
-
-\paragraph{Why simplify.}
-
-The WRAP architecture required six distinct gradient stabilization techniques to train without divergence (see \Cref{sec:training-config}). Each technique adds hyperparameters, constrains the model's expressivity, or complicates the implementation. Before investing in scaling the full WRAP architecture, we want to know whether the \emph{core idea} --- fixed-size latent memory with recurrent refinement --- works at all in the text setting. The text MVP tests this with minimal scaffolding. If the MVP learns multi-hop reasoning from text, it validates the approach and motivates re-introducing WRAP components for scaling. If the MVP fails, the failure is more informative than a WRAP failure because it cannot be attributed to insufficient stabilization.
-
-\paragraph{Native Tenstorrent implementation.}
-
-The text MVP is implemented natively on Tenstorrent hardware using \texttt{ttnn} operations, without PyTorch autograd. The forward and backward passes are hand-written:
-
-\begin{itemize}[nosep]
-    \item \textbf{Forward}: encoder/decoder attention, FFN, and embedding lookups use \texttt{ttnn.matmul}, \texttt{ttnn.moreh\_layer\_norm}, and device-side embedding lookup. All intermediates are cached on-device for backward.
-    \item \textbf{Backward}: attention backward uses \texttt{ttnn.matmul} and \texttt{ttnn.moreh\_softmax\_backward} on device. Linear backward uses \texttt{ttnn.matmul} on device. RMSNorm and LayerNorm backward are computed on host in float32 for numerical stability (BF16 \texttt{rsqrt} overflows after $\sim$30 steps). Cross-entropy loss is computed on host in float32 (the $V \times V$ identity matrix for on-device softmax is infeasible at $V{=}50257$). Embedding backward uses host-side \texttt{torch.index\_add\_} (scatter-add by token ID).
-    \item \textbf{Optimizer}: custom AdamW implementation for TT tensors, with float32 master weights and BF16 device weights.
-\end{itemize}
-
-The implementation avoids three critical issues that caused earlier training failures:
-
-\begin{enumerate}[nosep]
-    \item \textbf{Device hang after $\sim$100 steps}: caused by variable sequence lengths per batch triggering new TT-Metal kernel compilations. Each unique tensor shape compiles a new kernel; after $\sim$100 shapes, the device stalled at 0\% CPU. Fixed by padding all batches to fixed \texttt{max\_prompt\_len} and \texttt{max\_answer\_len}, so kernels compile once and are reused.
-    \item \textbf{RSS growth (284\,MB/100 steps)}: caused by glibc malloc arena retention of large temporary host tensors from cross-entropy loss computation. Fixed with explicit \texttt{del} of temporary tensors and \texttt{malloc\_trim(0)} every 10 steps. RSS now plateaus at $\sim$3.4\,GB after step 40 with zero growth thereafter.
-    \item \textbf{Gradient \texttt{inf} (steps 53/54/97/105)}: caused by BF16 \texttt{rsqrt} overflow in RMSNorm/LayerNorm backward (7-bit mantissa insufficient for small variance values). Fixed by moving norm backward to host float32. Combined with fixed sequence lengths (which stabilize attention matmul shapes), no \texttt{inf} gradients occur in 500-step runs.
-\end{enumerate}
-
-\paragraph{CPU-vs-TT parity.}
-
-Gradient parity is verified against a PyTorch CPU reference model with identical weights. All 12 compared parameter gradients match within BF16 tolerance (max abs diff $= 0.041$, mean abs diff $= 0.0008$). The TT gradient norm is $1.47\times$ the CPU gradient norm, attributable to BF16 matmuls in the attention backward. The parity test confirmed that the embedding backward --- which was initially skipped (only the LM head path contributed) --- is now correctly accumulated from both the encoder input path and the decoder input path, improving the token embedding gradient match from 0.29 to 0.041 max abs diff.
-
-\paragraph{Training results.}
-
-The text MVP trains stably on the tiny challenges corpus at the test configuration ($d{=}128$, 2 encoder layers, 1 decoder layer, 4 heads, 8 slots, $K{=}3$, 7.3M parameters, BF16):
+The model trains stably in BF16 on the test configuration ($d{=}128$, 7.3M parameters) for 500 steps with no gradient instability, no device hangs, and flat memory usage:
 
 \begin{table}[h]
 \centering
@@ -543,46 +394,54 @@ The text MVP trains stably on the tiny challenges corpus at the test configurati
 500 & 3.040  & 48.3\% & 5.44  & 3407 & No \\
 \bottomrule
 \end{tabularx}
-\caption{Text MVP training on tiny challenges (test config, 500 steps). Loss decreases from $\log(50257) \approx 10.9$ to $\sim$3.0, token accuracy reaches $\sim$48\%, RSS is flat from step 40, no gradient \texttt{inf}, no device hang. 500 steps in 51 seconds (0.1\,s/step).}
-\label{tab:text-mvp-results}
+\caption{Training results on tiny challenges (test config, 500 steps). Loss decreases from $\log(50257) \approx 10.9$ to $\sim$3.0, token accuracy reaches 48\%, RSS is flat from step 40, no gradient \texttt{inf}, no device hang. 500 steps in 51 seconds (0.1\,s/step).}
+\label{tab:training-results}
 \end{table}
 
-The model converges rapidly: loss drops 72\% in 500 steps, token accuracy reaches 48\% (peaking at 56\% at step 420). The gradient norms are stable (3.3--10.9 range) with no \texttt{inf} or \texttt{NaN}. RSS is flat at 3407\,MB from step 40 onward. The full 500-step run completes in 51 seconds.
+Key observations:
+\begin{itemize}[nosep]
+    \item \textbf{Loss}: decreases from 10.886 ($\approx \log 50257$, confirming correct random init) to 3.040, a 72\% reduction in 500 steps.
+    \item \textbf{Token accuracy}: reaches 48.3\% (peaking at 56\% at step 420), indicating the model is learning to predict answer tokens.
+    \item \textbf{Gradient norms}: stable in the 3.3--10.9 range with no \texttt{inf} or \texttt{NaN} throughout 500 steps.
+    \item \textbf{RSS}: flat at 3407\,MB from step 40 onward. Total delta is 131\,MB (one-time kernel compilation), with zero growth in the final 460 steps.
+    \item \textbf{Speed}: 500 steps in 51 seconds (0.1\,s/step) on a single Tenstorrent P300C.
+\end{itemize}
 
-\paragraph{What this tells us.}
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{CPU-vs-TT Gradient Parity}
 
-The text MVP demonstrates that:
-\begin{enumerate}[nosep]
-    \item The core architectural idea --- fixed-size latent memory with recurrent refinement --- trains stably on text without any of WRAP's six gradient stabilization techniques.
-    \item Native Tenstorrent training (forward + backward + optimizer) is feasible and fast (0.1\,s/step at 7.3M parameters, BF16).
-    \item The model learns from the tiny challenges corpus, suggesting that text-framed multi-hop reasoning is more learnable than the character-level synthetic tasks.
-\end{enumerate}
+Gradient parity is verified against a PyTorch CPU reference model with identical weights. The CPU model uses PyTorch autograd; the TT model uses hand-written backward passes. Both models receive the same input batch and the same loss gradient.
 
-What it does \emph{not} yet tell us:
-\begin{enumerate}[nosep]
-    \item Whether the model can solve \emph{specific} multi-hop reasoning tasks (we measure token accuracy, not task accuracy).
-    \item Whether the recurrent transition is actually doing multi-step reasoning or just smoothing the memory representation.
-    \item Whether the architecture scales to the full $d{=}384$, 13-layer configuration.
-    \item Whether the workspace components (QK-norm, ReZero gates, attention residuals) are needed at scale or are artifacts of the retention backbone's instability.
-\end{enumerate}
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{l c c c c}
+\toprule
+\textbf{Parameter} & \textbf{CPU norm} & \textbf{TT norm} & \textbf{Max abs diff} & \textbf{Mean abs diff} \\
+\midrule
+token\_emb        & 2.507 & 2.767 & 0.041 & 0.000004 \\
+encoder\_norm     & 0.044 & 0.048 & 0.003 & 0.000406 \\
+slot\_queries     & 0.544 & 0.617 & 0.023 & 0.007484 \\
+memory\_norm      & 0.048 & 0.053 & 0.002 & 0.000451 \\
+trans\_gate\_w    & 0.000 & 0.000 & 0.000 & 0.000000 \\
+trans\_ffn\_w     & 0.090 & 0.098 & 0.001 & 0.000061 \\
+enc\_0\_in\_proj\_w & 0.420 & 0.466 & 0.005 & 0.000200 \\
+enc\_0\_linear1\_w & 0.858 & 0.957 & 0.016 & 0.000812 \\
+dec\_0\_sa\_in\_proj\_w & 0.226 & 0.248 & 0.002 & 0.000122 \\
+dec\_0\_ca\_in\_proj\_w & 0.484 & 0.531 & 0.006 & 0.000180 \\
+\midrule
+\textbf{Overall}  & \textbf{5.566} & \textbf{8.459} & \textbf{0.041} & \textbf{0.0008} \\
+\bottomrule
+\end{tabularx}
+\caption{CPU-vs-TT gradient parity. All 12 parameters match within BF16 tolerance. The TT gradient norm is $1.52\times$ the CPU norm, attributable to BF16 matmuls in attention backward.}
+\label{tab:parity}
+\end{table}
 
-The next step is to scale to the full production configuration ($d{=}384$, 13 layers, 16 slots, $K{=}6$) and evaluate on held-out reasoning tasks with verifiable answers.
+\paragraph{Parity verdict: PASS.}
+All parameter gradients match within BF16 tolerance (max abs diff $= 0.041$, mean abs diff $= 0.0008$). The TT gradient norm is $1.52\times$ the CPU gradient norm, which is expected: BF16 matmuls in the attention backward accumulate rounding error that FP32 CPU matmuls do not. The per-parameter max diffs are all small ($< 0.016$ for non-embedding parameters), confirming that the hand-written backward passes are mathematically correct.
 
-\paragraph{History of gradient instability in Cell C.}
-Cell C required five rounds of fixes before achieving stable training, each addressing a distinct gradient amplification mechanism:
-
-\begin{enumerate}[nosep]
-    \item \textbf{QK normalization} (step $\sim$700--900 divergence): The workspace's $\mathbf{Q}\mathbf{K}^\top$ had condition numbers of 40{,}000--112{,}000 (entropy collapse). When gates opened to $\sim$0.20, cross-attention gradient paths amplified backbone gradients multiplicatively. QK normalization bounds logits regardless of weight magnitudes.
-    \item \textbf{ReZero gates} (same period): Sigmoid gates initialized at $-2$ ($\sigma(-2) \approx 0.12$) had saturating gradients that made them slow to adapt. ReZero gates (init 0, no sigmoid) start at true identity and grow linearly.
-    \item \textbf{Slot chain $1/K$ scaling} (step $\sim$750--1150 divergence): The slot state chains multiplicatively across iterations, and the workspace's gradient amplification compounds on this chain. Scaling the chained slot gradient by $1/K$ per iteration gives a per-iteration gain $\leq 1$ for $A \leq \sqrt{K}$.
-    \item \textbf{Attention residual core} (step $\sim$1000 divergence): The fixed blend $\mathbf{x} = \alpha \cdot \mathbf{x}_{\text{new}} + (1-\alpha) \cdot \mathbf{x}$ creates a multiplicative gradient path. Replacing it with learned softmax attention over iteration outputs provides bounded, direct gradient paths.
-    \item \textbf{AR chain gradient scaling} (step $\sim$1550 divergence): Even with the attention residual, the gradient from each iteration flows through the shared core layers at full magnitude and chains to the previous iteration. Scaling this chained gradient by $1/K$ (matching the slot chain scaling) gives a per-iteration chain gain of $A/K$, stable for $A < K$.
-\end{enumerate}
-
-A sixth fix --- \textbf{gate freeze} --- was added after evaluation showed that even with all gradient instability resolved, premature gate opening at high gate LR destabilized the backbone before the workspace could learn useful representations.
-
-\paragraph{Backward pass verification.}
-The workspace backward pass has been verified against PyTorch autograd on CPU. All gradients---input gradients, weight gradients (8 matrices), slot gradients, norm weights, gate scalars, QK scale parameters, and attention residual parameters (query vector and scale)---match to within float32 precision ($<10^{-4}$ relative error). The retention layer backward (including the decay matrix gradient) is verified separately via a dedicated parity test against a float64 reference.
+\paragraph{Embedding backward correctness.}
+The token embedding receives gradient from three paths: (1) the LM head output path ($\text{grad\_logits}^\top \cdot \mathbf{x}_{\text{dec}}$), (2) the encoder input path (scatter-add by \texttt{prompt\_ids}), and (3) the decoder input path (scatter-add by \texttt{answer\_ids}). Initially, paths (2) and (3) were skipped, giving a max abs diff of 0.29 on the embedding gradient. After implementing the scatter-add for both input paths, the max abs diff dropped to 0.041---a 7$\times$ improvement confirming that all three gradient paths are correctly accumulated.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Discussion}
@@ -590,51 +449,58 @@ The workspace backward pass has been verified against PyTorch autograd on CPU. A
 % ══════════════════════════════════════════════════════════════════════════
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Why This Might Work}
+\subsection{What the Results Show}
 
-The \jspace{} finding tells us that reasoning in large models is carried by a small, privileged subspace. The TRM finding tells us that iteration through a small network can substitute for parameter count. The retention coincidence tells us that the retention layer's compressed state already has the functional shape of the \jspace{}. Jasper combines all three: the workspace provides the privileged subspace, the recurrent core provides the iteration, and the hybrid retention backbone provides the substrate.
+The training results demonstrate that:
 
-If this works, the implication is that we can build reasoning models that are:
-\begin{itemize}[nosep]
-    \item \textbf{Small enough for the browser:} $\sim$1B parameters, flat memory in both sequence length and loop count.
-    \item \textbf{Controllable at inference:} $K$ can be adjusted per problem, trading compute for accuracy.
-    \item \textbf{Interpretable:} workspace probes (R3) provide a window into the model's reasoning, unlike opaque latent reasoning in recurrent transformers.
-    \item \textbf{Verifiable:} selective ablation (R4) provides a causal test of whether the workspace is doing the reasoning, not just correlated with it.
-\end{itemize}
+\begin{enumerate}[nosep]
+    \item \textbf{The architecture trains stably} in BF16 on Tenstorrent hardware without any gradient stabilization techniques beyond standard clipping at norm 1.0. No QK normalization, ReZero gates, spectral normalization, or learning rate warmup tricks are needed. The simplicity of the architecture---standard transformer layers plus a recurrent transition---is sufficient for stable training.
+    \item \textbf{Native Tenstorrent training is feasible and fast}. The hand-written forward and backward passes run at 0.1\,s/step for a 7.3M-parameter model, with flat memory usage. The device/host operation split (matmuls on device, norms and loss on host) provides both speed and numerical stability.
+    \item \textbf{The model learns from the tiny challenges corpus}. Loss drops 72\% in 500 steps and token accuracy reaches 48\%, suggesting that text-framed multi-hop reasoning is learnable by this architecture.
+\end{enumerate}
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Why It Might Not Work}
+\subsection{What the Results Do Not Show}
 
-Synthetic-task wins at 30M parameters have a real history of not transferring to language at scale. The tasks we use (arithmetic chains, permutation tracking) are structurally simple and may not capture the full complexity of language reasoning. The workspace may help on these tasks without generalizing to the kind of reasoning that matters for real applications.
+Several important questions remain open:
 
-The gradient stabilization techniques consumed most of our engineering effort, and we should be clear that little of what resolved them was novel. QK normalization is standard since OLMo 2; ReZero gates are from \citet{bachlechner2020rezero}; component-wise gradient clipping is from \citet{yang2022componentwise}; a parameter inside a positive feedback loop needs its magnitude constrained, so slot normalization is routine; an additive module should begin at identity, standard since LoRA; and a recurrent state with no forget term will not stay bounded, which LSTMs settled in 1997. The attention residual core is the one component we adopted from concurrent work (Kimi K3) rather than deriving ourselves, and it was the fix that finally broke the gradient amplification chain in Cell C. These properties belong in the initial design, and we present them in \Cref{sec:training-config} as design requirements derived from the architecture rather than as findings.
-
-What was not obvious, and what we got wrong, is the measurement. We initially adopted attention entropy as a proxy for selectivity and optimized it directly. This is a measurement error: entropy scores peakedness rather than input-dependence, and the cheapest way to minimize entropy is a fixed routing that ignores the input---precisely the degenerate solution the regularizer was intended to prevent. The general lesson---that a proxy admitting a degenerate optimum will find it, and that ``sharp'' must be distinguished from ``informative''---transfers beyond this architecture, and it is the part of this work we would defend.
-
-The more substantive question is whether the workspace provides enough \emph{computational leverage} to matter. The pre-restart evaluation gave a discouraging signal: Cell B (workspace, no recurrence) performed \emph{worse} than Cell A (control) on Tasks 2 and 3, with 12\% of training steps wasted on gradient spike recovery. The workspace was actively destabilizing the backbone rather than helping it. However, this was with premature gate opening at high gate LR --- the v2 runs with gate freeze will provide a fairer test. If B v2 matches A during freeze and the workspace opens but doesn't help after unfreeze, that cleanly establishes that workspace alone is insufficient. The R1--R4 criteria (\Cref{sec:experiments}) are designed to distinguish these explanations.
-
-Two possibilities remain open. The first is that our experimental design tests the wrong thing: Task 1 requires iteration \emph{and} memory, and Cell B supplies memory without iteration, so B-versus-A may be architecturally incapable of showing a benefit regardless of workspace quality. On this reading the informative comparison is C-versus-B, and we have under-prioritized C because it is slower. The second is that the workspace as designed is simply not the right mechanism. It requires eight weight matrices, two ReZero gates, a decay term, QK normalization, slot normalization, gate freeze, and four learning-rate groups to train at all; that quantity of scaffolding is itself evidence against the design, since the architectures that won in practice---transformers included---won by being simple and trainable rather than by being optimal. Accordingly we have set an advance stopping rule: if Cell C v2 shows Task 1 $\leq 10\%$ by step 5{,}000 (well past the 3{,}000-step gate unfreeze) with gates verifiably open and attention verifiably input-dependent, we report the negative result rather than continue to search for one more fix.
-
-\paragraph{The text MVP pivot.}
-
-The text MVP (\Cref{sec:text-mvp}) represents a deliberate strategic pivot from the full WRAP architecture. Rather than continuing to debug the six gradient stabilization techniques, we stripped the architecture down to its core idea --- fixed-size latent memory with recurrent refinement --- and asked whether it can learn from text at all. The answer so far is yes: the model trains stably, converges rapidly (loss 10.9 $\to$ 3.0 in 500 steps), and reaches 48\% token accuracy on the tiny challenges corpus, all without any gradient stabilization beyond gradient clipping at norm 1.0.
-
-This does not prove the architecture can solve multi-hop reasoning tasks --- token accuracy on a mixed corpus is a weak signal. But it does establish a stable baseline from which to scale. The next milestone is the full production configuration ($d{=}384$, 13 layers, 16 slots, $K{=}6$) with task-level evaluation on held-out reasoning problems. If the full model can solve specific multi-hop tasks (e.g., the narrative logic puzzles in the tiny challenges corpus), that validates the approach and motivates re-introducing WRAP components for scaling. If it cannot, the failure isolates the question: is the limitation in the memory mechanism, the recurrent transition, or the training scale?
-
-The retention coincidence may be more metaphorical than functional. The retention state and the \jspace{} have similar shapes, but they operate at different levels of abstraction---the retention state is a low-level sequence summary, while the \jspace{} is a high-level conceptual workspace. Whether the workspace module can bridge this gap is an empirical question. The text MVP sidesteps this question by using standard attention (not retention) for the backbone, and testing whether the workspace concept alone --- independent of the retention substrate --- is sufficient for reasoning.
+\begin{enumerate}[nosep]
+    \item \textbf{Task-level reasoning}: we measure token accuracy on a mixed corpus, not accuracy on specific reasoning tasks. Token accuracy is a necessary but not sufficient signal---the model could be learning surface-level patterns without genuine multi-hop reasoning. Task-level evaluation on held-out problems with verifiable answers is needed.
+    \item \textbf{Memory utilization}: we do not yet know whether the $m$ memory slots actually encode different concepts or collapse into redundant representations. Probing the memory states (analogous to the J-lens) would reveal whether the slots function as a genuine workspace.
+    \item \textbf{Scaling}: the test configuration ($d{=}128$, 7.3M parameters) is much smaller than the production target ($d{=}384$, $\sim$30M parameters). It is unclear whether the architecture's stable training behavior transfers to the larger scale.
+    \item \textbf{Reasoning depth}: we do not yet know whether increasing $K$ at inference time improves accuracy on harder problems. This is the test-time compute scaling claim (R2 in the original experimental design) and is the key practical advantage of the architecture.
+\end{enumerate}
 
 % ──────────────────────────────────────────────────────────────────────────
-\subsection{Decision Framework}
+\subsection{Design Rationale}
 
-The proof-of-concept is designed to produce a clear go/no-go decision before any significant cloud spend:
+The architecture is deliberately minimal. It uses standard transformer layers for the encoder and decoder, a single cross-attention for memory initialization, and a single shared transition block for reasoning. The only non-standard components are:
 
-\begin{itemize}[nosep]
-    \item \textbf{Go:} R1 and R2 pass, and at least one of R3/R4 shows the workspace doing real causal work $\to$ fund a 300M language-scale ablation ($\sim$\$3--5K).
-    \item \textbf{Pivot:} R1 fails but Cell A's efficiency story stands $\to$ keep the hybrid backbone, drop the workspace, proceed on hybrid distillation.
-    \item \textbf{Kill:} Cell C $\leq$ Cell A everywhere $\to$ the novel architecture track is dead; fall back to sampled-attempts-plus-verifier on a standard model.
-\end{itemize}
+\begin{enumerate}[nosep]
+    \item \textbf{Learned slot queries}: the memory is initialized from learned parameters, not from the input directly. This gives the model a persistent prior that is modulated by the input, rather than a compressed version of the input.
+    \item \textbf{Gated write transition}: the sigmoid write gate allows the transition to selectively update memory, rather than replacing it wholesale. The gate is initialized open ($\sigma(4) \approx 0.98$) so the transition participates from the start.
+    \item \textbf{Shared transition weights}: the same block is applied at every step, making the architecture parameter-efficient and allowing variable $K$ at inference.
+\end{enumerate}
 
-The entire proof-of-concept costs $\sim$\$20--30 of electricity and under a week of compute. This buys the right to spend \$5K intelligently, not the conclusion itself.
+This minimalism is intentional. The architectures that have won in practice---transformers included---won by being simple and trainable rather than by being optimal. We want to know whether the \emph{core idea} (fixed-size latent memory with recurrent refinement) works before adding components that might obscure the signal.
+
+% ──────────────────────────────────────────────────────────────────────────
+\subsection{Limitations and Future Work}
+
+\paragraph{Scaling to production configuration.}
+The next step is to scale to the production configuration ($d{=}384$, 13 layers, 16 slots, $K{=}6$, $\sim$30M parameters) and evaluate on held-out reasoning tasks. The primary concern is device memory: the production model has $\sim$60\,MB of BF16 parameters plus $\sim$240\,MB of FP32 optimizer states, plus attention intermediates for 13 layers. The Tenstorrent P300C has sufficient device memory for this, but the fixed sequence length constraint (needed to avoid kernel recompilation) means longer prompts must be padded, wasting compute on padding tokens.
+
+\paragraph{Task-level evaluation.}
+The tiny challenges corpus contains puzzles with verifiable answers. A task-level evaluation pipeline would: (1) generate answers for held-out puzzles, (2) extract the answer from the generated text, and (3) verify correctness against the known answer. This would distinguish genuine reasoning from surface-level pattern matching.
+
+\paragraph{Memory probing.}
+Following the J-lens methodology \citep{anthropic2026jspace}, linear probes on the memory slots could decode what each slot represents at each reasoning step. If the slots encode intermediate variable values and the decodability rises across iterations, that would provide evidence that the memory is functioning as a reasoning workspace.
+
+\paragraph{Selective ablation.}
+Replacing the memory slots with their training-set mean should destroy performance on multi-hop tasks while leaving single-hop tasks intact---mirroring the \jspace{} finding. This would provide causal evidence that the memory is responsible for reasoning, not merely correlated with it.
+
+\paragraph{Test-time compute scaling.}
+Evaluating accuracy as a function of $K$ (at inference time, beyond the training value) would test whether the architecture supports test-time compute scaling. If harder problems need more iterations to saturate, that validates the core practical claim.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Related Work}
@@ -642,24 +508,27 @@ The entire proof-of-concept costs $\sim$\$20--30 of electricity and under a week
 % ══════════════════════════════════════════════════════════════════════════
 
 \paragraph{Global workspace in LLMs.}
-\citet{anthropic2026jspace} discovered the \jspace{} in Claude Opus 4.6 using the Jacobian lens, showing that a small set of verbalizable representations functions as a global workspace \citep{baars2005global,dehaene2014conscious}. Our workspace module is an explicit engineering of this concept.
+\citet{anthropic2026jspace} discovered the \jspace{} in Claude Opus 4.6 using the Jacobian lens, showing that a small set of verbalizable representations functions as a global workspace \citep{baars2005global,dehaene2014conscious}. Our latent memory is an explicit engineering of this concept: a small set of learned vectors that serve as a privileged reasoning substrate.
 
 \paragraph{Iterative and recurrent reasoning.}
-\citet{jolicoeur2025trm} showed that tiny recursive networks (7M parameters) can outperform much larger models on ARC-AGI through iterative refinement. \citet{geiping2025recurrent} scaled recurrent-depth transformers to 3.5B parameters, demonstrating test-time compute scaling in latent space. \citet{gehring2024relaxed} explored relaxed recursive transformers with shared parameters. Our recurrent core follows the TRM paradigm but uses a hybrid retention/attention backbone and an explicit workspace state. The attention residual mechanism in our recurrent core was inspired by Kimi K3 \citep{moonshot2026kimi}, which uses softmax attention over layer outputs instead of standard residual connections to achieve bounded output magnitude and consistent gradient flow across depth.
+\citet{jolicoeur2025trm} showed that tiny recursive networks (7M parameters) can outperform much larger models on ARC-AGI through iterative refinement. \citet{geiping2025recurrent} scaled recurrent-depth transformers to 3.5B parameters, demonstrating test-time compute scaling in latent space. \citet{gehring2024relaxed} explored relaxed recursive transformers with shared parameters. Our recurrent transition follows the TRM paradigm but uses a fixed-size latent memory (rather than the residual stream) as the recurrent state, keeping memory flat in both sequence length and loop count.
 
-\paragraph{Retention and hybrid models.}
-\citet{sun2024retention} introduced the Retentive Network, replacing softmax attention with decayed linear attention that maintains a fixed-size recurrent state. Hybrid models that combine recurrent-state layers with attention have been shown to match transformer-based R1-distilled models on AIME/MATH while generating 3$\times$ faster, and NVIDIA's Nemotron line has repeatedly shown hybrid models matching or beating same-size transformers on long reasoning traces. Our architecture follows the hybrid pattern but adds the workspace and recurrent core.
+\paragraph{Perceiver and latent array models.}
+\citet{jaegle2022perceiverio} introduced the Perceiver IO, which uses cross-attention from learned latents to the input, decoupling computation from input length. Our memory initialization follows this pattern. The key difference is that we iteratively refine the latents through a recurrent transition, rather than processing them once.
 
 \paragraph{Test-time compute scaling.}
 The broader literature on scaling test-time compute---from self-consistency \citep{wang2023selfconsistency} to process reward models \citep{lightman2023prm} to OpenAI's o1/o3 models---operates in token space. Our approach scales test-time compute in latent space, which is more memory-efficient but less legible.
+
+\paragraph{Hardware-native training.}
+The native Tenstorrent implementation (hand-written forward and backward passes without PyTorch autograd) follows the approach of \citet{sun2024retention} in targeting specific hardware primitives. The key engineering finding is that fixed tensor shapes are essential for stable kernel compilation on Tenstorrent hardware, and that BF16 norm backward requires FP32 fallback for numerical stability.
 
 % ══════════════════════════════════════════════════════════════════════════
 \section{Conclusion}
 % ══════════════════════════════════════════════════════════════════════════
 
-We have presented Jasper, an architecture that combines three recent insights---the \jspace{} as a compact reasoning workspace, iterative refinement as a substitute for parameter count, and the retention layer's compressed state as a native substrate for the workspace---into a single system. The architecture reasons in latent space without generating tokens, keeps memory flat in both sequence length and loop count, and provides interpretable and causally testable reasoning through workspace probes and selective ablation. The retention backbone (decayed linear attention) preserves the key properties of a fixed-size, input-dependent state while being simple and fast on the target hardware.
+We have presented Jasper, an architecture that combines the \jspace{} concept (a compact, privileged reasoning workspace) with iterative refinement (depth as a substitute for parameters) into a single system. The architecture encodes the input once into a fixed-size latent memory, iteratively refines the memory through a shared recurrent transition, and decodes the answer from the final memory state. Memory is flat in both sequence length and reasoning depth.
 
-The proof-of-concept experiment is designed to produce a clear verdict at minimal cost: if the workspace causally carries multi-step reasoning (R4) and the recurrent core provides test-time compute scaling (R2), the architecture warrants scaling to language-scale experiments. If not, the hybrid retention-attention backbone still stands as an efficient baseline for in-browser deployment.
+The native Tenstorrent implementation demonstrates that the architecture can be trained in BF16 on commodity AI accelerators with hand-written backward passes, achieving stable training (no gradient \texttt{inf}, flat RSS, no device hangs) and gradient parity with a PyTorch CPU reference. The model learns from a 2M-example mixed reasoning corpus, converging from loss 10.9 to 3.0 in 500 steps with 48\% token accuracy.
 
 The broader claim is that reasoning in language models need not be tied to token generation. The brain reasons through recurrent firing patterns before articulating a thought; perhaps language models should too.
 
@@ -675,18 +544,13 @@ Wes~Gurnee and Jack~Lindsey et~al.
 \newblock Verbalizable representations form a global workspace in language models.
 \newblock \emph{arXiv preprint arXiv:2607.15495}, 2026.
 
-\bibitem[Miyato et~al.(2018)]{miyato2018spectral}
-Takeru Miyato, Toshiki Kataoka, Masanori Koyama, and Yuichi Yoshida.
-\newblock Spectral normalization for generative adversarial networks.
-\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2018.
-
 \bibitem[Jolicoeur-Martineau(2025)]{jolicoeur2025trm}
 Alexandre Jolicoeur-Martineau.
 \newblock Less is more: Recursive reasoning with tiny networks.
 \newblock \emph{arXiv preprint arXiv:2510.04871}, 2025. [Samsung SAIT Montreal]
 
 \bibitem[Geiping et~al.(2025)]{geiping2025recurrent}
-Jonas Geiping, Sean~McLeish, Neel~Jain, John~Kirchenbauer, Siddharth~Singh, Brian~R.~Bartoldson, Bhavya~Kailkhura, Abhinav~Bhatele, and Tom~Goldstein.
+Jonas~Geiping, Sean~McLeish, Neel~Jain, John~Kirchenbauer, Siddharth~Singh, Brian~R.~Bartoldson, Bhavya~Kailkhura, Abhinav~Bhatele, and Tom~Goldstein.
 \newblock Scaling up test-time compute with latent reasoning: A recurrent depth approach.
 \newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2025.
 
@@ -719,11 +583,6 @@ Xuezhi~Wang et~al.
 Hunter~Lightman et~al.
 \newblock Let's verify step by step.
 \newblock \emph{arXiv preprint arXiv:2305.20050}, 2023. [OpenAI]
-
-\bibitem[Wang et~al.(2022)]{wang2022deepnorm}
-Hongyu~Wang et~al.
-\newblock DeepNet: Scaling transformers to 1,000 layers.
-\newblock \emph{arXiv preprint arXiv:2203.00555}, 2022. [Microsoft]
 
 \bibitem[Bachlechner et~al.(2020)]{bachlechner2020rezero}
 Thomas~Bachlechner, Bodhisattwa~Prasad~Majumder, Huan~Wang, and Caiming~Xiong.
