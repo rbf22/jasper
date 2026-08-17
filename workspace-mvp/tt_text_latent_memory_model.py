@@ -62,13 +62,14 @@ def from_device(tensor: "ttnn.Tensor") -> torch.Tensor:
 class TTRMSNorm:
     """RMSNorm using ttnn.rms_norm — same as model_ttnn.py."""
 
-    def __init__(self, d: int, device, eps=1e-6):
+    def __init__(self, d: int, device, eps=1e-6, dtype=ttnn.bfloat16):
         self.d = d
         self.eps = eps
         self.device = device
+        self.dtype = dtype
         self.weight = ttnn.from_torch(
-            torch.ones(d, dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            torch.ones(d, dtype=torch.bfloat16 if dtype == ttnn.bfloat16 else torch.float32),
+            dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
         )
 
     def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
@@ -78,17 +79,19 @@ class TTRMSNorm:
 class TTLayerNorm:
     """LayerNorm using ttnn.layer_norm — matches PyTorch nn.LayerNorm."""
 
-    def __init__(self, d: int, device, eps=1e-5):
+    def __init__(self, d: int, device, eps=1e-5, dtype=ttnn.bfloat16):
         self.d = d
         self.eps = eps
         self.device = device
+        self.dtype = dtype
+        torch_dtype = torch.bfloat16 if dtype == ttnn.bfloat16 else torch.float32
         self.weight = ttnn.from_torch(
-            torch.ones(d, dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            torch.ones(d, dtype=torch_dtype),
+            dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
         )
         self.bias = ttnn.from_torch(
-            torch.zeros(d, dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            torch.zeros(d, dtype=torch_dtype),
+            dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
         )
 
     def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
@@ -101,15 +104,17 @@ class TTLinear:
     ttnn.linear(x, W) computes x @ W, so W must be (in_features, out_features).
     """
 
-    def __init__(self, in_features: int, out_features: int, device, bias=True):
+    def __init__(self, in_features: int, out_features: int, device, bias=True, dtype=ttnn.bfloat16):
         self.device = device
         self.has_bias = bias
+        self.dtype = dtype
+        torch_dtype = torch.bfloat16 if dtype == ttnn.bfloat16 else torch.float32
         # NOTE: ttnn.linear(x, W) computes x @ W, so W is (in, out) — transposed from PyTorch
-        w = torch.randn(in_features, out_features, dtype=torch.bfloat16) * 0.02
-        self.weight = to_device(w, device)
+        w = torch.randn(in_features, out_features, dtype=torch_dtype) * 0.02
+        self.weight = to_device(w, device, dtype=dtype)
         if bias:
-            b = torch.zeros(out_features, dtype=torch.bfloat16)
-            self.bias = to_device(b, device)
+            b = torch.zeros(out_features, dtype=torch_dtype)
+            self.bias = to_device(b, device, dtype=dtype)
         else:
             self.bias = None
 
@@ -129,32 +134,34 @@ class TTMultiHeadAttention:
     - out_proj.bias: (d_model,)
     """
 
-    def __init__(self, d_model: int, n_heads: int, device, dropout=0.0):
+    def __init__(self, d_model: int, n_heads: int, device, dropout=0.0, dtype=ttnn.bfloat16):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.scale = 1.0 / (self.d_head ** 0.5)
         self.device = device
+        self.dtype = dtype
+        torch_dtype = torch.bfloat16 if dtype == ttnn.bfloat16 else torch.float32
 
         # Combined QKV projection: (d_model, 3*d_model) for ttnn.linear
         self.in_proj_weight = to_device(
-            torch.randn(d_model, 3 * d_model, dtype=torch.bfloat16) * 0.02, device
+            torch.randn(d_model, 3 * d_model, dtype=torch_dtype) * 0.02, device, dtype=dtype
         )
         self.in_proj_bias = to_device(
-            torch.zeros(3 * d_model, dtype=torch.bfloat16), device
+            torch.zeros(3 * d_model, dtype=torch_dtype), device, dtype=dtype
         )
         # Output projection
         self.out_proj_weight = to_device(
-            torch.randn(d_model, d_model, dtype=torch.bfloat16) * 0.02, device
+            torch.randn(d_model, d_model, dtype=torch_dtype) * 0.02, device, dtype=dtype
         )
         self.out_proj_bias = to_device(
-            torch.zeros(d_model, dtype=torch.bfloat16), device
+            torch.zeros(d_model, dtype=torch_dtype), device, dtype=dtype
         )
 
         # Cache scale as device tensor
         self._scale_tt = ttnn.from_torch(
-            torch.tensor([self.scale], dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            torch.tensor([self.scale], dtype=torch_dtype),
+            dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
         )
 
     def _reshape_to_heads(self, x, B, L):
@@ -235,16 +242,17 @@ class TTMultiHeadAttention:
 
         # Apply key padding mask if provided
         if key_padding_mask is not None:
+            # key_padding_mask: (B, L_k) additive — 0.0=valid, -inf=padding
+            # Reshape to (B, 1, 1, L_k) for broadcasting over heads and query dim
             kpm = ttnn.reshape(key_padding_mask, [B, 1, 1, L_k])
-            neg_inf = ttnn.from_torch(
-                torch.full((1,), float('-inf'), dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-            )
-            mask_val = ttnn.mul(kpm, neg_inf)
+            # Use where instead of mul+add to avoid 0 * -inf = NaN
+            # scores = where(kpm == -inf, -inf, scores)
+            # ttnn.where doesn't easily work with -inf comparison, so use a large negative
+            # Actually, just add directly — the mask already has 0 for valid and -inf for padding
+            # The issue was in _get_key_padding_mask using mul(0, -inf) = NaN
+            # But here we're just adding the pre-computed additive mask
+            scores = ttnn.add(scores, kpm)
             _safe_deallocate(kpm)
-            scores = ttnn.add(scores, mask_val)
-            _safe_deallocate(mask_val)
-            _safe_deallocate(neg_inf)
 
         # Apply attention mask if provided (causal mask)
         if attn_mask is not None:
@@ -276,14 +284,14 @@ class TTEncoderLayer:
     where norm1/norm2 are LayerNorm (with bias), ffn uses GELU.
     """
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0, dtype=ttnn.bfloat16):
         self.device = device
         self.d_model = d_model
-        self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.norm1 = TTLayerNorm(d_model, device)  # LayerNorm, not RMSNorm
-        self.norm2 = TTLayerNorm(d_model, device)
-        self.linear1 = TTLinear(d_model, d_ff, device, bias=True)
-        self.linear2 = TTLinear(d_ff, d_model, device, bias=True)
+        self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout, dtype=dtype)
+        self.norm1 = TTLayerNorm(d_model, device, dtype=dtype)
+        self.norm2 = TTLayerNorm(d_model, device, dtype=dtype)
+        self.linear1 = TTLinear(d_model, d_ff, device, bias=True, dtype=dtype)
+        self.linear2 = TTLinear(d_ff, d_model, device, bias=True, dtype=dtype)
 
     def forward(self, x: "ttnn.Tensor", key_padding_mask: Optional["ttnn.Tensor"] = None) -> "ttnn.Tensor":
         # Pre-norm self-attention
@@ -313,16 +321,16 @@ class TTDecoderLayer:
       x = x + ffn(norm3(x))
     """
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0, dtype=ttnn.bfloat16):
         self.device = device
         self.d_model = d_model
-        self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.norm1 = TTLayerNorm(d_model, device)
-        self.cross_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.norm2 = TTLayerNorm(d_model, device)
-        self.linear1 = TTLinear(d_model, d_ff, device, bias=True)
-        self.linear2 = TTLinear(d_ff, d_model, device, bias=True)
-        self.norm3 = TTLayerNorm(d_model, device)
+        self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout, dtype=dtype)
+        self.norm1 = TTLayerNorm(d_model, device, dtype=dtype)
+        self.cross_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout, dtype=dtype)
+        self.norm2 = TTLayerNorm(d_model, device, dtype=dtype)
+        self.linear1 = TTLinear(d_model, d_ff, device, bias=True, dtype=dtype)
+        self.linear2 = TTLinear(d_ff, d_model, device, bias=True, dtype=dtype)
+        self.norm3 = TTLayerNorm(d_model, device, dtype=dtype)
 
     def forward(
         self,
@@ -372,15 +380,15 @@ class TTTransition:
       updated = output_norm(memory + gate * proposal)
     """
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, device, dropout=0.0, dtype=ttnn.bfloat16):
         self.device = device
         self.d_model = d_model
-        self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout)
-        self.attn_norm = TTRMSNorm(d_model, device)
-        self.ffn = TTLinear(d_model, d_ff, device, bias=False)
-        self.ffn_out = TTLinear(d_ff, d_model, device, bias=False)
-        self.gate = TTLinear(d_model, d_model, device, bias=True)
-        self.output_norm = TTRMSNorm(d_model, device)
+        self.self_attn = TTMultiHeadAttention(d_model, n_heads, device, dropout, dtype=dtype)
+        self.attn_norm = TTRMSNorm(d_model, device, dtype=dtype)
+        self.ffn = TTLinear(d_model, d_ff, device, bias=False, dtype=dtype)
+        self.ffn_out = TTLinear(d_ff, d_model, device, bias=False, dtype=dtype)
+        self.gate = TTLinear(d_model, d_model, device, bias=True, dtype=dtype)
+        self.output_norm = TTRMSNorm(d_model, device, dtype=dtype)
 
     def forward(self, memory: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
         """Returns (updated_memory, gate) where gate is (B, S, d_model) in [0, 1]."""
@@ -439,24 +447,37 @@ class TTTextLatentMemoryModel:
     - Is simpler and less bug-prone than full manual backward
     """
 
-    def __init__(self, config: TTTextLatentMemoryConfig, device):
+    def __init__(self, config: TTTextLatentMemoryConfig, device, dtype=ttnn.bfloat16):
         self.config = config
         self.device = device
+        self.dtype = dtype
         self.n_slots = config.n_slots
         self.d_model = config.d_model
+        torch_dtype = torch.bfloat16 if dtype == ttnn.bfloat16 else torch.float32
 
         # Token embedding (shared with LM head via weight tying)
-        emb_w = torch.randn(config.vocab_size, config.d_model, dtype=torch.bfloat16) * 0.02
-        self.token_emb_weight = to_device(emb_w, device)
+        # ttnn.embedding requires bf16, so we keep a bf16 copy for embedding
+        # and a compute-dtype copy for the LM head matmul.
+        emb_w = torch.randn(config.vocab_size, config.d_model, dtype=torch_dtype) * 0.02
+        self.token_emb_weight = to_device(emb_w, device, dtype=dtype)  # for LM head
+        self.token_emb_weight_bf16 = to_device(emb_w, device, dtype=ttnn.bfloat16)  # for embedding
 
-        # Position embeddings
+        # Position embeddings (also need bf16 copies for embedding lookup)
         self.prompt_pos_emb = to_device(
-            torch.randn(config.max_prompt_len, config.d_model, dtype=torch.bfloat16) * 0.02,
-            device
+            torch.randn(config.max_prompt_len, config.d_model, dtype=torch_dtype) * 0.02,
+            device, dtype=dtype
+        )
+        self.prompt_pos_emb_bf16 = to_device(
+            torch.randn(config.max_prompt_len, config.d_model, dtype=torch_dtype) * 0.02,
+            device, dtype=ttnn.bfloat16
         )
         self.answer_pos_emb = to_device(
-            torch.randn(config.max_answer_len + 2, config.d_model, dtype=torch.bfloat16) * 0.02,
-            device
+            torch.randn(config.max_answer_len + 2, config.d_model, dtype=torch_dtype) * 0.02,
+            device, dtype=dtype
+        )
+        self.answer_pos_emb_bf16 = to_device(
+            torch.randn(config.max_answer_len + 2, config.d_model, dtype=torch_dtype) * 0.02,
+            device, dtype=ttnn.bfloat16
         )
 
         # Encoder layers
@@ -464,23 +485,23 @@ class TTTextLatentMemoryModel:
         for _ in range(config.n_encoder_layers):
             layer = TTEncoderLayer(
                 config.d_model, config.n_heads,
-                config.d_model * config.expand, device
+                config.d_model * config.expand, device, dtype=dtype
             )
             self.encoder_layers.append(layer)
-        self.encoder_norm = TTRMSNorm(config.d_model, device)
+        self.encoder_norm = TTRMSNorm(config.d_model, device, dtype=dtype)
 
         # Memory initialization: cross-attention from learnable slot queries
         self.slot_queries = to_device(
-            torch.randn(config.n_slots, config.d_model, dtype=torch.bfloat16) * 0.02,
-            device
+            torch.randn(config.n_slots, config.d_model, dtype=torch_dtype) * 0.02,
+            device, dtype=dtype
         )
-        self.memory_init_attn = TTMultiHeadAttention(config.d_model, config.n_heads, device)
-        self.memory_norm = TTRMSNorm(config.d_model, device)
+        self.memory_init_attn = TTMultiHeadAttention(config.d_model, config.n_heads, device, dtype=dtype)
+        self.memory_norm = TTRMSNorm(config.d_model, device, dtype=dtype)
 
         # Recurrent transition
         self.transition = TTTransition(
             config.d_model, config.n_heads,
-            config.d_model * config.expand, device
+            config.d_model * config.expand, device, dtype=dtype
         )
 
         # Decoder layers
@@ -488,22 +509,22 @@ class TTTextLatentMemoryModel:
         for _ in range(config.n_decoder_layers):
             layer = TTDecoderLayer(
                 config.d_model, config.n_heads,
-                config.d_model * config.expand, device
+                config.d_model * config.expand, device, dtype=dtype
             )
             self.decoder_layers.append(layer)
-        self.decoder_norm = TTRMSNorm(config.d_model, device)
+        self.decoder_norm = TTRMSNorm(config.d_model, device, dtype=dtype)
 
         # LM head (weight-tied with embedding)
         self.lm_head_weight = self.token_emb_weight
 
         # Initialize gate to start open (sigmoid(4) ≈ 0.98)
         # Must be done after all weights are created
-        gate_w = torch.zeros(config.d_model, config.d_model, dtype=torch.bfloat16)
-        gate_b = torch.full((config.d_model,), 4.0, dtype=torch.bfloat16)
+        gate_w = torch.zeros(config.d_model, config.d_model, dtype=torch_dtype)
+        gate_b = torch.full((config.d_model,), 4.0, dtype=torch_dtype)
         _safe_deallocate(self.transition.gate.weight)
         _safe_deallocate(self.transition.gate.bias)
-        self.transition.gate.weight = to_device(gate_w, device)
-        self.transition.gate.bias = to_device(gate_b, device)
+        self.transition.gate.weight = to_device(gate_w, device, dtype=dtype)
+        self.transition.gate.bias = to_device(gate_b, device, dtype=dtype)
 
         # Cache for causal mask
         self._causal_mask_cache = {}
@@ -512,11 +533,12 @@ class TTTextLatentMemoryModel:
         """Get or create causal mask for sequence length T."""
         if T in self._causal_mask_cache:
             return self._causal_mask_cache[T]
+        torch_dtype = torch.bfloat16 if self.dtype == ttnn.bfloat16 else torch.float32
         mask = torch.triu(
-            torch.full((T, T), float('-inf'), dtype=torch.bfloat16),
+            torch.full((T, T), float('-inf'), dtype=torch_dtype),
             diagonal=1,
         )
-        mask_tt = to_device(mask, self.device)
+        mask_tt = to_device(mask, self.device, dtype=self.dtype)
         self._causal_mask_cache[T] = mask_tt
         return mask_tt
 
@@ -525,10 +547,27 @@ class TTTextLatentMemoryModel:
 
         Input: (B, L) boolean where True=valid, False=padding
         Output: (B, L) where 0.0=valid, -inf=padding
+
+        Uses torch.where to avoid 0 * -inf = NaN.
         """
-        additive = torch.zeros_like(mask, dtype=torch.bfloat16)
-        additive[~mask] = float('-inf')
-        return to_device(additive, self.device)
+        torch_dtype = torch.bfloat16 if self.dtype == ttnn.bfloat16 else torch.float32
+        additive = torch.where(
+            mask,
+            torch.zeros((), dtype=torch_dtype),
+            torch.full((), float('-inf'), dtype=torch_dtype),
+        )
+        return to_device(additive, self.device, dtype=self.dtype)
+
+    def _embedding_lookup(self, indices: "ttnn.Tensor", weight: "ttnn.Tensor") -> "ttnn.Tensor":
+        """Embedding lookup with dtype handling.
+
+        ttnn.embedding requires bf16 weights, so we keep embedding weights in bf16
+        and typecast the output to the model's compute dtype.
+        """
+        out = ttnn.embedding(indices, weight, layout=ttnn.TILE_LAYOUT)
+        if self.dtype != ttnn.bfloat16:
+            out = ttnn.typecast(out, self.dtype)
+        return out
 
     def encode_prompt(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> "ttnn.Tensor":
         """Encode the prompt on device. Returns (B, T, d_model) ttnn tensor."""
@@ -540,7 +579,7 @@ class TTTextLatentMemoryModel:
             input_ids.to(torch.int32),
             dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device
         )
-        x = ttnn.embedding(indices, self.token_emb_weight, layout=ttnn.TILE_LAYOUT)
+        x = self._embedding_lookup(indices, self.token_emb_weight_bf16)
         _safe_deallocate(indices)
 
         # Add position embeddings
@@ -548,7 +587,7 @@ class TTTextLatentMemoryModel:
             torch.arange(T, dtype=torch.int32).unsqueeze(0),
             dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device
         )
-        pos_emb = ttnn.embedding(pos, self.prompt_pos_emb, layout=ttnn.TILE_LAYOUT)
+        pos_emb = self._embedding_lookup(pos, self.prompt_pos_emb_bf16)
         _safe_deallocate(pos)
         x = ttnn.add(x, pos_emb)
         _safe_deallocate(pos_emb)
@@ -617,7 +656,7 @@ class TTTextLatentMemoryModel:
             answer_ids.to(torch.int32),
             dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device
         )
-        x = ttnn.embedding(indices, self.token_emb_weight, layout=ttnn.TILE_LAYOUT)
+        x = self._embedding_lookup(indices, self.token_emb_weight_bf16)
         _safe_deallocate(indices)
 
         # Add position embeddings
@@ -625,7 +664,7 @@ class TTTextLatentMemoryModel:
             torch.arange(T_ans, dtype=torch.int32).unsqueeze(0),
             dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device
         )
-        pos_emb = ttnn.embedding(pos, self.answer_pos_emb, layout=ttnn.TILE_LAYOUT)
+        pos_emb = self._embedding_lookup(pos, self.answer_pos_emb_bf16)
         _safe_deallocate(pos)
         x = ttnn.add(x, pos_emb)
         _safe_deallocate(pos_emb)
@@ -800,7 +839,8 @@ class TTTextLatentMemoryModel:
         model_state = checkpoint["model_state"]
 
         for name, host_tensor in model_state.items():
-            tt_tensor = to_device(host_tensor.to(torch.bfloat16), device)
+            torch_dtype = torch.bfloat16 if self.dtype == ttnn.bfloat16 else torch.float32
+            tt_tensor = to_device(host_tensor.to(torch_dtype), device, dtype=self.dtype)
             self._set_param(name, tt_tensor)
 
         print(f"Loaded checkpoint from {path} (step {checkpoint.get('step', 0)})", flush=True)
@@ -812,12 +852,22 @@ class TTTextLatentMemoryModel:
             _safe_deallocate(self.token_emb_weight)
             self.token_emb_weight = tt_tensor
             self.lm_head_weight = tt_tensor
+            # Also update bf16 copy for embedding lookup
+            _safe_deallocate(self.token_emb_weight_bf16)
+            self.token_emb_weight_bf16 = ttnn.typecast(tt_tensor, ttnn.bfloat16) \
+                if self.dtype != ttnn.bfloat16 else tt_tensor
         elif name == "prompt_pos_emb":
             _safe_deallocate(self.prompt_pos_emb)
             self.prompt_pos_emb = tt_tensor
+            _safe_deallocate(self.prompt_pos_emb_bf16)
+            self.prompt_pos_emb_bf16 = ttnn.typecast(tt_tensor, ttnn.bfloat16) \
+                if self.dtype != ttnn.bfloat16 else tt_tensor
         elif name == "answer_pos_emb":
             _safe_deallocate(self.answer_pos_emb)
             self.answer_pos_emb = tt_tensor
+            _safe_deallocate(self.answer_pos_emb_bf16)
+            self.answer_pos_emb_bf16 = ttnn.typecast(tt_tensor, ttnn.bfloat16) \
+                if self.dtype != ttnn.bfloat16 else tt_tensor
         elif name == "slot_queries":
             _safe_deallocate(self.slot_queries)
             self.slot_queries = tt_tensor

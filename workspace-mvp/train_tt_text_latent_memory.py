@@ -104,6 +104,8 @@ def transfer_pytorch_to_tt(pt_model: TextLatentMemoryModel, tt_model: TTTextLate
     RMSNorm weights and embeddings are 1D, no transpose needed.
     """
     pt_state = pt_model.state_dict()
+    dtype = tt_model.dtype
+    torch_dtype = torch.bfloat16 if dtype == ttnn.bfloat16 else torch.float32
 
     # Determine which params need transposition (2D linear weights)
     # All params ending in _w that are 2D need transpose, except embeddings
@@ -119,10 +121,10 @@ def transfer_pytorch_to_tt(pt_model: TextLatentMemoryModel, tt_model: TTTextLate
     for tt_name in tt_model.get_params():
         pt_name = _map_tt_to_pt_name(tt_name)
         if pt_name and pt_name in pt_state:
-            pt_w = pt_state[pt_name].to(torch.bfloat16)
+            pt_w = pt_state[pt_name].to(torch_dtype)
             if tt_name in transpose_params:
                 pt_w = pt_w.t().contiguous()  # (out, in) -> (in, out)
-            new_tt = to_device(pt_w, device)
+            new_tt = to_device(pt_w, device, dtype=dtype)
             tt_model._set_param(tt_name, new_tt)
             transfers += 1
 
@@ -193,12 +195,15 @@ def _map_attn_param(suffix, prefix):
 
 def _map_enc_dec_param(suffix, prefix):
     """Map encoder/decoder layer parameter suffix to PyTorch name."""
-    # Self-attention
+    # Self-attention (decoder uses sa_ prefix, encoder has no prefix)
     if suffix.startswith("sa_"):
         return _map_attn_param(suffix[3:], f"{prefix}.self_attn")
-    # Cross-attention
+    # Cross-attention (decoder uses ca_ prefix)
     if suffix.startswith("ca_"):
         return _map_attn_param(suffix[3:], f"{prefix}.multihead_attn")
+    # Direct attention params (encoder layer has no sa_/ca_ prefix)
+    if suffix in ("in_proj_w", "in_proj_b", "out_proj_w", "out_proj_b"):
+        return _map_attn_param(suffix, f"{prefix}.self_attn")
     # Norms
     norm_map = {
         "norm1_w": f"{prefix}.norm1.weight", "norm1_b": f"{prefix}.norm1.bias",
@@ -276,6 +281,8 @@ def main():
     parser.add_argument("--max-prompt-len", type=int, default=256)
     parser.add_argument("--max-answer-len", type=int, default=32)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
+                        help="TT-NN compute precision (bf16 for production, fp32 for parity testing)")
     parser.add_argument("--checkpoint-dir", default="checkpoints/tt_text_lm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -358,9 +365,10 @@ def main():
         max_answer_len=args.max_answer_len,
         pad_token_id=dataset.pad_id,
     )
-    tt_model = TTTextLatentMemoryModel(tt_config, device)
+    tt_dtype = ttnn.float32 if args.precision == "fp32" else ttnn.bfloat16
+    tt_model = TTTextLatentMemoryModel(tt_config, device, dtype=tt_dtype)
     tt_n_params = tt_model.get_num_params()
-    print(f"TT model: {tt_n_params:,} params ({tt_n_params/1e6:.1f}M)", flush=True)
+    print(f"TT model: {tt_n_params:,} params ({tt_n_params/1e6:.1f}M) precision={args.precision}", flush=True)
 
     # Transfer initial weights to TT model
     n_transferred = transfer_pytorch_to_tt(pt_model, tt_model, device)
