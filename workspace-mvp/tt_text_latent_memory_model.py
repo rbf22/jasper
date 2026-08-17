@@ -50,6 +50,13 @@ def to_device(t: torch.Tensor, device, dtype=ttnn.bfloat16) -> "ttnn.Tensor":
     return ttnn.from_torch(t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
 
 
+# Matmul wrapper for backward — uses standard ttnn.matmul
+# (fp32 typecast was too slow and caused device memory issues)
+def _matmul_fp32(a, b, **kwargs):
+    """Matmul wrapper for backward pass."""
+    return ttnn.matmul(a, b, **kwargs)
+
+
 def from_device(tensor: "ttnn.Tensor") -> torch.Tensor:
     """Convert a tt-nn device tensor to a PyTorch tensor (float32)."""
     return ttnn.to_torch(tensor).to(torch.float32)
@@ -76,7 +83,7 @@ class TTRMSNorm:
         return ttnn.rms_norm(x, weight=self.weight, epsilon=self.eps)
 
     def backward(self, grad_out: "ttnn.Tensor", x: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
-        """RMSNorm backward computed on host (avoids TT-NN buffer aliasing issues).
+        """RMSNorm backward on host (bf16 device ops produce inf after ~30 steps).
 
         Forward: y = x / rms(x) * weight
         where rms = sqrt(mean(x^2) + eps)
@@ -88,30 +95,40 @@ class TTRMSNorm:
         """
         eps = self.eps
 
-        # Move to host for computation — TT-NN buffer aliasing makes on-device
-        # RMSNorm backward unreliable with manual deallocation
+        # Host computation in fp32 for stability
         x_torch = ttnn.to_torch(x).float()
         go_torch = ttnn.to_torch(grad_out).float()
         w_torch = ttnn.to_torch(self.weight).float()
 
         rms_sq = (x_torch ** 2).mean(-1, keepdim=True)
         rms = torch.sqrt(rms_sq + eps)
-        x_norm_t = x_torch / rms
+        del rms_sq
+        x_norm = x_torch / rms
+        del x_torch
 
-        grad_w_t = go_torch * w_torch
-        grad_x_t = (grad_w_t - x_norm_t * (grad_w_t * x_norm_t).mean(-1, keepdim=True)) / rms
-
+        # grad_weight = sum(grad_out * x_norm) — compute before deleting go_torch
         reduce_dims = tuple(range(go_torch.ndim - 1))
-        grad_weight_t = (go_torch * x_norm_t).sum(dim=reduce_dims)
+        grad_weight = (go_torch * x_norm).sum(dim=reduce_dims)
 
-        grad_x = to_device(grad_x_t, self.device, dtype=self.dtype)
-        grad_weight = to_device(grad_weight_t, self.device, dtype=self.dtype)
+        grad_w = go_torch * w_torch
+        del go_torch, w_torch
+        grad_x = (grad_w - x_norm * (grad_w * x_norm).mean(-1, keepdim=True)) / rms
+        del x_norm, rms, grad_w
 
-        return grad_x, grad_weight
+        grad_x_tt = to_device(grad_x, self.device, dtype=self.dtype)
+        del grad_x
+        grad_weight_tt = to_device(grad_weight, self.device, dtype=self.dtype)
+        del grad_weight
+
+        return grad_x_tt, grad_weight_tt
 
 
 class TTLayerNorm:
-    """LayerNorm using ttnn.layer_norm — matches PyTorch nn.LayerNorm."""
+    """LayerNorm using moreh_layer_norm — matches PyTorch nn.LayerNorm.
+
+    Uses moreh_layer_norm for forward (produces mean + rstd for backward)
+    and moreh_layer_norm_backward for backward.
+    """
 
     def __init__(self, d: int, device, eps=1e-5, dtype=ttnn.bfloat16):
         self.d = d
@@ -127,12 +144,27 @@ class TTLayerNorm:
             torch.zeros(d, dtype=torch_dtype),
             dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
         )
+        # Cache for mean/rstd from forward
+        self._mean = None
+        self._rstd = None
 
     def forward(self, x: "ttnn.Tensor") -> "ttnn.Tensor":
-        return ttnn.layer_norm(x, weight=self.weight, bias=self.bias, epsilon=self.eps)
+        # Allocate mean and rstd tensors for backward
+        # mean/rstd shape: (B, L) — normalized dim is removed, not kept as size 1
+        x_shape = list(x.shape)
+        mean_rstd_shape = ttnn.Shape(x_shape[:-1])  # drop last dim
+        self._mean = ttnn.empty(mean_rstd_shape, dtype=self.dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+        self._rstd = ttnn.empty(mean_rstd_shape, dtype=self.dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+
+        result = ttnn.moreh_layer_norm(
+            x, normalized_dims=1, eps=self.eps,
+            gamma=self.weight, beta=self.bias,
+            mean=self._mean, rstd=self._rstd,
+        )
+        return result[0]  # output tensor
 
     def backward(self, grad_out: "ttnn.Tensor", x: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor", "ttnn.Tensor"]:
-        """LayerNorm backward computed on host (avoids TT-NN buffer aliasing issues).
+        """LayerNorm backward on host (bf16 device ops produce inf after ~30 steps).
 
         Forward: y = (x - mean) * rstd * weight + bias
 
@@ -144,30 +176,42 @@ class TTLayerNorm:
         """
         eps = self.eps
 
-        # Move to host for computation — TT-NN buffer aliasing makes on-device
-        # LayerNorm backward unreliable with manual deallocation
+        # Move to host for computation (fp32 for stability)
         x_torch = ttnn.to_torch(x).float()
         go_torch = ttnn.to_torch(grad_out).float()
         w_torch = ttnn.to_torch(self.weight).float()
 
         mean_t = x_torch.mean(-1, keepdim=True)
-        var_t = ((x_torch - mean_t) ** 2).mean(-1, keepdim=True)
+        x_centered = x_torch - mean_t
+        del x_torch, mean_t
+        var_t = (x_centered ** 2).mean(-1, keepdim=True)
         rstd_t = 1.0 / torch.sqrt(var_t + eps)
-        x_norm_t = (x_torch - mean_t) * rstd_t
+        del var_t
+        x_norm_t = x_centered * rstd_t
+        del x_centered
 
-        grad_w_t = go_torch * w_torch
-        grad_x_t = (grad_w_t - grad_w_t.mean(-1, keepdim=True) -
-                    x_norm_t * (grad_w_t * x_norm_t).mean(-1, keepdim=True)) * rstd_t
-
-        # Reduce over all leading dims for weight and bias grads
+        # Compute grad_weight and grad_bias before deleting go_torch
         reduce_dims = tuple(range(go_torch.ndim - 1))
         grad_weight_t = (go_torch * x_norm_t).sum(dim=reduce_dims)
         grad_bias_t = go_torch.sum(dim=reduce_dims)
 
-        # Move back to device
+        grad_w_t = go_torch * w_torch
+        del go_torch, w_torch
+        grad_x_t = (grad_w_t - grad_w_t.mean(-1, keepdim=True) -
+                    x_norm_t * (grad_w_t * x_norm_t).mean(-1, keepdim=True)) * rstd_t
+        del x_norm_t, rstd_t, grad_w_t
+
         grad_x = to_device(grad_x_t, self.device, dtype=self.dtype)
+        del grad_x_t
         grad_weight = to_device(grad_weight_t, self.device, dtype=self.dtype)
+        del grad_weight_t
         grad_bias = to_device(grad_bias_t, self.device, dtype=self.dtype)
+        del grad_bias_t
+
+        _safe_deallocate(self._mean)
+        _safe_deallocate(self._rstd)
+        self._mean = None
+        self._rstd = None
 
         return grad_x, grad_weight, grad_bias
 
@@ -210,14 +254,14 @@ class TTLinear:
         """
         # grad_x = grad_out @ W^T  (W is (in, out), W^T is (out, in))
         w_t = ttnn.transpose(self.weight, -2, -1)  # (out, in)
-        grad_x = ttnn.matmul(grad_out, w_t)
+        grad_x = _matmul_fp32(grad_out, w_t)
         _safe_deallocate(w_t)
 
         # grad_W = x^T @ grad_out  (x is (..., in), grad_out is (..., out))
         # Need to flatten leading dims for matmul
         x_2d = ttnn.reshape(x, [-1, self.in_features])  # (N, in)
         grad_out_2d = ttnn.reshape(grad_out, [-1, self.out_features])  # (N, out)
-        grad_weight = ttnn.matmul(ttnn.transpose(x_2d, -2, -1), grad_out_2d)  # (in, out)
+        grad_weight = _matmul_fp32(ttnn.transpose(x_2d, -2, -1), grad_out_2d)  # (in, out)
         # Don't deallocate x_2d or grad_out_2d — they may be views of x/grad_out
         # which the caller still needs
 
@@ -383,7 +427,7 @@ class TTMultiHeadAttention:
         return out
 
     def backward(self, grad_out: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor", Dict[str, "ttnn.Tensor"]]:
-        """Backward pass for multi-head attention.
+        """Backward pass for multi-head attention — fully on device.
 
         Args:
             grad_out: (B, L_q, d_model) gradient w.r.t. attention output
@@ -402,113 +446,167 @@ class TTMultiHeadAttention:
         d = self.d_model
         H = self.n_heads
         d_h = d // H
+        dtype = self.dtype
 
-        # Move everything to host
-        grad_out_t = ttnn.to_torch(grad_out).float()
-        q_t = ttnn.to_torch(c["q"]).float()    # (B, H, L_q, d_h) or (B, H, L_k, d_h)
-        k_t = ttnn.to_torch(c["k"]).float()    # (B, H, L_k, d_h)
-        v_t = ttnn.to_torch(c["v"]).float()    # (B, H, L_k, d_h)
-        attn_t = ttnn.to_torch(c["attn"]).float()  # (B, H, L_q, L_k)
-        out_pre_t = ttnn.to_torch(c["out_pre"]).float()  # (B, L_q, d)
-        opw_t = ttnn.to_torch(self.out_proj_weight).float()  # (d, d)
-        opb_t = ttnn.to_torch(self.out_proj_bias).float()  # (d,)
-        ipw_t = ttnn.to_torch(self.in_proj_weight).float()  # (d, 3d) TT-NN layout
-        ipb_t = ttnn.to_torch(self.in_proj_bias).float()  # (3d,)
-        scale = self.scale
+        q = c["q"]      # (B, H, L_q, d_h)
+        k = c["k"]      # (B, H, L_k, d_h)
+        v = c["v"]      # (B, H, L_k, d_h)
+        attn = c["attn"]  # (B, H, L_q, L_k)
+        out_pre = c["out_pre"]  # (B, L_q, d)
 
-        # Out proj backward: y = out_pre @ opw + opb (TT-NN: W is (in, out) = (d, d))
-        N = B * L_q
-        grad_opw = out_pre_t.reshape(N, d).T @ grad_out_t.reshape(N, d)  # (d, d)
-        grad_opb = grad_out_t.reshape(N, d).sum(0)  # (d,)
-        grad_out_pre = grad_out_t.reshape(N, d) @ opw_t.T  # (N, d) -> (B, L_q, d)
+        # --- Output projection backward: y = out_pre @ opw + opb ---
+        # grad_out_pre = grad_out @ opw^T  (opw is (d, d), opw^T is (d, d))
+        opw_t = ttnn.transpose(self.out_proj_weight, -2, -1)  # (d, d) -> (d, d) transposed
+        grad_out_pre = _matmul_fp32(grad_out, opw_t)  # (B, L_q, d)
+        _safe_deallocate(opw_t)
 
-        # Reshape to heads
-        grad_heads = grad_out_pre.reshape(B, L_q, H, d_h).permute(0, 2, 1, 3)  # (B, H, L_q, d_h)
+        # grad_opw = out_pre^T @ grad_out  (need 2D: (d, N) @ (N, d) = (d, d))
+        out_pre_2d = ttnn.reshape(out_pre, [B * L_q, d])
+        grad_out_2d = ttnn.reshape(grad_out, [B * L_q, d])
+        grad_opw = _matmul_fp32(ttnn.transpose(out_pre_2d, -2, -1), grad_out_2d)  # (d, d)
+        # Don't deallocate out_pre_2d/grad_out_2d — may be views
 
-        # attn @ v backward
-        grad_attn = torch.matmul(grad_heads, v_t.transpose(-2, -1))  # (B, H, L_q, L_k)
-        grad_v = torch.matmul(attn_t.transpose(-2, -1), grad_heads)  # (B, H, L_k, d_h)
+        # grad_opb = sum(grad_out, over batch/seq dims)
+        reduce_dims = tuple(range(len(grad_out.shape) - 1))
+        grad_opb = ttnn.sum(grad_out, dim=reduce_dims) if reduce_dims else grad_out
 
-        # Softmax backward: grad_scores = (grad_attn - sum(grad_attn * attn, -1, keepdim)) * attn
-        grad_attn_sum = (grad_attn * attn_t).sum(-1, keepdim=True)
-        grad_scores = (grad_attn - grad_attn_sum) * attn_t  # (B, H, L_q, L_k)
+        # --- Reshape grad_out_pre to heads: (B, L_q, d) -> (B, H, L_q, d_h) ---
+        grad_heads = self._reshape_to_heads(grad_out_pre, B, L_q)  # (B, H, L_q, d_h)
 
-        # Scale backward
-        grad_scores_pre = grad_scores * scale  # (B, H, L_q, L_k)
+        # --- attn @ v backward ---
+        # grad_attn = grad_heads @ v^T  → (B, H, L_q, L_k)
+        v_t = ttnn.transpose(v, -2, -1)  # (B, H, d_h, L_k)
+        grad_attn = _matmul_fp32(grad_heads, v_t)  # (B, H, L_q, L_k)
+        _safe_deallocate(v_t)
 
-        # scores = q @ k^T backward
-        grad_q = torch.matmul(grad_scores_pre, k_t)  # (B, H, L_q, d_h)
-        grad_k = torch.matmul(grad_scores_pre.transpose(-2, -1), q_t)  # (B, H, L_k, d_h)
+        # grad_v = attn^T @ grad_heads  → (B, H, L_k, d_h)
+        attn_t = ttnn.transpose(attn, -2, -1)  # (B, H, L_k, L_q)
+        grad_v = _matmul_fp32(attn_t, grad_heads)  # (B, H, L_k, d_h)
+        _safe_deallocate(attn_t)
 
-        # Reshape from heads
-        grad_q_flat = grad_q.permute(0, 2, 1, 3).reshape(B, L_q, d)  # (B, L_q, d)
-        grad_k_flat = grad_k.permute(0, 2, 1, 3).reshape(B, L_k, d)  # (B, L_k, d)
-        grad_v_flat = grad_v.permute(0, 2, 1, 3).reshape(B, L_k, d)  # (B, L_k, d)
+        # --- Softmax backward using moreh_softmax_backward ---
+        # moreh_softmax_backward(output, output_grad, dim) → grad_input
+        # softmax was over last dim (L_k), dim=3 for 4D tensor
+        grad_scores = ttnn.moreh_softmax_backward(attn, grad_attn, dim=3)
+        _safe_deallocate(grad_attn)
 
+        # --- Scale backward: grad_scores_pre = grad_scores * scale ---
+        grad_scores_pre = ttnn.mul(grad_scores, self._scale_tt)
+        _safe_deallocate(grad_scores)
+
+        # --- q @ k^T backward ---
+        # grad_q = grad_scores_pre @ k  → (B, H, L_q, d_h)
+        grad_q = _matmul_fp32(grad_scores_pre, k)  # (B, H, L_q, d_h)
+
+        # grad_k = grad_scores_pre^T @ q  → (B, H, L_k, d_h)
+        gsp_t = ttnn.transpose(grad_scores_pre, -2, -1)  # (B, H, L_k, L_q)
+        grad_k = _matmul_fp32(gsp_t, q)  # (B, H, L_k, d_h)
+        _safe_deallocate(gsp_t)
+        _safe_deallocate(grad_scores_pre)
+
+        # --- Reshape from heads: (B, H, L, d_h) -> (B, L, d) ---
+        grad_q_flat = self._reshape_from_heads(grad_q, B, L_q)  # (B, L_q, d)
+        grad_k_flat = self._reshape_from_heads(grad_k, B, L_k)  # (B, L_k, d)
+        grad_v_flat = self._reshape_from_heads(grad_v, B, L_k)  # (B, L_k, d)
+        _safe_deallocate(grad_q)
+        _safe_deallocate(grad_k)
+        _safe_deallocate(grad_v)
+
+        # --- QKV projection backward ---
         if self._is_self_attn:
-            # Self-attention: single projection qkv = x @ ipw + ipb (TT-NN: ipw is (d, 3d))
-            query_input_t = ttnn.to_torch(c["query"]).float()
-            grad_qkv = torch.cat([grad_q_flat, grad_k_flat, grad_v_flat], dim=-1)  # (B, L, 3d)
+            # Self-attention: qkv = x @ ipw + ipb (ipw is (d, 3d))
+            # Concatenate grad_q, grad_k, grad_v along last dim
+            grad_qkv = ttnn.concat([grad_q_flat, grad_k_flat, grad_v_flat], dim=-1)  # (B, L, 3d)
+            _safe_deallocate(grad_q_flat)
+            _safe_deallocate(grad_k_flat)
+            _safe_deallocate(grad_v_flat)
 
-            qi_2d = query_input_t.reshape(N, d)
-            gqkv_2d = grad_qkv.reshape(N, 3 * d)
-            grad_ipw = qi_2d.T @ gqkv_2d  # (d, 3d)
-            grad_ipb = gqkv_2d.sum(0)  # (3d,)
-            grad_input_t = gqkv_2d @ ipw_t.T  # (N, d) -> (B, L, d)
-            grad_key_t = None
+            # grad_input = grad_qkv @ ipw^T  (ipw is (d, 3d), ipw^T is (3d, d))
+            ipw_t = ttnn.transpose(self.in_proj_weight, -2, -1)  # (3d, d)
+            grad_input = _matmul_fp32(grad_qkv, ipw_t)  # (B, L, d)
+            _safe_deallocate(ipw_t)
+
+            # grad_ipw = query^T @ grad_qkv  (need 2D)
+            query_input = c["query"]  # (B, L, d)
+            qi_2d = ttnn.reshape(query_input, [B * L_q, d])
+            gqkv_2d = ttnn.reshape(grad_qkv, [B * L_q, 3 * d])
+            grad_ipw = _matmul_fp32(ttnn.transpose(qi_2d, -2, -1), gqkv_2d)  # (d, 3d)
+            # Don't deallocate qi_2d/gqkv_2d — may be views
+
+            # grad_ipb = sum(grad_qkv, over batch/seq dims)
+            grad_ipb = ttnn.sum(grad_qkv, dim=reduce_dims) if reduce_dims else grad_qkv
+
+            grad_key_input = None
         else:
             # Cross-attention: query and key have separate inputs
-            # TT-NN: ipw is (d, 3d), forward: qkv = x @ ipw + ipb
-            query_input_t = ttnn.to_torch(c["query"]).float()  # (B, L_q, d)
-            key_input_t = ttnn.to_torch(c["key"]).float()  # (B, L_k, d)
+            # ipw is (d, 3d), forward: qkv = x @ ipw + ipb
+            query_input = c["query"]  # (B, L_q, d)
+            key_input = c["key"]      # (B, L_k, d)
 
-            # Query projection: q = query @ ipw[:d, :d] (only first d output columns used)
-            Nq = B * L_q
-            grad_qkv_q = torch.cat([grad_q_flat, torch.zeros(B, L_q, 2 * d), ], dim=-1)
-            qi_2d = query_input_t.reshape(Nq, d)
-            gqkv_q_2d = grad_qkv_q.reshape(Nq, 3 * d)
-            grad_ipw_q = qi_2d.T @ gqkv_q_2d  # (d, 3d)
-            grad_input_t = gqkv_q_2d @ ipw_t.T  # (Nq, d) -> (B, L_q, d)
+            # Compute bias gradient BEFORE deallocating grad_q/k/v_flat
+            # grad_ipb = [sum(grad_q_flat), sum(grad_k_flat), sum(grad_v_flat)]
+            reduce_dims_q = tuple(range(len(grad_q_flat.shape) - 1))
+            reduce_dims_k = tuple(range(len(grad_k_flat.shape) - 1))
+            grad_ipb_q = ttnn.sum(grad_q_flat, dim=reduce_dims_q) if reduce_dims_q else grad_q_flat
+            grad_ipb_k = ttnn.sum(grad_k_flat, dim=reduce_dims_k) if reduce_dims_k else grad_k_flat
+            grad_ipb_v = ttnn.sum(grad_v_flat, dim=reduce_dims_k) if reduce_dims_k else grad_v_flat
+            grad_ipb = ttnn.concat([grad_ipb_q, grad_ipb_k, grad_ipb_v], dim=-1)  # (3d,)
+            _safe_deallocate(grad_ipb_q)
+            _safe_deallocate(grad_ipb_k)
+            _safe_deallocate(grad_ipb_v)
 
-            # Key projection: k,v = key @ ipw (uses d:3d output columns)
-            Nk = B * L_k
-            grad_qkv_kv = torch.cat([torch.zeros(B, L_k, d), grad_k_flat, grad_v_flat], dim=-1)
-            ki_2d = key_input_t.reshape(Nk, d)
-            gqkv_kv_2d = grad_qkv_kv.reshape(Nk, 3 * d)
-            grad_ipw_kv = ki_2d.T @ gqkv_kv_2d  # (d, 3d)
-            grad_key_t = gqkv_kv_2d @ ipw_t.T  # (Nk, d) -> (B, L_k, d)
+            # Pad grad_q with zeros for k,v columns
+            zeros_q = ttnn.zeros((B, L_q, 2 * d), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+            grad_qkv_q = ttnn.concat([grad_q_flat, zeros_q], dim=-1)  # (B, L_q, 3d)
+            _safe_deallocate(zeros_q)
+            _safe_deallocate(grad_q_flat)
 
-            grad_ipw = grad_ipw_q + grad_ipw_kv
-            # Correct bias gradient: [sum(grad_q), sum(grad_k), sum(grad_v)]
-            grad_ipb = torch.cat([
-                grad_q_flat.reshape(Nq, d).sum(0),
-                grad_k_flat.reshape(Nk, d).sum(0),
-                grad_v_flat.reshape(Nk, d).sum(0),
-            ])  # (3d,)
+            # grad_input (query) = grad_qkv_q @ ipw^T
+            ipw_t = ttnn.transpose(self.in_proj_weight, -2, -1)  # (3d, d)
+            grad_input = _matmul_fp32(grad_qkv_q, ipw_t)  # (B, L_q, d)
 
-        # Move results back to device (reshape to 3D)
-        grad_input = to_device(grad_input_t.reshape(B, L_q, d), device, dtype=self.dtype)
-        grad_key_input = to_device(grad_key_t.reshape(B, L_k, d), device, dtype=self.dtype) if grad_key_t is not None else None
-        grad_ipw_tt = to_device(grad_ipw, device, dtype=self.dtype)
-        grad_ipb_tt = to_device(grad_ipb, device, dtype=self.dtype)
-        grad_opw_tt = to_device(grad_opw, device, dtype=self.dtype)
-        grad_opb_tt = to_device(grad_opb, device, dtype=self.dtype)
+            # grad_ipw_q = query^T @ grad_qkv_q
+            qi_2d = ttnn.reshape(query_input, [B * L_q, d])
+            gqkv_q_2d = ttnn.reshape(grad_qkv_q, [B * L_q, 3 * d])
+            grad_ipw_q = _matmul_fp32(ttnn.transpose(qi_2d, -2, -1), gqkv_q_2d)  # (d, 3d)
+            _safe_deallocate(grad_qkv_q)
+
+            # Key path: pad grad_k, grad_v with zeros for q columns
+            zeros_k = ttnn.zeros((B, L_k, d), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+            grad_qkv_kv = ttnn.concat([zeros_k, grad_k_flat, grad_v_flat], dim=-1)  # (B, L_k, 3d)
+            _safe_deallocate(zeros_k)
+            _safe_deallocate(grad_k_flat)
+            _safe_deallocate(grad_v_flat)
+
+            # grad_key_input = grad_qkv_kv @ ipw^T
+            grad_key_input = _matmul_fp32(grad_qkv_kv, ipw_t)  # (B, L_k, d)
+            _safe_deallocate(ipw_t)
+
+            # grad_ipw_kv = key^T @ grad_qkv_kv
+            ki_2d = ttnn.reshape(key_input, [B * L_k, d])
+            gqkv_kv_2d = ttnn.reshape(grad_qkv_kv, [B * L_k, 3 * d])
+            grad_ipw_kv = _matmul_fp32(ttnn.transpose(ki_2d, -2, -1), gqkv_kv_2d)  # (d, 3d)
+            _safe_deallocate(grad_qkv_kv)
+
+            # Combine ipw gradients
+            grad_ipw = ttnn.add(grad_ipw_q, grad_ipw_kv)
+            _safe_deallocate(grad_ipw_q)
+            _safe_deallocate(grad_ipw_kv)
 
         # Clean up cache — don't deallocate query/key inputs as they may be
-        # shared with the model-level cache (e.g. enc_pre_norm used as key)
+        # shared with the model-level cache
         _safe_deallocate(c["q"])
         _safe_deallocate(c["k"])
         _safe_deallocate(c["v"])
         _safe_deallocate(c["attn"])
         _safe_deallocate(c["out_pre"])
-        # query and key are NOT deallocated here — caller manages their lifetime
         self._cache = {}
 
         grads = {
-            "in_proj_weight": grad_ipw_tt,
-            "in_proj_bias": grad_ipb_tt,
-            "out_proj_weight": grad_opw_tt,
-            "out_proj_bias": grad_opb_tt,
+            "in_proj_weight": grad_ipw,
+            "in_proj_bias": grad_ipb,
+            "out_proj_weight": grad_opw,
+            "out_proj_bias": grad_opb,
         }
         return grad_input, grad_key_input, grads
 
@@ -1449,7 +1547,7 @@ class TTTextLatentMemoryModel:
         x_dec = c["x_dec_pre_lm"]
         x_dec_2d = ttnn.reshape(x_dec, [-1, d])  # (N, d)
         gl_2d = ttnn.reshape(grad_logits, [-1, self.config.vocab_size])  # (N, V)
-        grad_token_emb = ttnn.matmul(ttnn.transpose(x_dec_2d, -2, -1), gl_2d)  # (d, V)
+        grad_token_emb = _matmul_fp32(ttnn.transpose(x_dec_2d, -2, -1), gl_2d)  # (d, V)
         _safe_deallocate(x_dec_2d)
         _safe_deallocate(gl_2d)
         # Transpose to (V, d) to match embedding shape
@@ -1658,9 +1756,61 @@ class TTTextLatentMemoryModel:
         Synchronizes device first so async queue releases references.
         """
         ttnn.synchronize_device(self.device)
-        # Causal masks are small and reused — keep them cached
-        # No intermediate tensors to clear in this hybrid model since
-        # forward() deallocates everything before returning
+
+        # Clear encoder layer caches
+        for layer in self.encoder_layers:
+            if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, '_cache'):
+                layer.self_attn._cache = {}
+            if hasattr(layer, 'norm1') and hasattr(layer.norm1, '_mean'):
+                _safe_deallocate(layer.norm1._mean)
+                _safe_deallocate(layer.norm1._rstd)
+                layer.norm1._mean = None
+                layer.norm1._rstd = None
+            if hasattr(layer, 'norm2') and hasattr(layer.norm2, '_mean'):
+                _safe_deallocate(layer.norm2._mean)
+                _safe_deallocate(layer.norm2._rstd)
+                layer.norm2._mean = None
+                layer.norm2._rstd = None
+            if hasattr(layer, 'linear1') and hasattr(layer.linear1, '_cache'):
+                layer.linear1._cache = {}
+            if hasattr(layer, 'linear2') and hasattr(layer.linear2, '_cache'):
+                layer.linear2._cache = {}
+
+        # Clear decoder layer caches
+        for layer in self.decoder_layers:
+            if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, '_cache'):
+                layer.self_attn._cache = {}
+            if hasattr(layer, 'cross_attn') and hasattr(layer.cross_attn, '_cache'):
+                layer.cross_attn._cache = {}
+            if hasattr(layer, 'attn_norm') and hasattr(layer.attn_norm, '_mean'):
+                _safe_deallocate(layer.attn_norm._mean)
+                _safe_deallocate(layer.attn_norm._rstd)
+                layer.attn_norm._mean = None
+                layer.attn_norm._rstd = None
+            if hasattr(layer, 'ffn') and hasattr(layer.ffn, '_cache'):
+                layer.ffn._cache = {}
+            if hasattr(layer, 'ffn_out') and hasattr(layer.ffn_out, '_cache'):
+                layer.ffn_out._cache = {}
+
+        # Clear transition caches
+        if hasattr(self, 'transition'):
+            t = self.transition
+            if hasattr(t, 'self_attn') and hasattr(t.self_attn, '_cache'):
+                t.self_attn._cache = {}
+            if hasattr(t, 'ffn') and hasattr(t.ffn, '_cache'):
+                t.ffn._cache = {}
+            if hasattr(t, 'ffn_out') and hasattr(t.ffn_out, '_cache'):
+                t.ffn_out._cache = {}
+            if hasattr(t, 'gate') and hasattr(t.gate, '_cache'):
+                t.gate._cache = {}
+
+        # Clear memory init attention cache
+        if hasattr(self, 'memory_init_attn') and hasattr(self.memory_init_attn, '_cache'):
+            self.memory_init_attn._cache = {}
+
+        # Clear model-level train cache
+        if hasattr(self, '_train_cache'):
+            self._train_cache = {}
 
     def save_checkpoint(self, path: str, step: int = 0):
         """Save model checkpoint."""

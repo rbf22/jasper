@@ -74,6 +74,8 @@ class ChallengeDataset:
         batch_size: int,
         split: str = "train",
         rng: Optional[random.Random] = None,
+        fixed_prompt_len: Optional[int] = None,
+        fixed_answer_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample a batch of (prompt_ids, prompt_mask, decoder_input, answer_targets, answer_mask).
 
@@ -83,15 +85,27 @@ class ChallengeDataset:
             decoder_input: (B, T_ans) — answer tokens shifted right (BOS prepended, last token dropped)
             answer_targets: (B, T_ans) — target answer tokens (first token dropped)
             answer_mask: (B, T_ans) — 1 for valid answer tokens
+
+        If fixed_prompt_len/fixed_answer_len are provided, all batches are padded
+        to those exact lengths. This avoids triggering new kernel compilations
+        for every new sequence length on Tenstorrent hardware.
         """
         if rng is None:
             rng = random.Random()
         examples = self.train_examples if split == "train" else self.valid_examples
 
-        # Sample and find max lengths in this batch
+        # Sample batch
         batch = rng.sample(examples, min(batch_size, len(examples)))
-        max_prompt = max(len(p) for p, _ in batch)
-        max_answer = max(len(a) for _, a in batch)
+
+        # Use fixed lengths if provided, otherwise per-batch max
+        if fixed_prompt_len is not None:
+            max_prompt = fixed_prompt_len
+        else:
+            max_prompt = max(len(p) for p, _ in batch)
+        if fixed_answer_len is not None:
+            max_answer = fixed_answer_len
+        else:
+            max_answer = max(len(a) for _, a in batch)
 
         prompt_ids = torch.full((len(batch), max_prompt), self.pad_id, dtype=torch.long)
         prompt_mask = torch.zeros(len(batch), max_prompt, dtype=torch.bool)

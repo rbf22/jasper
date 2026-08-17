@@ -11,11 +11,18 @@ Usage:
 """
 
 import argparse
+import ctypes
 import math
 import os
 import random
 import time
 import sys
+
+# Force glibc to return freed memory to the OS (prevents RSS growth from
+# malloc arena expansion when large temporary tensors are allocated/freed)
+_libc = ctypes.CDLL("libc.so.6")
+def malloc_trim():
+    _libc.malloc_trim(0)
 
 # Set env before importing ttnn
 os.environ.setdefault("TT_METAL_HOME", "/home/rfenwick/Documents/tt-metal-src")
@@ -90,10 +97,10 @@ def cross_entropy_loss_and_grad(
     device,
     dtype=ttnn.bfloat16,
 ):
-    """Compute cross-entropy loss and gradient on device.
+    """Compute cross-entropy loss and gradient on host, then move grad to device.
 
-    For large vocabularies (V=50257), we compute the softmax in a numerically
-    stable way: subtract max, exponentiate, sum, divide.
+    For large vocabularies (V=50257), we compute the softmax on host in float32
+    to avoid the V×V identity matrix issue on device.
 
     Args:
         logits: (B, T, V) ttnn tensor
@@ -104,63 +111,43 @@ def cross_entropy_loss_and_grad(
         loss: scalar (float) — mean cross-entropy over valid tokens
         grad_logits: (B, T, V) ttnn tensor — gradient w.r.t. logits
     """
-    B, T = targets.shape
-    V = logits.shape[-1]
-
-    # Convert targets and mask to device
-    targets_tt = ttnn.from_torch(
-        targets.to(torch.int32),
-        dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device
-    )
-    mask_tt = ttnn.from_torch(
-        mask.to(torch.float32),
-        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device
-    )
-
-    # Softmax with numerical stability: shift = max(logits, dim=-1)
-    # For BF16, we do this on device
-    # logits_max = ttnn.max(logits, dim=-1)  # (B, T, 1)
-    # shifted = logits - logits_max
-    # exp = ttnn.exp(shifted)
-    # sum_exp = ttnn.sum(exp, dim=-1)  # (B, T, 1)
-    # probs = exp / sum_exp
-
-    # For the gradient: grad_logits = (probs - one_hot(targets)) / N
-    # where N = number of valid tokens
-
-    # Compute on host for simplicity with large V — this is the bottleneck
-    # but avoids the V×V identity matrix issue.
-    # For native TT training, we move logits to host for loss computation,
-    # then move the gradient back to device.
+    # Move logits to host and compute loss+grad in fp32
     logits_torch = ttnn.to_torch(logits)
-
-    # Compute loss and gradient on host (CPU)
     logits_f = logits_torch.float()
-    log_probs = torch.log_softmax(logits_f, dim=-1)  # (B, T, V)
+    del logits_torch  # free the bf16 copy immediately
 
-    # Gather log_probs at target positions
-    gathered = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # (B, T)
-    per_token_loss = -gathered  # (B, T)
+    # Compute log_softmax (numerically stable)
+    log_probs = torch.log_softmax(logits_f, dim=-1)  # (B, T, V)
+    del logits_f
+
+    # Gather log_probs at target positions for loss
+    targets_long = targets.long()
+    gathered = log_probs.gather(2, targets_long.unsqueeze(-1)).squeeze(-1)  # (B, T)
+    per_token_loss = -gathered
+    del gathered
 
     # Mask out padding
     mask_f = mask.float()
     n_valid = mask_f.sum().clamp_min(1)
-    loss = (per_token_loss * mask_f).sum() / n_valid
+    loss_val = (per_token_loss * mask_f).sum().item() / n_valid.item()
+    del per_token_loss
 
     # Gradient: (probs - one_hot) / N
-    probs = torch.exp(log_probs)
-    grad = probs.clone()
-    # Subtract 1 at target positions
-    grad.scatter_(2, targets.unsqueeze(-1), grad.gather(2, targets.unsqueeze(-1)) - 1.0)
-    grad = grad * mask_f.unsqueeze(-1) / n_valid  # scale by mask and normalize
+    # Compute in-place to minimize memory: reuse log_probs tensor
+    probs = torch.exp(log_probs)  # (B, T, V)
+    del log_probs
+
+    # Subtract 1 at target positions (in-place)
+    probs.scatter_(2, targets_long.unsqueeze(-1), probs.gather(2, targets_long.unsqueeze(-1)) - 1.0)
+    grad = probs  # rename for clarity (probs is now the gradient before masking)
+    grad = grad * mask_f.unsqueeze(-1) / n_valid
+    del mask_f, n_valid, probs
 
     # Move gradient back to device
     grad_tt = to_device(grad, device, dtype=dtype)
+    del grad
 
-    _safe_deallocate(targets_tt)
-    _safe_deallocate(mask_tt)
-
-    return loss.item(), grad_tt
+    return loss_val, grad_tt
 
 
 # ---------------------------------------------------------------------------
@@ -680,12 +667,25 @@ def main():
         lr = get_lr(step, args)
         optimizer.set_lr(lr)
 
-        # Sample batch
+        # Sample batch — use fixed sequence lengths to avoid triggering
+        # new kernel compilations on every batch (causes device hangs)
         prompt_ids, prompt_mask, dec_input, ans_targets, ans_mask = \
-            dataset.sample_batch(args.batch_size, "train", rng)
+            dataset.sample_batch(
+                args.batch_size, "train", rng,
+                fixed_prompt_len=args.max_prompt_len,
+                fixed_answer_len=args.max_answer_len + 1,  # +1 for BOS
+            )
 
         # Forward pass (training mode — caches intermediates)
         logits_tt = model.forward_train(prompt_ids, prompt_mask, dec_input, ans_mask)
+
+        # Compute token accuracy from logits before loss (avoids extra eval forward)
+        if step % 10 == 0 or args.smoke_test:
+            with torch.no_grad():
+                logits_torch = ttnn.to_torch(logits_tt).float()
+                preds = logits_torch.argmax(-1)
+                tok_acc = ((preds == ans_targets).float() * ans_mask.float()).sum() / \
+                           ans_mask.float().sum().clamp_min(1)
 
         # Loss + gradient (host-side loss for large vocab, gradient back to device)
         loss_val, grad_logits = cross_entropy_loss_and_grad(
@@ -707,21 +707,16 @@ def main():
         for name, g in grads.items():
             _safe_deallocate(g)
 
+        # Synchronize and clear caches to prevent device memory fragmentation
+        model.clear_caches()
+
+        # Return freed host memory to OS (prevents RSS growth from glibc arena)
+        if step % 10 == 0:
+            malloc_trim()
+
         # Log
         if step % 10 == 0 or args.smoke_test:
             elapsed = time.time() - start_time
-            # Compute token accuracy from the logits we already have
-            # (we need to move logits to host for this, but we already
-            # deallocated them. Instead, compute from the loss batch
-            # by doing a quick eval forward)
-            with torch.no_grad():
-                eval_logits_tt = model.forward(
-                    prompt_ids, prompt_mask, dec_input, ans_mask
-                )
-                preds = eval_logits_tt.argmax(-1)
-                tok_acc = ((preds == ans_targets).float() * ans_mask.float()).sum() / \
-                           ans_mask.float().sum().clamp_min(1)
-
             rss = get_rss()
             rss_str = f" rss={rss:.1f}MB" if args.monitor_rss else ""
             print(
