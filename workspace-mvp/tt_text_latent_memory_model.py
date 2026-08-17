@@ -611,23 +611,113 @@ class TTEncoderLayer:
         self.linear1 = TTLinear(d_model, d_ff, device, bias=True, dtype=dtype)
         self.linear2 = TTLinear(d_ff, d_model, device, bias=True, dtype=dtype)
 
-    def forward(self, x: "ttnn.Tensor", key_padding_mask: Optional["ttnn.Tensor"] = None) -> "ttnn.Tensor":
+    def forward(self, x: "ttnn.Tensor", key_padding_mask: Optional["ttnn.Tensor"] = None,
+                training: bool = False) -> "ttnn.Tensor":
         # Pre-norm self-attention
         normed = self.norm1.forward(x)
-        attn_out = self.self_attn.forward(normed, normed, normed, key_padding_mask=key_padding_mask)
-        x = ttnn.add(x, attn_out)
-        _safe_deallocate(attn_out)
-        _safe_deallocate(normed)
+        attn_out = self.self_attn.forward(normed, normed, normed,
+                                          key_padding_mask=key_padding_mask, training=training)
+        x_new = ttnn.add(x, attn_out)
 
         # Pre-norm FFN (GELU activation — matches PyTorch TransformerEncoderLayer)
-        normed = self.norm2.forward(x)
-        hidden = ttnn.gelu(self.linear1.forward(normed))
+        normed2 = self.norm2.forward(x_new)
+        hidden = ttnn.gelu(self.linear1.forward(normed2))
         ffn_out = self.linear2.forward(hidden)
-        _safe_deallocate(hidden)
-        _safe_deallocate(normed)
-        x = ttnn.add(x, ffn_out)
-        _safe_deallocate(ffn_out)
-        return x
+        x_out = ttnn.add(x_new, ffn_out)
+
+        if training:
+            self._cache = {
+                "x": x, "normed": normed, "attn_out": attn_out,
+                "x_new": x_new, "normed2": normed2, "hidden": hidden, "ffn_out": ffn_out,
+                "key_padding_mask": key_padding_mask,
+            }
+        else:
+            _safe_deallocate(attn_out)
+            _safe_deallocate(normed)
+            _safe_deallocate(hidden)
+            _safe_deallocate(normed2)
+            _safe_deallocate(ffn_out)
+            _safe_deallocate(x_new)
+
+        return x_out
+
+    def backward(self, grad_out: "ttnn.Tensor") -> Tuple["ttnn.Tensor", Dict]:
+        """Backward through encoder layer.
+
+        Returns: (grad_x, grads_dict) where grads_dict contains gradients for
+        all layer parameters.
+        """
+        c = self._cache
+        x = c["x"]
+        normed = c["normed"]
+        x_new = c["x_new"]
+        normed2 = c["normed2"]
+        hidden = c["hidden"]
+        ffn_out = c["ffn_out"]
+        kpm = c["key_padding_mask"]
+
+        # Backward through: x_out = x_new + ffn_out
+        grad_x_new = grad_out  # residual passthrough
+        grad_ffn_out = grad_out  # copy for ffn path
+
+        # Backward through ffn_out = linear2(gelu(linear1(normed2)))
+        grad_hidden, grad_l2_w, grad_l2_b = self.linear2.backward(grad_ffn_out, hidden)
+        _safe_deallocate(grad_ffn_out)
+
+        # Backward through gelu
+        grad_l1_out = ttnn.gelu_bw(grad_hidden, hidden)[0]
+        _safe_deallocate(grad_hidden)
+
+        # Backward through linear1
+        grad_normed2, grad_l1_w, grad_l1_b = self.linear1.backward(grad_l1_out, normed2)
+        _safe_deallocate(grad_l1_out)
+
+        # Backward through norm2
+        grad_x_new_from_ffn, grad_n2_w, grad_n2_b = self.norm2.backward(grad_normed2, x_new)
+        _safe_deallocate(grad_normed2)
+
+        # Combine residual grads for x_new
+        grad_x_new_total = ttnn.add(grad_x_new, grad_x_new_from_ffn)
+        _safe_deallocate(grad_x_new)
+        _safe_deallocate(grad_x_new_from_ffn)
+
+        # Backward through: x_new = x + attn_out
+        grad_x = grad_x_new_total  # residual passthrough
+        grad_attn_out = grad_x_new_total  # copy for attn path
+
+        # Backward through attention
+        grad_normed, _, attn_grads = self.self_attn.backward(grad_attn_out)
+        _safe_deallocate(grad_attn_out)
+
+        # Backward through norm1
+        grad_x_from_attn, grad_n1_w, grad_n1_b = self.norm1.backward(grad_normed, x)
+        _safe_deallocate(grad_normed)
+
+        # Combine residual grads for x
+        grad_x_total = ttnn.add(grad_x, grad_x_from_attn)
+        _safe_deallocate(grad_x)
+        _safe_deallocate(grad_x_from_attn)
+
+        # Clean up cache
+        _safe_deallocate(c["attn_out"])
+        _safe_deallocate(c["normed"])
+        _safe_deallocate(c["hidden"])
+        _safe_deallocate(c["normed2"])
+        _safe_deallocate(c["ffn_out"])
+        _safe_deallocate(c["x_new"])
+        self._cache = {}
+
+        grads = {
+            "norm1_weight": grad_n1_w, "norm1_bias": grad_n1_b,
+            "norm2_weight": grad_n2_w, "norm2_bias": grad_n2_b,
+            "linear1_weight": grad_l1_w, "linear1_bias": grad_l1_b,
+            "linear2_weight": grad_l2_w, "linear2_bias": grad_l2_b,
+            "in_proj_weight": attn_grads["in_proj_weight"],
+            "in_proj_bias": attn_grads["in_proj_bias"],
+            "out_proj_weight": attn_grads["out_proj_weight"],
+            "out_proj_bias": attn_grads["out_proj_bias"],
+        }
+        return grad_x_total, grads
 
 
 class TTDecoderLayer:
@@ -657,33 +747,138 @@ class TTDecoderLayer:
         causal_mask: Optional["ttnn.Tensor"] = None,
         tgt_key_padding_mask: Optional["ttnn.Tensor"] = None,
         memory_key_padding_mask: Optional["ttnn.Tensor"] = None,
+        training: bool = False,
     ) -> "ttnn.Tensor":
         # Pre-norm self-attention (causal)
-        normed = self.norm1.forward(x)
-        self_out = self.self_attn.forward(normed, normed, normed,
-                                           key_padding_mask=tgt_key_padding_mask,
-                                           attn_mask=causal_mask)
-        x = ttnn.add(x, self_out)
-        _safe_deallocate(self_out)
-        _safe_deallocate(normed)
+        normed1 = self.norm1.forward(x)
+        self_out = self.self_attn.forward(normed1, normed1, normed1,
+                                          key_padding_mask=tgt_key_padding_mask,
+                                          attn_mask=causal_mask, training=training)
+        x1 = ttnn.add(x, self_out)
 
         # Pre-norm cross-attention to memory
-        normed = self.norm2.forward(x)
-        cross_out = self.cross_attn.forward(normed, memory, memory,
-                                             key_padding_mask=memory_key_padding_mask)
-        x = ttnn.add(x, cross_out)
-        _safe_deallocate(cross_out)
-        _safe_deallocate(normed)
+        normed2 = self.norm2.forward(x1)
+        cross_out = self.cross_attn.forward(normed2, memory, memory,
+                                             key_padding_mask=memory_key_padding_mask, training=training)
+        x2 = ttnn.add(x1, cross_out)
 
         # Pre-norm FFN (GELU — matches PyTorch TransformerDecoderLayer)
-        normed = self.norm3.forward(x)
-        hidden = ttnn.gelu(self.linear1.forward(normed))
+        normed3 = self.norm3.forward(x2)
+        hidden = ttnn.gelu(self.linear1.forward(normed3))
         ffn_out = self.linear2.forward(hidden)
-        _safe_deallocate(hidden)
-        _safe_deallocate(normed)
-        x = ttnn.add(x, ffn_out)
-        _safe_deallocate(ffn_out)
-        return x
+        x_out = ttnn.add(x2, ffn_out)
+
+        if training:
+            self._cache = {
+                "x": x, "normed1": normed1, "self_out": self_out, "x1": x1,
+                "normed2": normed2, "cross_out": cross_out, "x2": x2,
+                "normed3": normed3, "hidden": hidden, "ffn_out": ffn_out,
+                "memory": memory,
+            }
+        else:
+            _safe_deallocate(self_out)
+            _safe_deallocate(normed1)
+            _safe_deallocate(cross_out)
+            _safe_deallocate(normed2)
+            _safe_deallocate(hidden)
+            _safe_deallocate(normed3)
+            _safe_deallocate(ffn_out)
+            _safe_deallocate(x1)
+            _safe_deallocate(x2)
+
+        return x_out
+
+    def backward(self, grad_out: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor", Dict]:
+        """Backward through decoder layer.
+
+        Returns: (grad_x, grad_memory, grads_dict)
+        """
+        c = self._cache
+        x = c["x"]
+        normed1 = c["normed1"]
+        x1 = c["x1"]
+        normed2 = c["normed2"]
+        x2 = c["x2"]
+        normed3 = c["normed3"]
+        hidden = c["hidden"]
+        ffn_out = c["ffn_out"]
+        memory = c["memory"]
+
+        # Backward through: x_out = x2 + ffn_out
+        grad_x2 = grad_out
+        grad_ffn_out = grad_out
+
+        # Backward through ffn
+        grad_hidden, grad_l2_w, grad_l2_b = self.linear2.backward(grad_ffn_out, hidden)
+        _safe_deallocate(grad_ffn_out)
+        grad_l1_out = ttnn.gelu_bw(grad_hidden, hidden)[0]
+        _safe_deallocate(grad_hidden)
+        grad_normed3, grad_l1_w, grad_l1_b = self.linear1.backward(grad_l1_out, normed3)
+        _safe_deallocate(grad_l1_out)
+        grad_x2_ffn, grad_n3_w, grad_n3_b = self.norm3.backward(grad_normed3, x2)
+        _safe_deallocate(grad_normed3)
+        grad_x2_total = ttnn.add(grad_x2, grad_x2_ffn)
+        _safe_deallocate(grad_x2)
+        _safe_deallocate(grad_x2_ffn)
+
+        # Backward through: x2 = x1 + cross_out
+        grad_x1 = grad_x2_total
+        grad_cross_out = grad_x2_total
+
+        # Backward through cross-attention
+        grad_normed2, grad_memory, cross_grads = self.cross_attn.backward(grad_cross_out)
+        _safe_deallocate(grad_cross_out)
+
+        # Backward through norm2
+        grad_x1_cross, grad_n2_w, grad_n2_b = self.norm2.backward(grad_normed2, x1)
+        _safe_deallocate(grad_normed2)
+        grad_x1_total = ttnn.add(grad_x1, grad_x1_cross)
+        _safe_deallocate(grad_x1)
+        _safe_deallocate(grad_x1_cross)
+
+        # Backward through: x1 = x + self_out
+        grad_x = grad_x1_total
+        grad_self_out = grad_x1_total
+
+        # Backward through self-attention
+        grad_normed1, _, self_grads = self.self_attn.backward(grad_self_out)
+        _safe_deallocate(grad_self_out)
+
+        # Backward through norm1
+        grad_x_sa, grad_n1_w, grad_n1_b = self.norm1.backward(grad_normed1, x)
+        _safe_deallocate(grad_normed1)
+        grad_x_total = ttnn.add(grad_x, grad_x_sa)
+        _safe_deallocate(grad_x)
+        _safe_deallocate(grad_x_sa)
+
+        # Clean up cache
+        _safe_deallocate(c["self_out"])
+        _safe_deallocate(c["normed1"])
+        _safe_deallocate(c["cross_out"])
+        _safe_deallocate(c["normed2"])
+        _safe_deallocate(c["hidden"])
+        _safe_deallocate(c["normed3"])
+        _safe_deallocate(c["ffn_out"])
+        _safe_deallocate(c["x1"])
+        _safe_deallocate(c["x2"])
+        self._cache = {}
+
+        grads = {
+            "norm1_weight": grad_n1_w, "norm1_bias": grad_n1_b,
+            "norm2_weight": grad_n2_w, "norm2_bias": grad_n2_b,
+            "norm3_weight": grad_n3_w, "norm3_bias": grad_n3_b,
+            "linear1_weight": grad_l1_w, "linear1_bias": grad_l1_b,
+            "linear2_weight": grad_l2_w, "linear2_bias": grad_l2_b,
+            "sa_in_proj_weight": self_grads["in_proj_weight"],
+            "sa_in_proj_bias": self_grads["in_proj_bias"],
+            "sa_out_proj_weight": self_grads["out_proj_weight"],
+            "sa_out_proj_bias": self_grads["out_proj_bias"],
+            "ca_in_proj_weight": cross_grads["in_proj_weight"],
+            "ca_in_proj_bias": cross_grads["in_proj_bias"],
+            "ca_out_proj_weight": cross_grads["out_proj_weight"],
+            "ca_out_proj_bias": cross_grads["out_proj_bias"],
+        }
+        return grad_x_total, grad_memory, grads
 
 
 class TTTransition:
@@ -708,28 +903,154 @@ class TTTransition:
         self.gate = TTLinear(d_model, d_model, device, bias=True, dtype=dtype)
         self.output_norm = TTRMSNorm(d_model, device, dtype=dtype)
 
-    def forward(self, memory: "ttnn.Tensor") -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
+    def forward(self, memory: "ttnn.Tensor", training: bool = False) -> Tuple["ttnn.Tensor", "ttnn.Tensor"]:
         """Returns (updated_memory, gate) where gate is (B, S, d_model) in [0, 1]."""
         normed = self.attn_norm.forward(memory)
-        attn_out = self.self_attn.forward(normed, normed, normed)
-        _safe_deallocate(normed)
+        attn_out = self.self_attn.forward(normed, normed, normed, training=training)
         hidden_pre = ttnn.add(memory, attn_out)
-        _safe_deallocate(attn_out)
         # Reuse attn_norm for FFN input (matches PyTorch)
         hidden = self.attn_norm.forward(hidden_pre)
-        _safe_deallocate(hidden_pre)
 
         hidden_act = ttnn.silu(self.ffn.forward(hidden))
         proposal = self.ffn_out.forward(hidden_act)
-        _safe_deallocate(hidden_act)
 
-        gate = ttnn.sigmoid(self.gate.forward(hidden))
+        gate_pre = self.gate.forward(hidden)
+        gate = ttnn.sigmoid(gate_pre)
         gated_proposal = ttnn.mul(gate, proposal)
-        _safe_deallocate(proposal)
-        updated = ttnn.add(memory, gated_proposal)
-        _safe_deallocate(gated_proposal)
-        updated = self.output_norm.forward(updated)
+        updated_pre = ttnn.add(memory, gated_proposal)
+        updated = self.output_norm.forward(updated_pre)
+
+        if training:
+            self._cache = {
+                "memory": memory, "normed": normed, "attn_out": attn_out,
+                "hidden_pre": hidden_pre, "hidden": hidden,
+                "hidden_act": hidden_act, "proposal": proposal,
+                "gate_pre": gate_pre, "gate": gate,
+                "gated_proposal": gated_proposal, "updated_pre": updated_pre,
+            }
+        else:
+            _safe_deallocate(normed)
+            _safe_deallocate(attn_out)
+            _safe_deallocate(hidden_pre)
+            _safe_deallocate(hidden)
+            _safe_deallocate(hidden_act)
+            _safe_deallocate(proposal)
+            _safe_deallocate(gate_pre)
+            _safe_deallocate(gated_proposal)
+            _safe_deallocate(updated_pre)
+
         return updated, gate
+
+    def backward(self, grad_updated: "ttnn.Tensor") -> Tuple["ttnn.Tensor", Dict]:
+        """Backward through transition step.
+
+        Returns: (grad_memory, grads_dict)
+        """
+        c = self._cache
+        memory = c["memory"]
+        normed = c["normed"]
+        attn_out = c["attn_out"]
+        hidden_pre = c["hidden_pre"]
+        hidden = c["hidden"]
+        hidden_act = c["hidden_act"]
+        proposal = c["proposal"]
+        gate_pre = c["gate_pre"]
+        gate = c["gate"]
+        gated_proposal = c["gated_proposal"]
+        updated_pre = c["updated_pre"]
+
+        # Backward through output_norm
+        grad_updated_pre, grad_on_w = self.output_norm.backward(grad_updated, updated_pre)
+
+        # Backward through: updated_pre = memory + gated_proposal
+        grad_memory = grad_updated_pre  # residual
+        grad_gated_proposal = grad_updated_pre
+
+        # Backward through: gated_proposal = gate * proposal
+        grad_gate = ttnn.mul(grad_gated_proposal, proposal)
+        grad_proposal = ttnn.mul(grad_gated_proposal, gate)
+        _safe_deallocate(grad_gated_proposal)
+
+        # Backward through sigmoid: grad_gate_pre = grad_gate * gate * (1 - gate)
+        # sigmoid_bw(grad_gate, gate_pre) gives the gradient
+        grad_gate_pre = ttnn.sigmoid_bw(grad_gate, gate_pre)[0]
+        _safe_deallocate(grad_gate)
+
+        # Backward through gate linear
+        grad_hidden_from_gate, grad_gate_w, grad_gate_b = self.gate.backward(grad_gate_pre, hidden)
+        _safe_deallocate(grad_gate_pre)
+
+        # Backward through ffn_out linear
+        grad_hidden_act, grad_ffn_out_w, grad_ffn_out_b = self.ffn_out.backward(grad_proposal, hidden_act)
+        _safe_deallocate(grad_proposal)
+
+        # Backward through silu
+        grad_ffn_out = ttnn.silu_bw(grad_hidden_act, hidden_act)[0]
+        _safe_deallocate(grad_hidden_act)
+
+        # Backward through ffn linear
+        grad_hidden_from_ffn, grad_ffn_w, grad_ffn_b = self.ffn.backward(grad_ffn_out, hidden)
+        _safe_deallocate(grad_ffn_out)
+
+        # Combine grads for hidden (from gate path and ffn path)
+        grad_hidden = ttnn.add(grad_hidden_from_gate, grad_hidden_from_ffn)
+        _safe_deallocate(grad_hidden_from_gate)
+        _safe_deallocate(grad_hidden_from_ffn)
+
+        # Backward through attn_norm (reused for hidden)
+        grad_hidden_pre, grad_an_w1 = self.attn_norm.backward(grad_hidden, hidden_pre)
+        _safe_deallocate(grad_hidden)
+
+        # Backward through: hidden_pre = memory + attn_out
+        grad_memory_attn = grad_hidden_pre  # residual
+        grad_attn_out = grad_hidden_pre
+
+        # Backward through attention
+        grad_normed, _, attn_grads = self.self_attn.backward(grad_attn_out)
+        _safe_deallocate(grad_attn_out)
+
+        # Backward through attn_norm (first use)
+        grad_memory_norm, grad_an_w2 = self.attn_norm.backward(grad_normed, memory)
+        _safe_deallocate(grad_normed)
+
+        # Combine all grads for memory
+        grad_memory_total = ttnn.add(grad_memory, grad_memory_attn)
+        grad_memory_total = ttnn.add(grad_memory_total, grad_memory_norm)
+        _safe_deallocate(grad_memory)
+        _safe_deallocate(grad_memory_attn)
+        _safe_deallocate(grad_memory_norm)
+
+        # Accumulate attn_norm weight grads (used twice)
+        grad_attn_norm_w = ttnn.add(grad_an_w1, grad_an_w2)
+        _safe_deallocate(grad_an_w1)
+        _safe_deallocate(grad_an_w2)
+
+        # Clean up cache
+        _safe_deallocate(c["normed"])
+        _safe_deallocate(c["attn_out"])
+        _safe_deallocate(c["hidden_pre"])
+        _safe_deallocate(c["hidden"])
+        _safe_deallocate(c["hidden_act"])
+        _safe_deallocate(c["proposal"])
+        _safe_deallocate(c["gate_pre"])
+        _safe_deallocate(c["gate"])
+        _safe_deallocate(c["gated_proposal"])
+        _safe_deallocate(c["updated_pre"])
+        self._cache = {}
+
+        grads = {
+            "attn_norm_weight": grad_attn_norm_w,
+            "ffn_weight": grad_ffn_w,
+            "ffn_out_weight": grad_ffn_out_w,
+            "gate_weight": grad_gate_w,
+            "gate_bias": grad_gate_b,
+            "output_norm_weight": grad_on_w,
+            "in_proj_weight": attn_grads["in_proj_weight"],
+            "in_proj_bias": attn_grads["in_proj_bias"],
+            "out_proj_weight": attn_grads["out_proj_weight"],
+            "out_proj_bias": attn_grads["out_proj_bias"],
+        }
+        return grad_memory_total, grads
 
 
 # ---------------------------------------------------------------------------
