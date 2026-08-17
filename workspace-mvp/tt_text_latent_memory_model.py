@@ -1509,6 +1509,8 @@ class TTTextLatentMemoryModel:
             "dec_inputs": dec_inputs, "dec_pre_norm": dec_pre_norm,
             "x_dec_pre_lm": x_dec,
             "ans_kpm": ans_kpm,
+            "prompt_ids": prompt_ids,  # for embedding backward
+            "answer_ids": answer_ids,  # for embedding backward
         }
 
         return logits
@@ -1573,7 +1575,9 @@ class TTTextLatentMemoryModel:
                 _safe_deallocate(grad_mem_i)
                 grad_memory = new_grad_memory
 
-        _safe_deallocate(grad_dec_pre)
+        # Save grad_dec_pre for answer embedding backward
+        # (this is the gradient w.r.t. x_dec = token_emb(answer_ids) + answer_pos_emb)
+        grad_x_dec_ans = grad_dec_pre
 
         # --- Backward through reasoning steps (reverse order) ---
         # memory_states[0] = initial memory, [1..K] = after each step
@@ -1633,39 +1637,74 @@ class TTTextLatentMemoryModel:
             _accum_grads(enc_grads, f"enc_{i}")
 
         # --- Backward through prompt embeddings ---
-        # grad flows to token_emb and prompt_pos_emb
         # x_enc = token_emb(prompt_ids) + prompt_pos_emb(pos)
-        # grad_token_emb from encoder path (add to existing from LM head)
-        # We need to use embedding_bw for this
-        # For now, sum grad_x over batch for pos_emb grad, and scatter for token_emb
-        # This is simplified — proper embedding backward needs ttnn.embedding_bw
+        # grad flows to both token_emb (scatter by prompt_ids) and pos_emb (sum over batch)
 
-        # grad_pos_emb = sum over batch of grad_x
+        # 1. Embedding backward: scatter-add grad_x rows to token embedding rows
+        #    Done on host — it's a simple scatter, not a matmul
+        prompt_ids_torch = c["prompt_ids"]  # (B, T) torch tensor
+        grad_x_host = ttnn.to_torch(grad_x).float()  # (B, T, d) — copy before reduction
+
+        grad_emb_enc = torch.zeros(self.config.vocab_size, d, dtype=torch.float32)
+        grad_emb_enc.index_add_(
+            0, prompt_ids_torch.reshape(-1).long(),
+            grad_x_host.reshape(-1, d),
+        )
+        del grad_x_host
+
+        # Accumulate into existing token_emb gradient (from LM head)
+        grad_emb_enc_tt = to_device(grad_emb_enc, device, dtype=self.dtype)
+        del grad_emb_enc
+        if "token_emb_weight" in all_grads:
+            existing = all_grads["token_emb_weight"]
+            all_grads["token_emb_weight"] = ttnn.add(existing, grad_emb_enc_tt)
+            _safe_deallocate(existing)
+            _safe_deallocate(grad_emb_enc_tt)
+        else:
+            all_grads["token_emb_weight"] = grad_emb_enc_tt
+
+        # 2. Position embedding backward: sum grad_x over batch
         gpe = grad_x
         while len(gpe.shape) > 1:
             _gpe = ttnn.sum(gpe, dim=0)
             _safe_deallocate(gpe)
             gpe = _gpe
-        # Only first T positions are used
-        # gpe is (T, d) — but prompt_pos_emb is (max_prompt_len, d)
-        # The grad should be zero-padded to max_prompt_len
-        # For simplicity, just use the first T rows
         if "prompt_pos_emb" in all_grads:
-            # This shouldn't happen in a single forward, but just in case
             _safe_deallocate(all_grads["prompt_pos_emb"])
-        all_grads["prompt_pos_emb"] = gpe  # TODO: zero-pad to max_prompt_len
-
-        # grad_token_emb from encoder — use embedding_bw
-        # For now, accumulate into all_grads["token_emb_weight"]
-        # embedding_bw needs indices and grad_x
-        # This is a TODO — embedding backward on device
-        # For now, we skip the embedding backward through the encoder/decoder
-        # and only have the LM head gradient for token_emb_weight
-        _safe_deallocate(grad_x)
+        all_grads["prompt_pos_emb"] = gpe
 
         # --- Backward through answer embeddings ---
-        # Similar TODO for answer pos_emb and token_emb through decoder
-        # The LM head gradient already accounts for token_emb_weight
+        # x_dec = token_emb(answer_ids) + answer_pos_emb(pos)
+        # grad_x_dec_ans is the gradient w.r.t. x_dec (saved from decoder backward)
+
+        # 1. Answer token embedding backward: scatter-add by answer_ids
+        answer_ids_torch = c["answer_ids"]  # (B, T_ans) torch tensor
+        grad_ans_host = ttnn.to_torch(grad_x_dec_ans).float()  # (B, T_ans, d)
+
+        grad_emb_ans = torch.zeros(self.config.vocab_size, d, dtype=torch.float32)
+        grad_emb_ans.index_add_(
+            0, answer_ids_torch.reshape(-1).long(),
+            grad_ans_host.reshape(-1, d),
+        )
+        del grad_ans_host
+
+        # Accumulate into existing token_emb gradient
+        grad_emb_ans_tt = to_device(grad_emb_ans, device, dtype=self.dtype)
+        del grad_emb_ans
+        existing = all_grads["token_emb_weight"]
+        all_grads["token_emb_weight"] = ttnn.add(existing, grad_emb_ans_tt)
+        _safe_deallocate(existing)
+        _safe_deallocate(grad_emb_ans_tt)
+
+        # 2. Answer position embedding backward: sum over batch
+        gape = grad_x_dec_ans
+        while len(gape.shape) > 1:
+            _gape = ttnn.sum(gape, dim=0)
+            _safe_deallocate(gape)
+            gape = _gape
+        if "answer_pos_emb" in all_grads:
+            _safe_deallocate(all_grads["answer_pos_emb"])
+        all_grads["answer_pos_emb"] = gape
 
         # Clean up train cache
         _safe_deallocate(c["x_dec_pre_lm"])

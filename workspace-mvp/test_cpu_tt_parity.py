@@ -206,12 +206,12 @@ def main():
         max_prompt_len=max_prompt_len,
         max_answer_len=max_answer_len,
     )
-    tt_model = TTTextLatentMemoryModel(tt_config, device, dtype=ttnn.float32)
+    tt_model = TTTextLatentMemoryModel(tt_config, device, dtype=ttnn.bfloat16)
     tt_params = tt_model.get_num_params()
-    print(f"TT model: {tt_params:,} params (fp32)", flush=True)
+    print(f"TT model: {tt_params:,} params (bf16)", flush=True)
 
     print("Copying weights from CPU to TT...", flush=True)
-    copy_cpu_to_tt(cpu_model, tt_model, device, dtype=ttnn.float32)
+    copy_cpu_to_tt(cpu_model, tt_model, device, dtype=ttnn.bfloat16)
 
     # Load dataset and get a fixed batch
     print("Loading dataset...", flush=True)
@@ -223,7 +223,13 @@ def main():
     )
 
     torch.manual_seed(123)  # fixed seed for batch sampling
-    prompt_ids, prompt_mask, decoder_input, answer_targets, answer_mask = dataset.sample_batch(batch_size=4)
+    import random as _random
+    _rng = _random.Random(123)
+    prompt_ids, prompt_mask, decoder_input, answer_targets, answer_mask = dataset.sample_batch(
+        batch_size=4, rng=_rng,
+        fixed_prompt_len=max_prompt_len,
+        fixed_answer_len=max_answer_len + 1,  # +1 for BOS
+    )
 
     print(f"Batch: prompt_ids {prompt_ids.shape}, answer_ids {decoder_input.shape}", flush=True)
 
@@ -317,7 +323,7 @@ def main():
     grad_logits_torch = (probs - onehot) / (answer_mask.sum().item())
     grad_logits_torch = grad_logits_torch.reshape(*tt_logits_for_loss.shape)
 
-    grad_logits_tt = to_device(grad_logits_torch, device, dtype=ttnn.float32)
+    grad_logits_tt = to_device(grad_logits_torch, device, dtype=ttnn.bfloat16)
     _safe_deallocate_fn = getattr(ttnn, "deallocate", None)
 
     tt_grads = tt_model.backward(grad_logits_tt)
