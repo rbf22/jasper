@@ -100,6 +100,7 @@ def main():
     parser.add_argument("--vocab-size", type=int, default=1000)
     parser.add_argument("--max-prompt-len", type=int, default=64)
     parser.add_argument("--max-answer-len", type=int, default=16)
+    parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -120,7 +121,7 @@ def main():
         max_answer_len=args.max_answer_len,
         pad_token_id=0,
     )
-    model = TTTextLatentMemoryModel(config, device)
+    model = TTTextLatentMemoryModel(config, device, dtype=ttnn.float32 if args.precision == "fp32" else ttnn.bfloat16)
     print(f"Model: {model.get_num_params():,} params", flush=True)
 
     # Generate fixed test inputs

@@ -566,7 +566,9 @@ class TTTextLatentMemoryModel:
         """
         out = ttnn.embedding(indices, weight, layout=ttnn.TILE_LAYOUT)
         if self.dtype != ttnn.bfloat16:
-            out = ttnn.typecast(out, self.dtype)
+            casted = ttnn.typecast(out, self.dtype)
+            _safe_deallocate(out)
+            out = casted
         return out
 
     def encode_prompt(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> "ttnn.Tensor":
